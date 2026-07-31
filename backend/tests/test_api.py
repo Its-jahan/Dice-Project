@@ -213,3 +213,10 @@ def test_columns_probe_reports_real_column_names(client):
     assert body["table"] == "balances_ethereum.daily_updates"
     assert body["columns"] == ["address", "balance", "valid_from"]
     assert "LIMIT 1" in FakeDuneClient.calls["query_sql"]
+
+
+def test_responses_are_not_cacheable(client):
+    """A stale app.js against a fresh index.html breaks the UI silently."""
+    for path in ("/", "/static/app.js", "/api/config"):
+        response = client.get(path)
+        assert "no-store" in response.headers.get("cache-control", ""), path

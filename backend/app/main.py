@@ -46,6 +46,20 @@ app = FastAPI(
 )
 
 
+@app.middleware("http")
+async def _no_store(request: Request, call_next):
+    """Never let a browser cache this app.
+
+    index.html and app.js are served from stable URLs with no version hash, so
+    a cached copy of one and a fresh copy of the other produces a page whose
+    buttons exist but do nothing. The assets are a few KB; correctness beats
+    the saved round trip.
+    """
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store, must-revalidate"
+    return response
+
+
 @app.exception_handler(DuneError)
 async def _dune_error_handler(_request: Request, exc: DuneError) -> JSONResponse:
     return JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})
