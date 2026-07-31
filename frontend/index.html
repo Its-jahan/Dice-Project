@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DICE — Historical Token Holders</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%233b5bdb'/%3E%3Cpath d='M16 6l10 10-10 10L6 16z' fill='%23fff'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true">◈</span>
+      <div>
+        <h1>DICE</h1>
+        <p>Historical token holders, straight from Dune.</p>
+      </div>
+    </div>
+    <span id="keyPill" class="pill pill--muted">No API key</span>
+  </header>
+
+  <main>
+    <!-- ------------------------------------------------ API key -->
+    <section class="card" aria-labelledby="keyHeading">
+      <h2 id="keyHeading">Dune API key</h2>
+      <p class="hint">
+        Your key stays in your browser and is sent only with your own requests —
+        it is never stored on the server or written to logs.
+        Create one at <code>dune.com → Settings → API</code>.
+      </p>
+
+      <div class="field-row">
+        <div class="field grow">
+          <label for="apiKey">API key</label>
+          <div class="input-with-button">
+            <input id="apiKey" type="password" autocomplete="off" spellcheck="false"
+                   placeholder="dQ…your Dune API key">
+            <button type="button" id="toggleKey" class="ghost" aria-label="Show or hide the key">Show</button>
+          </div>
+        </div>
+        <div class="field shrink">
+          <label for="keyStorage">Remember</label>
+          <select id="keyStorage">
+            <option value="local">On this browser</option>
+            <option value="session">Until tab closes</option>
+            <option value="none">Do not save</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="actions">
+        <button type="button" id="saveKey" class="primary">Save key</button>
+        <button type="button" id="testKey">Test key</button>
+        <button type="button" id="clearKey" class="danger-ghost">Clear</button>
+        <span id="keyStatus" class="status" role="status" aria-live="polite"></span>
+      </div>
+    </section>
+
+    <!-- ------------------------------------------------ query -->
+    <section class="card" aria-labelledby="queryHeading">
+      <h2 id="queryHeading">Query</h2>
+      <form id="queryForm">
+        <div class="grid">
+          <div class="field">
+            <label for="chain">Chain</label>
+            <select id="chain" name="chain">
+              <option value="ethereum">Ethereum</option>
+              <option value="base">Base</option>
+              <option value="arbitrum">Arbitrum</option>
+              <option value="optimism">Optimism</option>
+              <option value="polygon">Polygon</option>
+              <option value="solana">Solana</option>
+            </select>
+          </div>
+
+          <div class="field span2">
+            <label for="tokenAddress">Token contract / mint address</label>
+            <input id="tokenAddress" name="token_address" required
+                   spellcheck="false" placeholder="0x…">
+          </div>
+
+          <div class="field">
+            <label for="startDate">Start date (UTC)</label>
+            <input id="startDate" name="start_date" type="date" required>
+          </div>
+
+          <div class="field">
+            <label for="endDate">End date (UTC)</label>
+            <input id="endDate" name="end_date" type="date" required>
+          </div>
+
+          <div class="field">
+            <label for="minBalance">Minimum balance</label>
+            <input id="minBalance" name="min_balance" type="number" min="0"
+                   step="any" value="0">
+          </div>
+
+          <div class="field">
+            <label for="holderMode">Holder mode</label>
+            <select id="holderMode" name="holder_mode">
+              <option value="daily">Daily snapshots (default)</option>
+              <option value="any_time">Held at any time</option>
+              <option value="continuous">Continuous holders</option>
+            </select>
+          </div>
+
+          <div class="field">
+            <label for="format">Export format</label>
+            <select id="format">
+              <option value="csv">CSV</option>
+              <option value="xlsx">Excel (.xlsx)</option>
+              <option value="json">JSON</option>
+              <option value="html">HTML</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="checks">
+          <label><input type="checkbox" id="includeContracts" checked>
+            Include smart-contract addresses</label>
+          <label><input type="checkbox" id="excludeBurn" checked>
+            Exclude zero / burn addresses</label>
+        </div>
+
+        <div class="actions">
+          <button type="submit" class="primary" id="runBtn">Run query</button>
+          <button type="button" id="showSql">Show SQL</button>
+          <span id="runStatus" class="status" role="status" aria-live="polite"></span>
+        </div>
+      </form>
+    </section>
+
+    <!-- ------------------------------------------------ results -->
+    <section class="card hidden" id="sqlCard" aria-labelledby="sqlHeading">
+      <h2 id="sqlHeading">Generated DuneSQL</h2>
+      <pre id="sqlOut" class="scroll"></pre>
+    </section>
+
+    <section class="card hidden" id="resultsCard" aria-labelledby="resultsHeading">
+      <div class="results-head">
+        <h2 id="resultsHeading">Results</h2>
+        <div class="actions">
+          <button type="button" id="downloadBtn" class="primary">Download</button>
+        </div>
+      </div>
+      <p id="resultsMeta" class="hint"></p>
+      <div class="tabs" role="tablist">
+        <button type="button" class="tab is-active" data-tab="snapshots" role="tab">Snapshots</button>
+        <button type="button" class="tab" data-tab="summary" role="tab">Per-wallet summary</button>
+      </div>
+      <div class="scroll">
+        <table id="resultsTable"><thead></thead><tbody></tbody></table>
+      </div>
+      <p id="previewNote" class="hint"></p>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
