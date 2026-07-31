@@ -27,6 +27,7 @@ from .jobs import store
 from .models import Chain, ExportFormat, HoldersRequest, HoldersResponse
 from .sql import (
     build_columns_sql,
+    build_discovery_sql,
     build_query_parameters,
     build_snapshot_sql,
     table_for,
@@ -95,6 +96,48 @@ async def preview_sql(req: Annotated[HoldersRequest, Body()]) -> dict[str, objec
     }
 
 
+async def _run_sql(client: DuneClient, *, name: str, sql: str, max_rows: int):
+    """Create, execute and drain a one-off diagnostic query."""
+    query_id = await client.create_query(name=name, query_sql=sql)
+    execution_id = await client.execute_query(query_id)
+    await client.wait_for_execution(execution_id)
+    rows, _ = await client.fetch_results(execution_id, max_rows=max_rows)
+    return rows
+
+
+@app.get("/api/discover")
+async def discover_tables(
+    pattern: str = "balance",
+    x_dune_api_key: ApiKeyHeader = None,
+) -> dict[str, object]:
+    """List the balance tables this Dune key can actually reach.
+
+    ``information_schema`` only reports what the caller is entitled to, so this
+    distinguishes the two causes of "does not exist or it is private": a table
+    that was renamed upstream, versus one gated behind a Dune plan tier.
+    """
+    key = resolve_api_key(x_dune_api_key)
+    try:
+        sql = build_discovery_sql(pattern)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    async with DuneClient(key) as client:
+        rows = await _run_sql(
+            client, name=f"DICE discover {pattern}", sql=sql, max_rows=300
+        )
+
+    tables = sorted(
+        f"{row.get('table_schema')}.{row.get('table_name')}" for row in rows
+    )
+    return {
+        "pattern": pattern,
+        "count": len(tables),
+        "tables": tables,
+        "expected_by_dice": sorted({table_for(chain) for chain in Chain}),
+    }
+
+
 @app.get("/api/columns")
 async def describe_source_table(
     chain: Chain = Chain.ethereum,
@@ -108,13 +151,12 @@ async def describe_source_table(
     """
     key = resolve_api_key(x_dune_api_key)
     async with DuneClient(key) as client:
-        query_id = await client.create_query(
+        rows = await _run_sql(
+            client,
             name=f"DICE schema probe {chain.value}",
-            query_sql=build_columns_sql(chain),
+            sql=build_columns_sql(chain),
+            max_rows=1,
         )
-        execution_id = await client.execute_query(query_id)
-        await client.wait_for_execution(execution_id)
-        rows, _ = await client.fetch_results(execution_id, max_rows=1)
     return {
         "table": table_for(chain),
         "columns": sorted(rows[0].keys()) if rows else [],

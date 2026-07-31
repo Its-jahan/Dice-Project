@@ -182,6 +182,36 @@ async function showSql() {
   });
 }
 
+async function diagnose() {
+  if (!currentKey()) {
+    setStatus("runStatus", "Enter your Dune API key above first.", "error");
+    return;
+  }
+  await withBusy($("diagnoseBtn"), async () => {
+    setStatus("runStatus", "Asking Dune which balance tables your key can see…", "");
+    try {
+      const data = await api("/api/discover?pattern=balance");
+      const reachable = new Set(data.tables);
+      const lines = [
+        `Tables matching "balance" your key can reach: ${data.count}`,
+        "",
+        "What DICE expects:",
+        ...data.expected_by_dice.map(
+          (t) => `  ${reachable.has(t) ? "OK     " : "MISSING"}  ${t}`,
+        ),
+        "",
+        "All matching tables:",
+        ...(data.tables.length ? data.tables.map((t) => `  ${t}`) : ["  (none)"]),
+      ];
+      $("sqlOut").textContent = lines.join("\n");
+      $("sqlCard").classList.remove("hidden");
+      setStatus("runStatus", "", "");
+    } catch (error) {
+      setStatus("runStatus", error.message, "error");
+    }
+  });
+}
+
 async function runQuery(event) {
   event.preventDefault();
   if (!currentKey()) {
@@ -297,6 +327,7 @@ function init() {
 
   $("queryForm").addEventListener("submit", runQuery);
   $("showSql").addEventListener("click", showSql);
+  $("diagnoseBtn").addEventListener("click", diagnose);
   $("downloadBtn").addEventListener("click", download);
 
   for (const tab of document.querySelectorAll(".tab")) {

@@ -31,6 +31,8 @@ what the table actually looks like now.
 
 from __future__ import annotations
 
+import re
+
 from .models import Chain, HoldersRequest
 
 # Sinks that hold tokens but are never "holders" in any meaningful sense.
@@ -173,6 +175,33 @@ FROM (
 )
 WHERE balance > {req.min_balance!r}
 ORDER BY snapshot_date, balance DESC
+""".strip()
+
+
+#: Discovery patterns are interpolated into SQL, so they are restricted to a
+#: conservative character set rather than escaped.
+_SAFE_PATTERN = re.compile(r"^[A-Za-z0-9_]{1,40}$")
+
+
+def build_discovery_sql(pattern: str) -> str:
+    """Ask Dune which balance tables this API key can actually see.
+
+    Dune's balance tables are Open Beta: they get renamed, and some are gated
+    behind plan tiers, which surfaces as "does not exist or it is private".
+    Rather than guessing at names, this reads ``information_schema`` — which
+    only lists what the caller is entitled to — and reports the truth.
+    """
+    if not _SAFE_PATTERN.match(pattern):
+        raise ValueError("pattern must be 1-40 characters of [A-Za-z0-9_]")
+    needle = f"'%{pattern.lower()}%'"
+    return f"""
+-- DICE: which tables matching {needle} can this key see?
+SELECT table_schema, table_name
+FROM information_schema.tables
+WHERE lower(table_schema) LIKE {needle}
+   OR lower(table_name) LIKE {needle}
+ORDER BY table_schema, table_name
+LIMIT 300
 """.strip()
 
 

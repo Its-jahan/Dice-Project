@@ -102,6 +102,7 @@ HTML is a standalone, filterable page with no external assets.
 | `GET /api/config` | UI bootstrap — key presence, execution mode, row caps. |
 | `POST /api/key/validate` | Check a Dune key. Header: `X-Dune-Api-Key`. |
 | `POST /api/sql` | Preview the generated DuneSQL. No key, no credits. |
+| `GET /api/discover?pattern=balance` | Which balance tables your Dune key can actually reach. |
 | `GET /api/columns?chain=ethereum` | Real column names of the source balance table (Open Beta escape hatch). |
 | `POST /api/holders` | Run the query; returns a preview + `job_id`. |
 | `GET /api/export/{job_id}?format=csv\|xlsx\|json\|html` | Download the full result. |
@@ -153,10 +154,22 @@ address, mint and day), aggregated **per owner** — a Solana wallet can control
 several token accounts for one mint, and summing them keeps one holder from
 appearing as several fragmented rows.
 
-Dune's balance tables are in Open Beta and have been renamed before. If a query
-starts failing with "table does not exist", `GET /api/columns?chain=ethereum`
-returns the real column names of the table DICE reads, and
-`backend/app/sql.py` is the only file that needs editing.
+### When Dune says the table does not exist
+
+Dune's balance tables are Open Beta: they get renamed, and some are gated
+behind plan tiers. Both failures look identical from the outside —
+*"does not exist or it is private"* — so don't guess. Click **Check data
+source** in the UI (or `GET /api/discover?pattern=balance`). It reads
+`information_schema`, which lists only what your key is entitled to, and prints
+what DICE expects beside what you can actually reach:
+
+- the table is listed under a *different name* → upstream rename; update
+  `backend/app/sql.py`, the only file that needs editing.
+- nothing relevant is listed at all → your Dune plan does not include these
+  tables; the fix is a plan change, not a code change.
+
+`GET /api/columns?chain=ethereum` then confirms the real column names of
+whichever table you settle on.
 
 ## Known limits
 

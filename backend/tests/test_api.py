@@ -176,3 +176,40 @@ def test_invalid_request_is_rejected_before_touching_dune(client):
 
     assert response.status_code == 422
     assert "api_key" not in FakeDuneClient.calls
+
+
+def test_discover_lists_reachable_tables_and_what_dice_expects(client):
+    FakeDuneClient.rows = [
+        {"table_schema": "balances_ethereum", "table_name": "latest"},
+        {"table_schema": "tokens_ethereum", "table_name": "balances_daily"},
+    ]
+
+    body = client.get("/api/discover", headers={"X-Dune-Api-Key": "k"}).json()
+
+    assert body["count"] == 2
+    assert "balances_ethereum.latest" in body["tables"]
+    assert "information_schema.tables" in FakeDuneClient.calls["query_sql"]
+    # tells the operator what DICE is looking for, so a rename is obvious
+    assert "balances_ethereum.daily_updates" in body["expected_by_dice"]
+    assert "solana_utils.daily_balances" in body["expected_by_dice"]
+
+
+def test_discover_rejects_a_pattern_that_could_break_out_of_the_sql(client):
+    response = client.get(
+        "/api/discover", params={"pattern": "x' OR '1'='1"}, headers={"X-Dune-Api-Key": "k"}
+    )
+
+    assert response.status_code == 422
+    assert "query_sql" not in FakeDuneClient.calls
+
+
+def test_columns_probe_reports_real_column_names(client):
+    FakeDuneClient.rows = [{"address": "0xabc", "balance": 1.0, "valid_from": "2026-07-20"}]
+
+    body = client.get(
+        "/api/columns", params={"chain": "ethereum"}, headers={"X-Dune-Api-Key": "k"}
+    ).json()
+
+    assert body["table"] == "balances_ethereum.daily_updates"
+    assert body["columns"] == ["address", "balance", "valid_from"]
+    assert "LIMIT 1" in FakeDuneClient.calls["query_sql"]
