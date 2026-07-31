@@ -98,7 +98,23 @@ systemctl restart dice
 server_names="$SERVER_NAME"
 [[ -n "$SSLIP_NAME" ]] && server_names="$SERVER_NAME $SSLIP_NAME"
 
-if $SELF_SIGNED; then
+# An existing Let's Encrypt certificate beats generating a self-signed one:
+# certbot may already have been run against the IP's sslip.io name, and this
+# installer replaces the site file certbot wrote its config into.
+LE_NAME=""
+for candidate in "$SERVER_NAME" "$SSLIP_NAME"; do
+    if [[ -n "$candidate" && -f "/etc/letsencrypt/live/$candidate/fullchain.pem" ]]; then
+        LE_NAME="$candidate"
+        break
+    fi
+done
+
+if [[ -n "$LE_NAME" ]] && ! $SELF_SIGNED; then
+    log "Using the existing Let's Encrypt certificate for $LE_NAME"
+    ssl_cert="/etc/letsencrypt/live/$LE_NAME/fullchain.pem"
+    ssl_key="/etc/letsencrypt/live/$LE_NAME/privkey.pem"
+    template="$APP_DIR/deploy/nginx-tls.conf"
+elif $SELF_SIGNED; then
     log "Issuing a self-signed certificate for $SERVER_NAME"
     mkdir -p "$TLS_DIR"
     if $IS_IP; then
@@ -115,6 +131,8 @@ if $SELF_SIGNED; then
     fi
     chmod 600 "$TLS_DIR/dice.key"
     chmod 644 "$TLS_DIR/dice.crt"
+    ssl_cert="$TLS_DIR/dice.crt"
+    ssl_key="$TLS_DIR/dice.key"
     template="$APP_DIR/deploy/nginx-tls.conf"
 else
     template="$APP_DIR/deploy/nginx-http.conf"
@@ -122,7 +140,11 @@ fi
 
 log "Configuring nginx for $server_names"
 install -m 644 "$APP_DIR/deploy/nginx-proxy.conf" /etc/nginx/snippets/dice-proxy.conf
-sed "s|__SERVER_NAME__|$server_names|g" "$template" > /etc/nginx/sites-available/dice
+sed -e "s|__SERVER_NAME__|$server_names|g" \
+    -e "s|__SSL_CERT__|${ssl_cert:-}|g" \
+    -e "s|__SSL_KEY__|${ssl_key:-}|g" \
+    "$template" > /etc/nginx/sites-available/dice
+mkdir -p /var/www/html   # ACME challenge root referenced by the TLS template
 
 # `http2 on;` only exists from nginx 1.25.1. Ubuntu 24.04 ships 1.24, where it
 # is an unknown directive and fails the config test outright.
@@ -155,13 +177,28 @@ if ! curl -fsS --max-time 10 http://127.0.0.1:8000/api/health >/dev/null; then
     exit 1
 fi
 
-scheme=http
-$SELF_SIGNED && scheme=https
-echo "DICE is running at $scheme://$SERVER_NAME"
+if [[ -n "$LE_NAME" ]] && ! $SELF_SIGNED; then
+    echo "DICE is running at https://$LE_NAME"
+elif $SELF_SIGNED; then
+    echo "DICE is running at https://$SERVER_NAME"
+else
+    echo "DICE is running at http://$SERVER_NAME"
+fi
 
 # ---------------------------------------------------------------- next steps
 
-if $SELF_SIGNED; then
+if [[ -n "$LE_NAME" ]] && ! $SELF_SIGNED; then
+cat <<NEXT
+
+HTTPS is served with the Let's Encrypt certificate for $LE_NAME, and
+plain HTTP redirects to it. Renewal keeps working: the ACME challenge path
+stays on cleartext and the certificate is read from its /etc/letsencrypt
+path, so `certbot renew` needs no further changes.
+
+Check renewal any time with:
+    certbot renew --dry-run
+NEXT
+elif $SELF_SIGNED; then
 cat <<NEXT
 
 The certificate is self-signed, so the browser will warn once — that is

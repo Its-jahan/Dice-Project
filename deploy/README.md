@@ -54,6 +54,15 @@ certbot --nginx -d 203.0.113.10.sslip.io
 Then use `https://203.0.113.10.sslip.io` — no browser warning, real
 certificate, auto-renewing. This is the recommended route.
 
+Order does not matter. If certbot ran *before* `install.sh` — say you set up
+the certificate while the server was still showing nginx's welcome page —
+certbot will have written its TLS config into `sites-enabled/default`, which
+`install.sh` replaces. That is fine: the installer looks for an existing
+certificate under `/etc/letsencrypt/live/` for either the server name or its
+sslip.io alias, and points its own vhost at it. HTTP redirects to HTTPS, and
+`/.well-known/acme-challenge/` deliberately stays on cleartext so renewal
+keeps working. Confirm with `certbot renew --dry-run`.
+
 The trade-off: you depend on sslip.io continuing to resolve. It is a
 long-running free service, but it is not yours. If it disappears, renewal
 fails and you fall back to Option B or buy a domain.
