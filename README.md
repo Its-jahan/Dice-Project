@@ -49,6 +49,22 @@ How the key is handled:
 If you deploy DICE publicly, serve it over HTTPS — the key is only as protected
 as the transport carrying it.
 
+## Deploying to a server
+
+```bash
+# on the server, as root
+bash deploy/install.sh your-domain.example      # with a domain
+bash deploy/install.sh 203.0.113.10 --self-signed   # bare IP, no domain
+```
+
+Sets up a `dice` service user, a hardened systemd unit running uvicorn on
+`127.0.0.1:8000`, and an nginx reverse proxy. Re-run it to deploy updates.
+
+TLS matters here more than for a typical app: the Dune API key travels in a
+request header, so plain HTTP puts it on the wire in the clear. Without a
+domain you can still get a **publicly-trusted** certificate via sslip.io — see
+[deploy/README.md](deploy/README.md).
+
 ## Holder modes
 
 | Mode | Meaning | Export shape |
