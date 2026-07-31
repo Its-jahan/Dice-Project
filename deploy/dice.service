@@ -1,0 +1,35 @@
+[Unit]
+Description=DICE — historical token holders
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=dice
+Group=dice
+WorkingDirectory=/opt/dice/backend
+EnvironmentFile=-/etc/dice/dice.env
+ExecStart=/opt/dice/backend/.venv/bin/uvicorn app.main:app \
+    --host 127.0.0.1 --port 8000 --workers 2 --proxy-headers \
+    --forwarded-allow-ips 127.0.0.1
+Restart=on-failure
+RestartSec=3
+
+# The app only needs to read its own code and talk to api.dune.com.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+# AF_UNIX is needed for the multi-worker manager's internal pipes.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
