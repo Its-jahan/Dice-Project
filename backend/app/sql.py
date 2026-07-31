@@ -182,26 +182,46 @@ ORDER BY snapshot_date, balance DESC
 #: conservative character set rather than escaped.
 _SAFE_PATTERN = re.compile(r"^[A-Za-z0-9_]{1,40}$")
 
+#: Curated namespaces where Dune keeps balance data. Matching on the *schema*
+#: is essential: Dune hosts hundreds of thousands of user-decoded contract
+#: tables, and a free-text search for "balance" drowns in `*_call_balanceof`.
+CURATED_SCHEMA_PREFIXES = ("balances", "tokens", "solana_utils")
 
-def build_discovery_sql(pattern: str) -> str:
+#: Row cap for the discovery query, shared with the API so the two cannot drift.
+DISCOVERY_LIMIT = 500
+
+
+def build_discovery_sql(pattern: str | None = None) -> str:
     """Ask Dune which balance tables this API key can actually see.
 
     Dune's balance tables are Open Beta: they get renamed, and some are gated
     behind plan tiers, which surfaces as "does not exist or it is private".
     Rather than guessing at names, this reads ``information_schema`` — which
     only lists what the caller is entitled to — and reports the truth.
+
+    Decoded contract tables (``*_call_*``, ``*_evt_*``) are excluded: they are
+    per-contract ABI decodings, never a source of balances, and there are far
+    too many of them to page through.
     """
-    if not _SAFE_PATTERN.match(pattern):
-        raise ValueError("pattern must be 1-40 characters of [A-Za-z0-9_]")
-    needle = f"'%{pattern.lower()}%'"
+    if pattern is not None:
+        if not _SAFE_PATTERN.match(pattern):
+            raise ValueError("pattern must be 1-40 characters of [A-Za-z0-9_]")
+        schema_match = f"lower(table_schema) LIKE '%{pattern.lower()}%'"
+    else:
+        schema_match = "\n       OR ".join(
+            f"lower(table_schema) LIKE '{prefix}%'"
+            for prefix in CURATED_SCHEMA_PREFIXES
+        )
+
     return f"""
--- DICE: which tables matching {needle} can this key see?
+-- DICE: which curated balance tables can this key see?
 SELECT table_schema, table_name
 FROM information_schema.tables
-WHERE lower(table_schema) LIKE {needle}
-   OR lower(table_name) LIKE {needle}
+WHERE ({schema_match})
+  AND table_name NOT LIKE '%\\_call\\_%' ESCAPE '\\'
+  AND table_name NOT LIKE '%\\_evt\\_%' ESCAPE '\\'
 ORDER BY table_schema, table_name
-LIMIT 300
+LIMIT {DISCOVERY_LIMIT}
 """.strip()
 
 

@@ -26,6 +26,7 @@ from .holders import apply_holder_mode, build_summary, parse_rows
 from .jobs import store
 from .models import Chain, ExportFormat, HoldersRequest, HoldersResponse
 from .sql import (
+    DISCOVERY_LIMIT,
     build_columns_sql,
     build_discovery_sql,
     build_query_parameters,
@@ -121,7 +122,7 @@ async def _run_sql(client: DuneClient, *, name: str, sql: str, max_rows: int):
 
 @app.get("/api/discover")
 async def discover_tables(
-    pattern: str = "balance",
+    pattern: str | None = None,
     x_dune_api_key: ApiKeyHeader = None,
 ) -> dict[str, object]:
     """List the balance tables this Dune key can actually reach.
@@ -138,7 +139,10 @@ async def discover_tables(
 
     async with DuneClient(key) as client:
         rows = await _run_sql(
-            client, name=f"DICE discover {pattern}", sql=sql, max_rows=300
+            client,
+            name=f"DICE discover {pattern or 'curated'}",
+            sql=sql,
+            max_rows=DISCOVERY_LIMIT,
         )
 
     tables = sorted(
@@ -147,6 +151,9 @@ async def discover_tables(
     return {
         "pattern": pattern,
         "count": len(tables),
+        # The SQL caps at 500 rows. Say so rather than let an alphabetically
+        # truncated list read as "these are all the tables that exist".
+        "truncated": len(tables) >= DISCOVERY_LIMIT,
         "tables": tables,
         "expected_by_dice": sorted({table_for(chain) for chain in Chain}),
     }

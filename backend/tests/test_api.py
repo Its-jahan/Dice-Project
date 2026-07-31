@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 from app import main
 from app.config import settings
 from app.dune import DuneAuthError
+from app.sql import DISCOVERY_LIMIT
 
 TOKEN = "0x1234567890abcdef1234567890abcdef12345678"
 WALLET_A = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -187,8 +188,16 @@ def test_discover_lists_reachable_tables_and_what_dice_expects(client):
     body = client.get("/api/discover", headers={"X-Dune-Api-Key": "k"}).json()
 
     assert body["count"] == 2
+    assert body["truncated"] is False
     assert "balances_ethereum.latest" in body["tables"]
-    assert "information_schema.tables" in FakeDuneClient.calls["query_sql"]
+
+    sql = FakeDuneClient.calls["query_sql"]
+    assert "information_schema.tables" in sql
+    # Match on the schema, not free text: Dune hosts a vast number of decoded
+    # per-contract tables and "%balance%" on table_name drowns in them.
+    assert "lower(table_schema) LIKE 'balances%'" in sql
+    assert r"NOT LIKE '%\_call\_%'" in sql
+    assert r"NOT LIKE '%\_evt\_%'" in sql
     # tells the operator what DICE is looking for, so a rename is obvious
     assert "balances_ethereum.daily_updates" in body["expected_by_dice"]
     assert "solana_utils.daily_balances" in body["expected_by_dice"]
@@ -220,3 +229,14 @@ def test_responses_are_not_cacheable(client):
     for path in ("/", "/static/app.js", "/api/config"):
         response = client.get(path)
         assert "no-store" in response.headers.get("cache-control", ""), path
+
+
+def test_discover_flags_a_truncated_listing(client):
+    """A silently truncated list reads as "this is everything", and is not."""
+    FakeDuneClient.rows = [
+        {"table_schema": f"s{i:04d}", "table_name": "t"} for i in range(DISCOVERY_LIMIT)
+    ]
+
+    body = client.get("/api/discover", headers={"X-Dune-Api-Key": "k"}).json()
+
+    assert body["truncated"] is True

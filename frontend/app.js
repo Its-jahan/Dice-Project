@@ -190,10 +190,13 @@ async function diagnose() {
   await withBusy($("diagnoseBtn"), async () => {
     setStatus("runStatus", "Asking Dune which balance tables your key can see…", "");
     try {
-      const data = await api("/api/discover?pattern=balance");
+      // No pattern: the backend searches Dune's curated balance schemas.
+      // A free-text search drowns in per-contract decoded tables.
+      const data = await api("/api/discover");
       const reachable = new Set(data.tables);
       const lines = [
-        `Tables matching "balance" your key can reach: ${data.count}`,
+        `Curated balance tables your key can reach: ${data.count}` +
+          (data.truncated ? " (list truncated)" : ""),
         "",
         "What DICE expects:",
         ...data.expected_by_dice.map(
