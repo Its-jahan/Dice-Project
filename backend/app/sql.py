@@ -11,8 +11,22 @@ The three holder modes (daily / any_time / continuous) are all derived from the
 same daily snapshot set in :mod:`app.holders`, so one Dune execution answers
 all of them and we only pay for the query once.
 
-Dune's curated balance tables are in Open Beta; if a table name or column
-changes upstream, this module is the only place that needs editing.
+Table shapes
+------------
+EVM balances live in a per-chain schema, ``balances_<chain>.daily_updates``.
+That table is *sparse*: one row per balance change, carrying a validity
+interval ``[valid_from, valid_to)`` rather than one row per day. A holder who
+does nothing for a month is a single row spanning that month. So to get one row
+per day we expand each interval against a generated calendar — which is exactly
+the case that matters, and the reason a transfer-based query gets it wrong.
+
+Solana balances live in ``solana_utils.daily_balances``, which *is* dense (one
+row per address, mint and day), so it needs no interval expansion — only
+aggregation per owner.
+
+Dune's balance tables are in Open Beta. If a name changes upstream, this module
+is the only place that needs editing, and ``GET /api/columns`` will tell you
+what the table actually looks like now.
 """
 
 from __future__ import annotations
@@ -25,6 +39,17 @@ EVM_BURN_ADDRESSES = (
     "0x000000000000000000000000000000000000dead",
 )
 SOLANA_BURN_ADDRESSES = ("11111111111111111111111111111111",)
+
+SOLANA_BALANCES_TABLE = "solana_utils.daily_balances"
+
+
+def evm_table(chain: Chain) -> str:
+    """Per-chain balances schema, e.g. ``balances_ethereum.daily_updates``."""
+    return f"balances_{chain.value}.daily_updates"
+
+
+def table_for(chain: Chain) -> str:
+    return SOLANA_BALANCES_TABLE if chain is Chain.solana else evm_table(chain)
 
 
 def _quote(value: str) -> str:
@@ -51,37 +76,64 @@ def build_snapshot_sql(req: HoldersRequest) -> str:
     return _solana_sql(req) if req.chain is Chain.solana else _evm_sql(req)
 
 
+def _calendar_cte(req: HoldersRequest) -> str:
+    """One row per day in the requested range, in UTC."""
+    return f"""WITH calendar AS (
+    SELECT day
+    FROM UNNEST(
+        sequence(
+            date {_quote(req.start_date.isoformat())},
+            date {_quote(req.end_date.isoformat())},
+            interval '1' day
+        )
+    ) AS t(day)
+)"""
+
+
 def _evm_sql(req: HoldersRequest) -> str:
+    start = f"date {_quote(req.start_date.isoformat())}"
+    end = f"date {_quote(req.end_date.isoformat())}"
+
     filters = [
-        f"b.blockchain = {_quote(req.chain.value)}",
         f"b.token_address = {_quote(req.token_address)}",
-        f"b.day >= date {_quote(req.start_date.isoformat())}",
-        f"b.day <= date {_quote(req.end_date.isoformat())}",
+        # Narrow to intervals that can overlap the window at all, so the engine
+        # prunes before the calendar cross join rather than after it.
+        f"b.valid_from <= {end}",
+        f"(b.valid_to IS NULL OR b.valid_to > {start})",
+        # Expand each interval to the days it actually covers. valid_to is
+        # exclusive, and NULL means "still valid".
+        "b.valid_from <= cal.day",
+        "(b.valid_to IS NULL OR b.valid_to > cal.day)",
         f"b.balance > {req.min_balance!r}",
     ]
     if req.exclude_burn_addresses:
         filters.append(f"b.address NOT IN ({_address_list(EVM_BURN_ADDRESSES)})")
     if not req.include_contracts:
-        filters.append("c.address IS NULL")
+        filters.append("cm.address IS NULL")
 
     contract_join = (
-        "\n  LEFT JOIN contracts.contract_mapping c\n"
-        "         ON c.blockchain = b.blockchain\n"
-        "        AND c.address = b.address"
+        "\n  LEFT JOIN contracts.contract_mapping cm\n"
+        f"         ON cm.blockchain = {_quote(req.chain.value)}\n"
+        "        AND cm.address = b.address"
         if not req.include_contracts
         else ""
     )
 
     return f"""
 -- DICE: historical holders (daily end-of-day balances)
+-- {evm_table(req.chain)} is sparse: each row is a balance that held over
+-- [valid_from, valid_to). The calendar join expands those intervals into the
+-- one-row-per-day shape DICE exports.
+{_calendar_cte(req)}
 SELECT
-    b.address        AS wallet_address,
-    b.token_address  AS token_address,
-    b.day            AS snapshot_date,
-    b.balance        AS balance
-FROM tokens.balances_daily b{contract_join}
+    b.address       AS wallet_address,
+    b.token_address AS token_address,
+    cal.day         AS snapshot_date,
+    b.balance       AS balance
+FROM {evm_table(req.chain)} b
+CROSS JOIN calendar cal{contract_join}
 WHERE {_where(filters, "")}
-ORDER BY b.day, b.balance DESC
+ORDER BY cal.day, b.balance DESC
 """.strip()
 
 
@@ -102,6 +154,8 @@ def _solana_sql(req: HoldersRequest) -> str:
 
     return f"""
 -- DICE: historical holders (daily end-of-day balances, Solana owners)
+-- {SOLANA_BALANCES_TABLE} already has one row per address, mint and day,
+-- so no interval expansion is needed here.
 SELECT
     wallet_address,
     token_address,
@@ -109,17 +163,26 @@ SELECT
     balance
 FROM (
     SELECT
-        b.address                 AS wallet_address,
-        b.token_mint_address      AS token_address,
-        b.day                     AS snapshot_date,
-        SUM(b.balance)            AS balance
-    FROM tokens_solana.balances_daily b
+        b.address              AS wallet_address,
+        b.token_mint_address   AS token_address,
+        b.day                  AS snapshot_date,
+        SUM(b.token_balance)   AS balance
+    FROM {SOLANA_BALANCES_TABLE} b
     WHERE {_where(filters, "    ")}
     GROUP BY 1, 2, 3
 )
 WHERE balance > {req.min_balance!r}
 ORDER BY snapshot_date, balance DESC
 """.strip()
+
+
+def build_columns_sql(chain: Chain) -> str:
+    """Probe query: what does the balance table for this chain look like now?
+
+    Cheap escape hatch for the Open Beta problem — if Dune renames a column,
+    this shows the real schema without guessing.
+    """
+    return f"SELECT * FROM {table_for(chain)} LIMIT 1"
 
 
 def build_query_parameters(req: HoldersRequest) -> dict[str, str | float]:

@@ -102,6 +102,7 @@ HTML is a standalone, filterable page with no external assets.
 | `GET /api/config` | UI bootstrap — key presence, execution mode, row caps. |
 | `POST /api/key/validate` | Check a Dune key. Header: `X-Dune-Api-Key`. |
 | `POST /api/sql` | Preview the generated DuneSQL. No key, no credits. |
+| `GET /api/columns?chain=ethereum` | Real column names of the source balance table (Open Beta escape hatch). |
 | `POST /api/holders` | Run the query; returns a preview + `job_id`. |
 | `GET /api/export/{job_id}?format=csv\|xlsx\|json\|html` | Download the full result. |
 | `GET /api/health` | Liveness. |
@@ -134,16 +135,28 @@ declaring `blockchain`, `token_address`, `start_date`, `end_date` and
 `minimum_balance`. DICE then only passes parameter values — this works on any
 paid plan. Use `POST /api/sql` to get SQL to paste into that saved query.
 
-## Chains
+## Chains and source tables
 
-EVM: Ethereum, Base, Arbitrum, Optimism, Polygon — via `tokens.balances_daily`.
+EVM (Ethereum, Base, Arbitrum, Optimism, Polygon) reads
+`balances_<chain>.daily_updates` — the chain lives in the schema name, so there
+is no `blockchain` column to filter on.
 
-Solana: via `tokens_solana.balances_daily`, aggregated **per owner**. A Solana
-wallet can control several token accounts for one mint, so DICE sums them;
-otherwise one holder appears as several fragmented rows.
+That table is **sparse**: one row per balance change, carrying a validity
+interval `[valid_from, valid_to)` rather than one row per day. A wallet that
+bought before the window and held through it is a *single* row spanning the
+whole range. DICE expands those intervals against a generated calendar to get
+one row per day — without that step the steady holders, the ones this tool
+exists to find, would each collapse to a single row.
 
-Dune's curated balance tables are in Open Beta. If a table or column changes
-upstream, `backend/app/sql.py` is the only file that needs editing.
+Solana reads `solana_utils.daily_balances`, which is already dense (one row per
+address, mint and day), aggregated **per owner** — a Solana wallet can control
+several token accounts for one mint, and summing them keeps one holder from
+appearing as several fragmented rows.
+
+Dune's balance tables are in Open Beta and have been renamed before. If a query
+starts failing with "table does not exist", `GET /api/columns?chain=ethereum`
+returns the real column names of the table DICE reads, and
+`backend/app/sql.py` is the only file that needs editing.
 
 ## Known limits
 

@@ -145,7 +145,7 @@ def test_unknown_job_id_is_a_clean_404(client):
 def test_ad_hoc_mode_creates_a_query_from_generated_sql(client):
     client.post("/api/holders", json=BASE_REQUEST, headers={"X-Dune-Api-Key": "k"})
 
-    assert "tokens.balances_daily" in FakeDuneClient.calls["query_sql"]
+    assert "balances_ethereum.daily_updates" in FakeDuneClient.calls["query_sql"]
     assert FakeDuneClient.calls["query_id"] == 4242
     assert FakeDuneClient.calls["parameters"] is None
 
@@ -164,7 +164,7 @@ def test_sql_preview_needs_no_key(client):
     response = client.post("/api/sql", json=BASE_REQUEST)
 
     assert response.status_code == 200
-    assert "tokens.balances_daily" in response.json()["sql"]
+    assert "balances_ethereum.daily_updates" in response.json()["sql"]
 
 
 def test_invalid_request_is_rejected_before_touching_dune(client):

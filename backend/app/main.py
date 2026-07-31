@@ -24,8 +24,13 @@ from .dune import DuneClient, DuneError
 from .exporters import MEDIA_TYPES, export, filename_for
 from .holders import apply_holder_mode, build_summary, parse_rows
 from .jobs import store
-from .models import ExportFormat, HoldersRequest, HoldersResponse
-from .sql import build_query_parameters, build_snapshot_sql
+from .models import Chain, ExportFormat, HoldersRequest, HoldersResponse
+from .sql import (
+    build_columns_sql,
+    build_query_parameters,
+    build_snapshot_sql,
+    table_for,
+)
 
 log = logging.getLogger(__name__)
 
@@ -87,6 +92,33 @@ async def preview_sql(req: Annotated[HoldersRequest, Body()]) -> dict[str, objec
         "sql": build_snapshot_sql(req),
         "parameters": build_query_parameters(req),
         "execution_mode": "saved_query" if settings.dune_query_id else "ad_hoc",
+    }
+
+
+@app.get("/api/columns")
+async def describe_source_table(
+    chain: Chain = Chain.ethereum,
+    x_dune_api_key: ApiKeyHeader = None,
+) -> dict[str, object]:
+    """Report the real column names of the balance table DICE reads.
+
+    Dune's balance tables are in Open Beta and have been renamed before. When a
+    query starts failing with "table/column does not exist", this says what the
+    source actually looks like today instead of leaving you to guess.
+    """
+    key = resolve_api_key(x_dune_api_key)
+    async with DuneClient(key) as client:
+        query_id = await client.create_query(
+            name=f"DICE schema probe {chain.value}",
+            query_sql=build_columns_sql(chain),
+        )
+        execution_id = await client.execute_query(query_id)
+        await client.wait_for_execution(execution_id)
+        rows, _ = await client.fetch_results(execution_id, max_rows=1)
+    return {
+        "table": table_for(chain),
+        "columns": sorted(rows[0].keys()) if rows else [],
+        "sample_row": rows[0] if rows else None,
     }
 
 
