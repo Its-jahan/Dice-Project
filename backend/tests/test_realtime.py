@@ -125,11 +125,20 @@ def test_delivery_without_a_valid_signature_is_rejected(client):
     ) == []
 
 
-def test_delivery_for_an_unknown_webhook_is_rejected(client):
+def test_delivery_for_an_unknown_webhook_is_ignored_but_answered_ok(client):
+    _live_watchlist(client)
     payload = _payload(_activity(WALLETS[0]))
     payload["webhookId"] = "wh_not_ours"
 
-    assert _deliver(client, payload).status_code == 404
+    response = _deliver(client, payload)
+
+    # 200 so Alchemy's creation-time probe does not mark the endpoint broken,
+    # but nothing is trusted or stored from an unverifiable delivery.
+    assert response.status_code == 200
+    assert response.json()["ignored"] == "unknown webhook id"
+    assert db.events_in_window(
+        chain="ethereum", token_address=GEM, since_iso="2000-01-01", wallets=WALLETS
+    ) == []
 
 
 # -------------------------------------------------------------------- parsing

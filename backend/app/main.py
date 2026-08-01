@@ -778,8 +778,13 @@ async def receive_alchemy_webhook(request: Request) -> dict[str, object]:
     webhook_id = str(payload.get("webhookId") or "")
     registration = db.webhook_by_id(webhook_id) if webhook_id else None
     if registration is None:
-        # Not a webhook this server created: refuse rather than trust it.
-        raise HTTPException(status_code=404, detail="Unknown webhook id.")
+        # Not a webhook this server created, so there is no signing key to
+        # verify it with and nothing is processed. Answered 200 on purpose:
+        # Alchemy probes the URL around creation time — before the id is
+        # stored — and treats non-2xx replies as a failing endpoint worth
+        # retrying and eventually disabling.
+        log.warning("ignored delivery for unregistered webhook %r", webhook_id)
+        return {"ignored": "unknown webhook id", "events": 0, "signals": 0}
 
     signature = request.headers.get("X-Alchemy-Signature")
     if not alchemy.verify_signature(raw, signature, registration["signing_key"]):
