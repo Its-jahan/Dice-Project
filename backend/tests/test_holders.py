@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
 
@@ -101,3 +101,50 @@ def test_build_summary_reports_window_and_balance_envelope():
     assert a.avg_balance == pytest.approx(200)
     # sorted by max_balance descending
     assert summary[0].wallet_address == WALLET_A
+
+
+def test_future_end_dates_are_clamped_to_today():
+    """A still-current balance row matches every future calendar day.
+
+    Without clamping, asking for an end date in the future makes DICE project
+    today's balances forward and emit snapshots for days that never happened.
+    """
+    from app.models import utc_today
+
+    far_future = (utc_today() + timedelta(days=30)).isoformat()
+    req = make_request(start_date=utc_today().isoformat(), end_date=far_future)
+
+    assert req.effective_end_date == utc_today()
+    assert req.end_date_clamped is True
+    assert req.days == 1
+    assert req.requested_days == 31
+
+
+def test_a_past_end_date_is_left_alone():
+    req = make_request(start_date="2026-07-20", end_date="2026-07-22")
+
+    assert req.effective_end_date == date(2026, 7, 22)
+    assert req.end_date_clamped is False
+    assert req.days == 3
+
+
+def test_rows_after_today_are_dropped_even_if_dune_returns_them():
+    from app.models import utc_today
+
+    today = utc_today()
+    req = make_request(
+        start_date=today.isoformat(),
+        end_date=(today + timedelta(days=5)).isoformat(),
+    )
+    rows = [
+        {"wallet_address": WALLET_A, "day": today.isoformat(), "balance": 10},
+        {
+            "wallet_address": WALLET_A,
+            "day": (today + timedelta(days=3)).isoformat(),
+            "balance": 10,
+        },
+    ]
+
+    snapshots = parse_rows(rows, req)
+
+    assert [s.snapshot_date for s in snapshots] == [today]

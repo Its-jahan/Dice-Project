@@ -6,7 +6,7 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable
 
-from .models import HolderMode, HoldersRequest, Snapshot, WalletSummary
+from .models import HolderMode, HoldersRequest, Snapshot, WalletSummary, utc_today
 
 
 def parse_rows(rows: Iterable[dict[str, Any]], req: HoldersRequest) -> list[Snapshot]:
@@ -30,7 +30,7 @@ def parse_rows(rows: Iterable[dict[str, Any]], req: HoldersRequest) -> list[Snap
             continue
         if balance <= 0 or balance < req.min_balance:
             continue
-        if not (req.start_date <= snapshot_date <= req.end_date):
+        if not (req.start_date <= snapshot_date <= req.effective_end_date):
             continue
 
         token = _first(row, "token_address", "token_mint_address") or req.token_address
@@ -99,10 +99,6 @@ def build_summary(snapshots: Iterable[Snapshot]) -> list[WalletSummary]:
 
     summaries.sort(key=lambda s: (-s.max_balance, s.wallet_address))
     return summaries
-
-
-def utc_today() -> date:
-    return datetime.now(timezone.utc).date()
 
 
 # --------------------------------------------------------------------- utils

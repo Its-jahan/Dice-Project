@@ -248,7 +248,10 @@ function renderResults(data) {
     `${data.wallet_count.toLocaleString()} wallets · ` +
     `${data.row_count.toLocaleString()} snapshot rows · ` +
     `execution ${data.execution_id}` +
-    (data.truncated ? " · row cap reached, export is truncated" : "");
+    (data.truncated ? " · row cap reached, export is truncated" : "") +
+    (data.end_date_clamped
+      ? ` · end date clamped to ${data.effective_end_date} — no data exists after today`
+      : "");
   $("previewNote").textContent =
     data.row_count > state.preview.length
       ? `Showing the first ${state.preview.length.toLocaleString()} rows — ` +
@@ -312,6 +315,10 @@ function initDates() {
   const start = new Date(today.getTime() - 6 * 86400000).toISOString().slice(0, 10);
   $("startDate").value = start;
   $("endDate").value = end;
+  // Nothing exists after today; a future end date would otherwise project
+  // current balances forward into days that have not happened.
+  $("startDate").max = end;
+  $("endDate").max = end;
 }
 
 function init() {

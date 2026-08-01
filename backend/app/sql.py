@@ -106,7 +106,7 @@ def _calendar_cte(req: HoldersRequest) -> str:
     FROM UNNEST(
         sequence(
             date {_quote(req.start_date.isoformat())},
-            date {_quote(req.end_date.isoformat())},
+            date {_quote(req.effective_end_date.isoformat())},
             interval '1' day
         )
     ) AS t(day)
@@ -138,7 +138,7 @@ def _contract_filter(req: HoldersRequest, src: Source) -> tuple[str, str]:
 def _interval_sql(req: HoldersRequest, src: Source) -> str:
     """Sparse table: expand each ``[valid_from, valid_to)`` over the calendar."""
     start = f"date {_quote(req.start_date.isoformat())}"
-    end = f"date {_quote(req.end_date.isoformat())}"
+    end = f"date {_quote(req.effective_end_date.isoformat())}"
 
     filters = [
         f"b.{src.token} = {_address_literal(req.chain, req.token_address)}",
@@ -190,7 +190,7 @@ def _daily_sql(req: HoldersRequest, src: Source) -> str:
     filters = [
         f"b.{src.token} = {_address_literal(req.chain, req.token_address)}",
         f"b.{src.day} >= date {_quote(req.start_date.isoformat())}",
-        f"b.{src.day} <= date {_quote(req.end_date.isoformat())}",
+        f"b.{src.day} <= date {_quote(req.effective_end_date.isoformat())}",
     ]
     if req.exclude_burn_addresses:
         filters.append(

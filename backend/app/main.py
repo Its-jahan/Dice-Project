@@ -302,6 +302,8 @@ async def get_holders(
         "row_count": result.row_count,
         "wallet_count": result.wallet_count,
         "truncated": result.truncated,
+        "effective_end_date": req.effective_end_date.isoformat(),
+        "end_date_clamped": req.end_date_clamped,
         "preview": [s.model_dump(mode="json") for s in snapshots[:PREVIEW_ROWS]],
         "summary_preview": [s.model_dump(mode="json") for s in summary[:PREVIEW_ROWS]],
     }

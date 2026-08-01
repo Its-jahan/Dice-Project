@@ -12,6 +12,11 @@ exactly the holders that matter most.
 > **Holder** = an address whose end-of-day (UTC) balance is greater than zero
 > (or greater than the requested minimum).
 
+An end date later than today is clamped to today, and the response says so. A
+still-current balance row carries `valid_to IS NULL`, which matches *every*
+future calendar day — unclamped, a future end date would project today's
+balances forward and emit snapshots for days that have not happened.
+
 ## Quick start
 
 ```bash

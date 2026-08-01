@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from datetime import date
+from datetime import date, datetime, timezone
 from enum import Enum
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -15,6 +15,10 @@ SOLANA_MINT_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 # Maximum span we allow in a single job. Daily snapshots for a wide range on a
 # popular token get expensive fast, both in Dune credits and in export size.
 MAX_RANGE_DAYS = 366
+
+
+def utc_today() -> date:
+    return datetime.now(timezone.utc).date()
 
 
 class Chain(str, Enum):
@@ -82,7 +86,27 @@ class HoldersRequest(BaseModel):
         return self
 
     @property
+    def effective_end_date(self) -> date:
+        """The last day that can actually have data: never later than today.
+
+        A sparse balance row that is still current carries ``valid_to IS NULL``,
+        which matches *every* future calendar day. Left unclamped, a future end
+        date makes DICE project today's balances forward and emit snapshots for
+        days that have not happened. Clamping keeps the output to observed data.
+        """
+        return min(self.end_date, utc_today())
+
+    @property
+    def end_date_clamped(self) -> bool:
+        return self.effective_end_date < self.end_date
+
+    @property
     def days(self) -> int:
+        """Days actually covered, after clamping to today."""
+        return max((self.effective_end_date - self.start_date).days + 1, 0)
+
+    @property
+    def requested_days(self) -> int:
         return (self.end_date - self.start_date).days + 1
 
 
