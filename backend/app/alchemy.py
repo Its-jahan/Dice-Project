@@ -163,29 +163,30 @@ class AlchemyNotifyClient:
         self, webhook_id: str, *, add: list[str], remove: list[str]
     ) -> None:
         """Add and/or remove addresses, in batches. Idempotent on Alchemy's side."""
-        for index in range(0, max(len(add), 1), ADDRESS_BATCH):
-            chunk_add = add[index : index + ADDRESS_BATCH]
-            if not chunk_add and index:
-                break
-            if not chunk_add and not remove:
-                break
+        chunks = [
+            add[index : index + ADDRESS_BATCH]
+            for index in range(0, len(add), ADDRESS_BATCH)
+        ] or [[]]
+        for position, chunk in enumerate(chunks):
+            # Removals ride along with the first call; later calls only add.
+            removals = remove if position == 0 else []
+            if not chunk and not removals:
+                continue
             await self._request(
                 "PATCH",
                 "/update-webhook-addresses",
                 json={
                     "webhook_id": webhook_id,
-                    "addresses_to_add": chunk_add,
-                    # Removals ride along with the first batch only.
-                    "addresses_to_remove": remove if index == 0 else [],
+                    "addresses_to_add": chunk,
+                    "addresses_to_remove": removals,
                 },
             )
-            if not add:
-                break
 
     async def list_addresses(self, webhook_id: str, *, limit: int = 100) -> list[str]:
         """Every address currently registered, following Alchemy's cursor."""
         addresses: list[str] = []
         after: str | None = None
+        seen_cursors: set[str] = set()
         while True:
             params: dict[str, Any] = {"webhook_id": webhook_id, "limit": limit}
             if after:
@@ -194,9 +195,15 @@ class AlchemyNotifyClient:
             page = data.get("data") or []
             addresses.extend(str(item) for item in page)
             pagination = data.get("pagination") or {}
-            after = pagination.get("cursors", {}).get("after")
+            after = (pagination.get("cursors") or {}).get("after")
             if not after or not page:
                 return addresses
+            if after in seen_cursors:
+                # A cursor that does not advance would loop forever against a
+                # remote API; take what we have rather than hang the sync.
+                log.warning("Alchemy address cursor stalled for %s", webhook_id)
+                return addresses
+            seen_cursors.add(after)
 
     async def delete_webhook(self, webhook_id: str) -> None:
         await self._request(
