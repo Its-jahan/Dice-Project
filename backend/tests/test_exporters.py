@@ -95,3 +95,47 @@ def test_filename_carries_the_request_shape():
 
     assert name.startswith("dice_ethereum_0x12345678_2026-07-20_2026-07-21_daily_")
     assert name.endswith(".csv")
+
+
+def test_download_follows_the_requested_dataset_not_just_the_mode():
+    """Downloading from the summary tab must yield the summary.
+
+    In daily mode the export otherwise leads with snapshots regardless of
+    which table the user is looking at.
+    """
+    result = make_result("daily")
+
+    summary_csv = export(result, ExportFormat.csv, "summary").decode("utf-8-sig")
+    snapshot_csv = export(result, ExportFormat.csv, "snapshots").decode("utf-8-sig")
+
+    assert summary_csv.splitlines()[0].startswith("wallet_address,first_date")
+    assert snapshot_csv.splitlines()[0].startswith("wallet_address,token_address")
+
+
+def test_auto_still_follows_the_holder_mode():
+    daily = export(make_result("daily"), ExportFormat.csv, "auto").decode("utf-8-sig")
+    any_time = export(
+        make_result("any_time"), ExportFormat.csv, "auto"
+    ).decode("utf-8-sig")
+
+    assert "token_address" in daily.splitlines()[0]
+    assert "days_held" in any_time.splitlines()[0]
+
+
+def test_xlsx_leads_with_the_requested_dataset():
+    from openpyxl import load_workbook
+
+    workbook = load_workbook(
+        io.BytesIO(export(make_result("daily"), ExportFormat.xlsx, "summary"))
+    )
+
+    assert workbook.sheetnames[0] == "Summary"
+    # both tables are still present, only the order changes
+    assert "Snapshots" in workbook.sheetnames
+
+
+def test_filename_says_which_table_it_holds():
+    result = make_result("daily")
+
+    assert "_summary_" in filename_for(result, ExportFormat.csv, "summary")
+    assert "_snapshots_" in filename_for(result, ExportFormat.csv, "snapshots")

@@ -82,7 +82,7 @@ def build_catalog_sql(chain: Chain) -> str:
     """
     return f"""
 -- DICE: catalogue of readable balance tables for {chain.value}
-SELECT table_schema, table_name, column_name
+SELECT table_schema, table_name, column_name, data_type
 FROM information_schema.columns
 WHERE lower(table_schema) LIKE '{schema_pattern(chain)}'
   AND table_name IN ({", ".join(_quote(t) for t in TABLE_PREFERENCE)})
@@ -179,16 +179,24 @@ def _interval_sql(
     start = f"date {_quote(req.start_date.isoformat())}"
     end = f"date {_quote(req.effective_end_date.isoformat())}"
 
+    # A holder "on day D" means: holding at the *end* of day D, which is the
+    # instant D + 1 day. Testing against the end of the day rather than its
+    # start matters when valid_from carries a time: a wallet that bought at
+    # 14:00 on the 21st holds at end-of-day on the 21st, but `valid_from <=
+    # date '2026-07-21'` (i.e. midnight) would miss it and report the 22nd as
+    # its first day. Written this way the predicate is correct whether the
+    # column is a date or a timestamp.
+    day_end = f"cal.day + interval '1' day"
     filters = [
         f"b.{src.token} = {_address_literal(req.chain, req.token_address)}",
         # Narrow to intervals that can overlap the window at all, so the engine
         # prunes before the calendar cross join rather than after it.
-        f"b.{src.valid_from} <= {end}",
+        f"b.{src.valid_from} < {end} + interval '1' day",
         f"(b.{src.valid_to} IS NULL OR b.{src.valid_to} > {start})",
         # Expand each interval to the days it covers. valid_to is exclusive,
         # and NULL means the balance is still current.
-        f"b.{src.valid_from} <= cal.day",
-        f"(b.{src.valid_to} IS NULL OR b.{src.valid_to} > cal.day)",
+        f"b.{src.valid_from} < {day_end}",
+        f"(b.{src.valid_to} IS NULL OR b.{src.valid_to} >= {day_end})",
         f"b.{src.balance} > {req.min_balance!r}",
     ]
     if req.exclude_burn_addresses:

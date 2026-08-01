@@ -94,16 +94,31 @@ def test_interval_sql_expands_validity_intervals_into_one_row_per_day():
 
     assert "sequence(" in sql and "interval '1' day" in sql
     assert "CROSS JOIN calendar cal" in sql
-    assert "b.valid_from <= cal.day" in sql
-    # valid_to is exclusive, and NULL means the balance is still current
-    assert "(b.valid_to IS NULL OR b.valid_to > cal.day)" in sql
     assert "cal.day AS snapshot_date" in sql
+
+
+def test_membership_is_tested_at_end_of_day_not_at_midnight():
+    """"Holder on day D" means holding at the *end* of D.
+
+    If valid_from carries a time, a wallet that bought at 14:00 on the 21st
+    holds at end-of-day on the 21st — but `valid_from <= date '2026-07-21'`
+    compares against midnight and would report the 22nd as its first day,
+    shifting every intra-day acquisition one day late.
+    """
+    sql = build_snapshot_sql(make(), INTERVAL_SOURCE)
+
+    assert "b.valid_from < cal.day + interval '1' day" in sql
+    assert (
+        "(b.valid_to IS NULL OR b.valid_to >= cal.day + interval '1' day)" in sql
+    )
+    # the midnight comparison must be gone
+    assert "b.valid_from <= cal.day" not in sql
 
 
 def test_interval_sql_prunes_before_the_calendar_join():
     sql = build_snapshot_sql(make(), INTERVAL_SOURCE)
 
-    assert "b.valid_from <= date '2026-07-31'" in sql
+    assert "b.valid_from < date '2026-07-31' + interval '1' day" in sql
     assert "(b.valid_to IS NULL OR b.valid_to > date '2026-07-20')" in sql
 
 

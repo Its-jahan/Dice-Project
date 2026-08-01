@@ -208,7 +208,10 @@ async function diagnose() {
         "Column mapping:",
         ...Object.entries(cols)
           .filter(([, value]) => value)
-          .map(([role, value]) => `  ${role.padEnd(11)}${value}`),
+          .map(([role, value]) => {
+            const type = (data.column_types || {})[value];
+            return `  ${role.padEnd(11)}${value}${type ? `  (${type})` : ""}`;
+          }),
       ];
       $("sqlOut").textContent = lines.join("\n");
       $("sqlCard").classList.remove("hidden");
@@ -257,7 +260,13 @@ function renderResults(data) {
       ? `Showing the first ${state.preview.length.toLocaleString()} rows — ` +
         "download for the full result."
       : "";
+  updateDownloadLabel();
   renderTable();
+}
+
+function updateDownloadLabel() {
+  $("downloadBtn").textContent =
+    state.tab === "summary" ? "Download summary" : "Download snapshots";
 }
 
 function renderTable() {
@@ -294,8 +303,11 @@ function formatCell(value) {
 function download() {
   if (!state.jobId) return;
   const format = $("format").value;
+  // Download what the user is looking at: the active tab decides which table
+  // leads the file, not just the holder mode.
   // Plain navigation: no key in the URL, the file streams straight from /api/export.
-  window.location.href = `/api/export/${state.jobId}?format=${format}`;
+  window.location.href =
+    `/api/export/${state.jobId}?format=${format}&dataset=${state.tab}`;
 }
 
 async function withBusy(button, work) {
@@ -350,6 +362,7 @@ function init() {
         other.classList.toggle("is-active", other === tab);
       }
       state.tab = tab.dataset.tab;
+      updateDownloadLabel();
       renderTable();
     });
   }

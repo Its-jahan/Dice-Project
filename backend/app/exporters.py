@@ -31,24 +31,29 @@ MEDIA_TYPES = {
 }
 
 
-def filename_for(result: HoldersResponse, fmt: ExportFormat) -> str:
+def filename_for(
+    result: HoldersResponse, fmt: ExportFormat, dataset: str = "auto"
+) -> str:
     req = result.request
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     token = req.token_address[:10]
+    table = "summary" if _is_summary_first(result, dataset) else "snapshots"
     return (
-        f"dice_{req.chain.value}_{token}_{req.start_date}_{req.end_date}"
-        f"_{req.holder_mode.value}_{stamp}.{fmt.value}"
+        f"dice_{req.chain.value}_{token}_{req.start_date}_{req.effective_end_date}"
+        f"_{req.holder_mode.value}_{table}_{stamp}.{fmt.value}"
     )
 
 
-def export(result: HoldersResponse, fmt: ExportFormat) -> bytes:
+def export(
+    result: HoldersResponse, fmt: ExportFormat, dataset: str = "auto"
+) -> bytes:
     if fmt is ExportFormat.csv:
-        return _to_csv(result)
+        return _to_csv(result, dataset)
     if fmt is ExportFormat.json:
-        return _to_json(result)
+        return _to_json(result)  # JSON always carries both tables
     if fmt is ExportFormat.html:
-        return _to_html(result)
-    return _to_xlsx(result)
+        return _to_html(result, dataset)
+    return _to_xlsx(result, dataset)
 
 
 def _snapshot_rows(result: HoldersResponse) -> list[list[object]]:
@@ -73,15 +78,29 @@ def _summary_rows(result: HoldersResponse) -> list[list[object]]:
     ]
 
 
-def _is_summary_first(result: HoldersResponse) -> bool:
-    """any_time / continuous are wallet-level questions; daily is row-level."""
+#: Which table an export leads with. "auto" follows the holder mode; the
+#: explicit values let the UI download whichever tab the user is looking at.
+DATASETS = ("auto", "snapshots", "summary")
+
+
+def _is_summary_first(result: HoldersResponse, dataset: str = "auto") -> bool:
+    """Whether the summary table leads this export.
+
+    "auto" follows the holder mode: any_time and continuous are wallet-level
+    questions, daily is row-level. An explicit dataset overrides that, so the
+    Download button can honour the tab the user is actually viewing.
+    """
+    if dataset == "summary":
+        return True
+    if dataset == "snapshots":
+        return False
     return result.request.holder_mode is not HolderMode.daily
 
 
-def _to_csv(result: HoldersResponse) -> bytes:
+def _to_csv(result: HoldersResponse, dataset: str = "auto") -> bytes:
     buffer = io.StringIO(newline="")
     writer = csv.writer(buffer)
-    if _is_summary_first(result):
+    if _is_summary_first(result, dataset):
         writer.writerow(SUMMARY_HEADERS)
         writer.writerows(_summary_rows(result))
     else:
@@ -104,7 +123,7 @@ def _to_json(result: HoldersResponse) -> bytes:
     return json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8")
 
 
-def _to_xlsx(result: HoldersResponse) -> bytes:
+def _to_xlsx(result: HoldersResponse, dataset: str = "auto") -> bytes:
     from openpyxl import Workbook
     from openpyxl.styles import Font
     from openpyxl.utils import get_column_letter
@@ -114,7 +133,7 @@ def _to_xlsx(result: HoldersResponse) -> bytes:
         ("Snapshots", SNAPSHOT_HEADERS, _snapshot_rows(result)),
         ("Summary", SUMMARY_HEADERS, _summary_rows(result)),
     ]
-    if _is_summary_first(result):
+    if _is_summary_first(result, dataset):
         sheets.reverse()
 
     first = True
@@ -152,10 +171,11 @@ def _to_xlsx(result: HoldersResponse) -> bytes:
     return stream.getvalue()
 
 
-def _to_html(result: HoldersResponse) -> bytes:
+def _to_html(result: HoldersResponse, dataset: str = "auto") -> bytes:
     req = result.request
-    rows = _summary_rows(result) if _is_summary_first(result) else _snapshot_rows(result)
-    headers = SUMMARY_HEADERS if _is_summary_first(result) else SNAPSHOT_HEADERS
+    summary_first = _is_summary_first(result, dataset)
+    rows = _summary_rows(result) if summary_first else _snapshot_rows(result)
+    headers = SUMMARY_HEADERS if summary_first else SNAPSHOT_HEADERS
     title = f"DICE — {req.chain.value} — {req.token_address}"
 
     body_rows = "\n".join(

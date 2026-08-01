@@ -96,6 +96,16 @@ Per-wallet summary:
 | --- | --- | --- | ---: | ---: | ---: | ---: |
 | 0xabc… | 2026-07-20 | 2026-07-31 | 12 | 450 | 1540 | 980.5 |
 
+`days_held` counts distinct days **inside the requested window** on which the
+wallet's end-of-day balance cleared the minimum — not how long it has held the
+token overall. A wallet holding since January shows `days_held = 3` for a
+three-day window. Widen the window to see more.
+
+"Holder on day D" means holding at the **end** of D. The query tests each
+interval against `D + 1 day` rather than against midnight, so a wallet that
+bought at 14:00 on the 21st counts as a holder on the 21st. Comparing against
+the start of the day would push every intra-day acquisition to the next day.
+
 CSV carries the leading table for the chosen mode; XLSX carries **both** plus a
 `Request` sheet recording exactly what was asked for; JSON carries everything;
 HTML is a standalone, filterable page with no external assets.

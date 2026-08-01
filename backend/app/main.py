@@ -21,7 +21,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import settings
 from .dune import DuneClient, DuneError
-from .exporters import MEDIA_TYPES, export, filename_for
+from .exporters import DATASETS, MEDIA_TYPES, export, filename_for
 from .holders import apply_holder_mode, build_summary, parse_rows
 from .jobs import store
 from .models import Chain, ExportFormat, HoldersRequest, HoldersResponse
@@ -188,15 +188,25 @@ _SOURCE_CACHE: dict[Chain, Source] = {}
 _CONTRACT_CACHE: dict[Chain, ContractSource] = {}
 
 
+#: Column types of the last resolved balance table, for the diagnostics view.
+_COLUMN_TYPES: dict[Chain, dict[str, str]] = {}
+
+
 async def _read_catalog(
-    client: DuneClient, *, name: str, sql: str
+    client: DuneClient, *, name: str, sql: str, types_for: Chain | None = None
 ) -> dict[str, set[str]]:
     """Run a catalogue query and fold it into ``{"schema.table": {columns}}``."""
     rows = await _run_sql(client, name=name, sql=sql, max_rows=2000)
     catalog: dict[str, set[str]] = {}
+    types: dict[str, dict[str, str]] = {}
     for row in rows:
         key = f"{row.get('table_schema')}.{row.get('table_name')}"
-        catalog.setdefault(key, set()).add(str(row.get("column_name")))
+        column = str(row.get("column_name"))
+        catalog.setdefault(key, set()).add(column)
+        if row.get("data_type") is not None:
+            types.setdefault(key, {})[column] = str(row["data_type"])
+    if types_for is not None:
+        _COLUMN_TYPES[types_for] = {k: v for k, v in types.items()}  # type: ignore[assignment]
     return catalog
 
 
@@ -240,6 +250,7 @@ async def resolve_for(client: DuneClient, chain: Chain) -> Source:
         client,
         name=f"DICE catalogue {chain.value}",
         sql=build_catalog_sql(chain),
+        types_for=chain,
     )
     source = resolve_source(catalog)
     _SOURCE_CACHE[chain] = source
@@ -273,6 +284,9 @@ async def get_source(
             "valid_from": source.valid_from,
             "valid_to": source.valid_to,
         },
+        # Whether valid_from is a date or a timestamp decides how an
+        # intra-day acquisition is attributed, so show it.
+        "column_types": (_COLUMN_TYPES.get(chain) or {}).get(source.qualified, {}),
     }
 
 
@@ -359,20 +373,31 @@ async def get_holders(
 async def download_export(
     job_id: str,
     fmt: Annotated[ExportFormat, Query(alias="format")] = ExportFormat.csv,
+    dataset: str = "auto",
 ) -> Response:
+    """Download a finished result.
+
+    ``dataset`` picks which table leads the file — the UI passes the tab the
+    user is looking at, so downloading from the summary tab yields the summary
+    rather than the snapshots the holder mode would otherwise choose.
+    """
+    if dataset not in DATASETS:
+        raise HTTPException(
+            status_code=422, detail=f"dataset must be one of {', '.join(DATASETS)}"
+        )
     result = store.get(job_id)
     if result is None:
         raise HTTPException(
             status_code=404,
             detail="Result expired or unknown job id — run the query again.",
         )
-    payload = export(result, fmt)
+    payload = export(result, fmt, dataset)
     return Response(
         content=payload,
         media_type=MEDIA_TYPES[fmt],
         headers={
             "Content-Disposition": (
-                f'attachment; filename="{filename_for(result, fmt)}"'
+                f'attachment; filename="{filename_for(result, fmt, dataset)}"'
             )
         },
     )
