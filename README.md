@@ -204,8 +204,13 @@ the query.
 
 ## Execution modes
 
-**Ad hoc (default).** DICE generates DuneSQL, creates a *private* query in your
-Dune account and executes it. Needs a Dune plan that includes query CRUD.
+**Ad hoc (default).** DICE generates DuneSQL and executes it through a small,
+fixed set of *private* queries it keeps in your Dune account — one per task
+(holders, diagnostics, one per monitored watchlist), updated in place before
+every run. Dune caps how many private queries an account may own, so DICE
+never creates one per execution; if you hit "Max number of private queries
+reached", archive old per-run `DICE …` queries at dune.com once and re-run.
+Needs a Dune plan that includes query CRUD.
 
 **Saved query.** Set `DUNE_QUERY_ID` to a parametrised query you saved in Dune,
 declaring `blockchain`, `token_address`, `start_date`, `end_date` and

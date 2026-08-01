@@ -33,7 +33,7 @@ import httpx
 
 from . import db
 from .config import settings
-from .dune import DuneClient
+from .dune import DuneClient, ensure_query
 from .holders import _to_float
 from .models import Chain, MonitorResult, MonitorRunOut, SignalOut, TokenBuyer
 from .sql import build_trades_sql, ignored_tokens_for
@@ -254,7 +254,11 @@ async def run_monitor(
             extra_ignore_tokens=extra_ignores,
         )
         async with DuneClient(api_key) as client:
-            query_id = await client.create_query(
+            # One reusable query slot per watchlist: concurrent monitors of
+            # different watchlists must not rewrite each other's SQL.
+            query_id = await ensure_query(
+                client,
+                purpose=f"monitor:{watchlist_id}",
                 name=(
                     f"DICE monitor: {watchlist['name'][:40]} "
                     f"({chain.value}, {len(wallets)} wallets, {window_hours}h)"

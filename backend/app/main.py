@@ -26,7 +26,7 @@ from fastapi.staticfiles import StaticFiles
 from . import db, monitor
 from .cache import cache
 from .config import settings
-from .dune import DuneClient, DuneError
+from .dune import DuneClient, DuneError, ensure_query
 from .exporters import DATASETS, MEDIA_TYPES, export, filename_for
 from .holders import apply_holder_mode, build_summary, parse_rows
 from .jobs import store
@@ -182,9 +182,16 @@ async def preview_sql(
     }
 
 
-async def _run_sql(client: DuneClient, *, name: str, sql: str, max_rows: int):
-    """Create, execute and drain a one-off diagnostic query."""
-    query_id = await client.create_query(name=name, query_sql=sql)
+async def _run_sql(
+    client: DuneClient,
+    *,
+    name: str,
+    sql: str,
+    max_rows: int,
+    purpose: str = "diagnostic",
+):
+    """Execute and drain a one-off query, reusing the account's slot for it."""
+    query_id = await ensure_query(client, purpose=purpose, name=name, query_sql=sql)
     execution_id = await client.execute_query(query_id)
     await client.wait_for_execution(execution_id)
     rows, _ = await client.fetch_results(execution_id, max_rows=max_rows)
@@ -357,7 +364,9 @@ async def _run_holders_query(client: DuneClient, req: HoldersRequest) -> str:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
         contracts = await contracts_if_needed(client, req)
-        query_id = await client.create_query(
+        query_id = await ensure_query(
+            client,
+            purpose="holders",
             name=f"DICE holders {req.chain.value} {req.token_address[:10]} "
             f"{req.start_date}..{req.end_date}",
             query_sql=build_snapshot_sql(req, source, contracts),
@@ -666,6 +675,8 @@ async def update_watchlist(
 async def delete_watchlist(watchlist_id: int) -> Response:
     if not db.delete_watchlist(watchlist_id):
         raise HTTPException(status_code=404, detail="Watchlist not found.")
+    # The reusable Dune query slot for this watchlist is meaningless now.
+    db.drop_purpose_slots(f"monitor:{watchlist_id}")
     return Response(status_code=204)
 
 

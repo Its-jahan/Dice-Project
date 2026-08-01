@@ -7,7 +7,7 @@ from app import main
 from app import monitor as monitor_module
 from app.cache import DiskCache
 from app.config import settings
-from app.dune import DuneAuthError
+from app.dune import DuneAuthError, DuneError, DuneNotFoundError
 from app.jobs import JobStore
 
 TOKEN = "0x1234567890abcdef1234567890abcdef12345678"
@@ -28,6 +28,8 @@ class FakeDuneClient:
         if not api_key or not api_key.strip():
             raise DuneAuthError("no Dune API key supplied")
         FakeDuneClient.calls["api_key"] = api_key
+        # Opaque per-account id used by the query-slot reuse machinery.
+        self.key_fingerprint = "fp-" + api_key.strip()
 
     async def __aenter__(self):
         return self
@@ -41,9 +43,21 @@ class FakeDuneClient:
     async def create_query(self, *, name, query_sql):
         FakeDuneClient.calls["query_name"] = name
         FakeDuneClient.calls["query_sql"] = query_sql
+        FakeDuneClient.calls["create_count"] = (
+            FakeDuneClient.calls.get("create_count", 0) + 1
+        )
         if "information_schema" not in query_sql:
             FakeDuneClient.calls["data_sql"] = query_sql
         return 777
+
+    async def update_query(self, query_id, *, name=None, query_sql=None):
+        FakeDuneClient.calls["update_count"] = (
+            FakeDuneClient.calls.get("update_count", 0) + 1
+        )
+        if query_sql is not None:
+            FakeDuneClient.calls["query_sql"] = query_sql
+            if "information_schema" not in query_sql:
+                FakeDuneClient.calls["data_sql"] = query_sql
 
     async def execute_query(self, query_id, *, parameters=None, performance="medium"):
         return "exec-monitor"
@@ -273,6 +287,46 @@ def test_monitor_run_creates_signals_and_updates_them(client):
 
     runs = client.get(f"/api/watchlists/{watchlist_id}/runs").json()
     assert [run["status"] for run in runs] == ["ok", "ok"]
+
+    # Dune's private-query cap: the second run PATCHed the existing query
+    # instead of creating another one.
+    assert FakeDuneClient.calls["create_count"] == 1
+    assert FakeDuneClient.calls["update_count"] == 1
+
+
+def test_monitor_recreates_query_deleted_on_dune(client, monkeypatch):
+    watchlist_id = _create_watchlist(client)["id"]
+    FakeDuneClient.rows = [_trade_row(w) for w in WALLETS[:4]]
+    client.post(f"/api/watchlists/{watchlist_id}/monitor", headers=HEADERS)
+
+    async def gone(self, query_id, *, name=None, query_sql=None):
+        raise DuneNotFoundError("Dune returned 404: query not found")
+
+    monkeypatch.setattr(FakeDuneClient, "update_query", gone)
+    second = client.post(f"/api/watchlists/{watchlist_id}/monitor", headers=HEADERS)
+
+    assert second.status_code == 200
+    assert FakeDuneClient.calls["create_count"] == 2  # slot was recreated
+
+
+def test_private_query_cap_produces_actionable_error(client, monkeypatch):
+    watchlist_id = _create_watchlist(client)["id"]
+
+    async def cap_reached(self, *, name, query_sql):
+        raise DuneError(
+            'Dune returned 402: {"error":"Max number of private queries reached"}'
+        )
+
+    monkeypatch.setattr(FakeDuneClient, "create_query", cap_reached)
+    response = client.post(
+        f"/api/watchlists/{watchlist_id}/monitor", headers=HEADERS
+    )
+
+    assert response.status_code == 402
+    assert "reuses a single query" in response.json()["detail"]
+
+    runs = client.get(f"/api/watchlists/{watchlist_id}/runs").json()
+    assert runs[0]["status"] == "error"
 
 
 def test_monitor_requires_key_and_valid_watchlist(client):

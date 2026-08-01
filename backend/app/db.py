@@ -91,6 +91,14 @@ CREATE TABLE IF NOT EXISTS signals (
     status          TEXT    NOT NULL DEFAULT 'active',
     UNIQUE (watchlist_id, token_address)
 );
+
+CREATE TABLE IF NOT EXISTS dune_query_slots (
+    key_hash   TEXT    NOT NULL,
+    purpose    TEXT    NOT NULL,
+    query_id   INTEGER NOT NULL,
+    updated_at TEXT    NOT NULL,
+    PRIMARY KEY (key_hash, purpose)
+);
 """
 
 _init_lock = threading.Lock()
@@ -503,3 +511,46 @@ def set_signal_status(signal_id: int, status: str) -> bool:
             (status, utcnow_iso(), signal_id),
         )
         return cursor.rowcount > 0
+
+
+# ----------------------------------------------------------- dune query slots
+#
+# Dune caps how many *private queries* an account may own, and DICE used to
+# create a fresh one per execution — after enough runs every request died with
+# "Max number of private queries reached". A slot remembers the query DICE
+# already created for one (account, purpose) pair so the SQL can be PATCHed
+# into it instead. The key is a fingerprint of the API key, never the key.
+
+
+def get_query_slot(key_hash: str, purpose: str) -> int | None:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT query_id FROM dune_query_slots "
+            "WHERE key_hash = ? AND purpose = ?",
+            (key_hash, purpose),
+        ).fetchone()
+        return int(row["query_id"]) if row else None
+
+
+def set_query_slot(key_hash: str, purpose: str, query_id: int) -> None:
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO dune_query_slots VALUES (?, ?, ?, ?) "
+            "ON CONFLICT (key_hash, purpose) DO UPDATE "
+            "SET query_id = excluded.query_id, updated_at = excluded.updated_at",
+            (key_hash, purpose, query_id, utcnow_iso()),
+        )
+
+
+def drop_query_slot(key_hash: str, purpose: str) -> None:
+    with connect() as conn:
+        conn.execute(
+            "DELETE FROM dune_query_slots WHERE key_hash = ? AND purpose = ?",
+            (key_hash, purpose),
+        )
+
+
+def drop_purpose_slots(purpose: str) -> None:
+    """Forget a purpose across every account (e.g. a deleted watchlist)."""
+    with connect() as conn:
+        conn.execute("DELETE FROM dune_query_slots WHERE purpose = ?", (purpose,))

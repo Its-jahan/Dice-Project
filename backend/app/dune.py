@@ -13,19 +13,23 @@ Two execution paths are supported:
     in Dune. DICE only passes parameter values. Works on every paid plan.
 
 ``ad hoc``
-    DICE creates a private query from generated SQL, executes it, and deletes
-    nothing (it stays in the caller's Dune account for auditing). Query CRUD
+    DICE keeps **one private query per task** in the caller's Dune account and
+    PATCHes fresh SQL into it before each execution (see :func:`ensure_query`).
+    Earlier versions created a new private query per run, which walked straight
+    into Dune's "Max number of private queries reached" cap. Query CRUD
     requires a Dune plan that includes the Query API.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from typing import Any
 
 import httpx
 
+from . import db
 from .config import settings
 
 log = logging.getLogger(__name__)
@@ -50,6 +54,13 @@ class DuneError(RuntimeError):
 class DuneAuthError(DuneError):
     def __init__(self, message: str = "Dune rejected the API key") -> None:
         super().__init__(message, status_code=401)
+
+
+class DuneNotFoundError(DuneError):
+    """Dune answered 404 — the query or execution does not exist (any more)."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, status_code=404)
 
 
 class DuneUnreachable(DuneError):
@@ -96,6 +107,10 @@ class DuneClient:
             raise DuneAuthError(
                 "Dune rejected the API key (401/403). Check the key and its plan."
             )
+        if response.status_code == 404:
+            raise DuneNotFoundError(
+                f"Dune returned 404: {_short(response.text)}"
+            )
         if response.status_code == 429:
             raise DuneError("Dune rate limit hit; retry shortly.", status_code=429)
         if response.status_code >= 400:
@@ -129,6 +144,11 @@ class DuneClient:
             return True
         return True
 
+    @property
+    def key_fingerprint(self) -> str:
+        """Identifies the account for query-slot reuse without storing the key."""
+        return hashlib.sha256(self._api_key.encode()).hexdigest()[:16]
+
     async def create_query(self, *, name: str, query_sql: str) -> int:
         payload = {
             "name": name,
@@ -140,6 +160,18 @@ class DuneClient:
         if not isinstance(query_id, int):
             raise DuneError("Dune did not return a query_id when creating the query")
         return query_id
+
+    async def update_query(
+        self, query_id: int, *, name: str | None = None, query_sql: str | None = None
+    ) -> None:
+        """PATCH new SQL (and optionally a name) into an existing query."""
+        payload: dict[str, Any] = {}
+        if name is not None:
+            payload["name"] = name
+        if query_sql is not None:
+            payload["query_sql"] = query_sql
+        if payload:
+            await self._request("PATCH", f"/query/{query_id}", json=payload)
 
     async def execute_query(
         self,
@@ -208,3 +240,42 @@ class DuneClient:
 def _short(text: str, limit: int = 300) -> str:
     text = " ".join(text.split())
     return text if len(text) <= limit else text[:limit] + "..."
+
+
+async def ensure_query(
+    client: DuneClient, *, purpose: str, name: str, query_sql: str
+) -> int:
+    """Reuse one Dune query per (account, purpose): PATCH it, create only once.
+
+    Dune caps the number of private queries an account may own; creating one
+    per execution exhausts the cap and every later run fails with 402 "Max
+    number of private queries reached". A *slot* remembers the query DICE
+    already owns for this purpose so each run only rewrites its SQL. If the
+    user deleted the query on dune.com, the PATCH 404s and the slot is
+    recreated once.
+    """
+    fingerprint = client.key_fingerprint
+    query_id = db.get_query_slot(fingerprint, purpose)
+    if query_id is not None:
+        try:
+            await client.update_query(query_id, name=name, query_sql=query_sql)
+            return query_id
+        except DuneNotFoundError:
+            log.info("query slot %s/%s vanished on Dune; recreating", purpose, query_id)
+            db.drop_query_slot(fingerprint, purpose)
+
+    try:
+        query_id = await client.create_query(name=name, query_sql=query_sql)
+    except DuneError as exc:
+        if "private queries" in str(exc).lower():
+            raise DuneError(
+                f"{exc} — the account's private-query slots are full, most "
+                "likely with queries older DICE versions created one per run. "
+                "Archive or delete old 'DICE …' queries at dune.com "
+                "(My work → Queries) once; DICE now reuses a single query per "
+                "task, so the list will not grow again.",
+                status_code=402,
+            ) from exc
+        raise
+    db.set_query_slot(fingerprint, purpose, query_id)
+    return query_id

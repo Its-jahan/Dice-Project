@@ -33,6 +33,8 @@ class FakeDuneClient:
         if not api_key or not api_key.strip():
             raise DuneAuthError("no Dune API key supplied")
         FakeDuneClient.calls["api_key"] = api_key
+        # Opaque per-account id used by the query-slot reuse machinery.
+        self.key_fingerprint = "fp-" + api_key.strip()
 
     async def __aenter__(self):
         return self
@@ -49,6 +51,15 @@ class FakeDuneClient:
         if "information_schema" not in query_sql:
             FakeDuneClient.calls["data_sql"] = query_sql
         return 4242
+
+    async def update_query(self, query_id, *, name=None, query_sql=None):
+        # Slot reuse PATCHes SQL into the query created above.
+        if query_sql is not None:
+            FakeDuneClient.calls["query_sql"] = query_sql
+            if "information_schema" not in query_sql:
+                FakeDuneClient.calls["data_sql"] = query_sql
+        if name is not None:
+            FakeDuneClient.calls["query_name"] = name
 
     async def execute_query(self, query_id, *, parameters=None, performance="medium"):
         FakeDuneClient.calls["query_id"] = query_id
@@ -87,9 +98,11 @@ def client(monkeypatch, tmp_path):
         for column in ("address", "token_address", "balance", "valid_from", "valid_to")
     ]
     # Point the shared resolution cache at a scratch dir per test, so one
-    # test's resolved source cannot leak into the next.
+    # test's resolved source cannot leak into the next. Same for the SQLite
+    # file that holds the reusable Dune query slots.
     monkeypatch.setattr(main, "cache", DiskCache(directory=tmp_path / "cache"))
     monkeypatch.setattr(main, "store", JobStore(directory=tmp_path / "jobs"))
+    monkeypatch.setattr(settings, "db_path", str(tmp_path / "dice.db"))
     monkeypatch.setattr(main, "DuneClient", FakeDuneClient)
     monkeypatch.setattr(settings, "dune_api_key", None, raising=False)
     monkeypatch.setattr(settings, "dune_query_id", None, raising=False)
