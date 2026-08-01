@@ -95,6 +95,12 @@ class Settings:
     telegram_chat_id: str | None = field(
         default_factory=lambda: os.getenv("DICE_TELEGRAM_CHAT_ID") or None
     )
+    # Public HTTPS origin of this deployment. Alchemy delivers webhooks here,
+    # so it must be reachable from the internet. Normally set in the UI; this
+    # is the fallback.
+    public_base_url: str | None = field(
+        default_factory=lambda: os.getenv("DICE_PUBLIC_URL") or None
+    )
 
 
 settings = Settings()

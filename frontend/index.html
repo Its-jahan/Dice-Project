@@ -229,6 +229,14 @@
                   <option value="dex">DEX swaps only</option>
                 </select>
               </div>
+              <div class="col-md-2">
+                <label class="form-label small d-block">Live</label>
+                <div class="form-check form-switch">
+                  <input class="form-check-input" type="checkbox" id="watchlistRealtime">
+                  <label class="form-check-label small" for="watchlistRealtime"
+                         id="watchlistRealtimeLabel">Alchemy</label>
+                </div>
+              </div>
               <div class="col-md-2 d-none" id="topNField">
                 <label class="form-label small" for="watchlistTopN">Keep top N</label>
                 <input id="watchlistTopN" type="number" min="1" step="1"
@@ -323,6 +331,48 @@
       </div>
     </section>
 
+    <!-- ================================================== realtime -->
+    <section class="card shadow-sm" aria-labelledby="rtHeading">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <h2 id="rtHeading" class="h6 mb-0">Live monitoring (Alchemy webhooks)</h2>
+        <span id="rtBadge" class="badge rounded-pill text-bg-secondary">Off</span>
+      </div>
+      <div class="card-body">
+        <p class="form-text mt-0 mb-3">
+          The Dune monitor only looks when it is scheduled, so a signal can be up to
+          one interval old. With live monitoring, Alchemy pushes every token arrival
+          at a watched wallet within seconds of the block and the signal fires
+          immediately — and costs no Dune credits. Paste the
+          <strong>auth token</strong> from the top of your Alchemy
+          <em>webhooks dashboard</em> (not the app API key) and the public HTTPS
+          address of this server, then switch on <em>Live</em> for a watchlist.
+        </p>
+        <div class="row g-2 align-items-center">
+          <div class="col-lg-4">
+            <input id="rtToken" type="password" class="form-control" autocomplete="off"
+                   spellcheck="false" placeholder="Alchemy auth token">
+          </div>
+          <div class="col-lg-4">
+            <input id="rtUrl" class="form-control" spellcheck="false"
+                   placeholder="https://dice.your-domain.example">
+          </div>
+          <div class="col-auto">
+            <button type="button" id="rtSave" class="btn btn-primary">Save</button>
+            <button type="button" id="rtSync" class="btn btn-outline-secondary">
+              Sync wallets
+            </button>
+          </div>
+        </div>
+        <div id="rtStatus" class="small mt-2" role="status" aria-live="polite"></div>
+        <div class="table-responsive mt-2">
+          <table id="rtTable" class="table table-sm align-middle d-none mb-0">
+            <thead></thead><tbody></tbody>
+          </table>
+        </div>
+        <p class="form-text mb-0" id="rtChains"></p>
+      </div>
+    </section>
+
     <!-- ================================================== notifications -->
     <section class="card shadow-sm" aria-labelledby="tgHeading">
       <div class="card-header d-flex justify-content-between align-items-center">
@@ -408,9 +458,17 @@
               </select>
             </div>
             <div class="col-md-4 d-flex align-items-end">
-              <div class="form-check form-switch">
-                <input class="form-check-input" type="checkbox" id="wlAuto">
-                <label class="form-check-label small" for="wlAuto">Scheduled auto-runs</label>
+              <div>
+                <div class="form-check form-switch">
+                  <input class="form-check-input" type="checkbox" id="wlAuto">
+                  <label class="form-check-label small" for="wlAuto">Scheduled auto-runs</label>
+                </div>
+                <div class="form-check form-switch">
+                  <input class="form-check-input" type="checkbox" id="wlRealtime">
+                  <label class="form-check-label small" for="wlRealtime">
+                    Live (Alchemy webhooks)
+                  </label>
+                </div>
               </div>
             </div>
             <div class="col-md-6">

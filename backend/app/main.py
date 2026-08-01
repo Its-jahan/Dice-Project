@@ -25,7 +25,7 @@ from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import db, monitor
+from . import alchemy, db, monitor, realtime
 from .cache import cache
 from .config import settings
 from .dune import DuneClient, DuneError, ensure_query
@@ -150,6 +150,11 @@ async def get_config() -> dict[str, object]:
             # happen once a key has been saved on the server.
             "auto_possible": settings.monitor_enabled and bool(server_key),
             "telegram_configured": bool(telegram_token and telegram_chat),
+        },
+        "realtime": {
+            "configured": bool(db.get_setting("alchemy_auth_token")),
+            "public_url_set": bool(_public_base_url()),
+            "supported_chains": alchemy.supported_chains(),
         },
     }
 
@@ -615,6 +620,185 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+# ------------------------------------------------------ realtime (Alchemy)
+
+
+def _public_base_url() -> str | None:
+    return (db.get_setting("public_base_url") or settings.public_base_url or "").strip() or None
+
+
+def _webhook_url() -> str:
+    base = _public_base_url()
+    if not base:
+        raise HTTPException(
+            status_code=422,
+            detail="Set the public HTTPS URL of this server first — Alchemy has "
+            "to be able to reach it to deliver events.",
+        )
+    return base.rstrip("/") + "/api/webhooks/alchemy"
+
+
+async def sync_realtime_chain(chain: Chain) -> dict[str, object]:
+    """Make Alchemy watch exactly the wallets this chain's live watchlists hold.
+
+    Creates the network's webhook on first use, then reconciles the address
+    list — additions and removals — against what Alchemy currently has.
+    """
+    token = db.get_setting("alchemy_auth_token")
+    if not token:
+        raise HTTPException(
+            status_code=422, detail="Save your Alchemy auth token first."
+        )
+    network = alchemy.network_for(chain)
+    if not network:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Alchemy webhooks are not wired up for {chain.value}. "
+            f"Supported: {', '.join(alchemy.supported_chains())}.",
+        )
+
+    wanted = db.realtime_wallets(chain.value)
+    existing = db.get_webhook(chain.value)
+
+    try:
+        async with alchemy.AlchemyNotifyClient(token) as client:
+            if not wanted:
+                # Nothing left to watch: drop the webhook rather than leave an
+                # empty one consuming a free-tier slot.
+                if existing:
+                    await client.delete_webhook(existing["webhook_id"])
+                    db.delete_webhook(chain.value)
+                return {"chain": chain.value, "addresses": 0, "webhook_id": None}
+
+            if not existing:
+                created = await client.create_address_webhook(
+                    network=network,
+                    webhook_url=_webhook_url(),
+                    addresses=sorted(wanted),
+                )
+                db.save_webhook(
+                    chain=chain.value,
+                    network=network,
+                    webhook_id=str(created["id"]),
+                    signing_key=str(created.get("signing_key") or ""),
+                    webhook_url=_webhook_url(),
+                    address_count=0,
+                )
+                existing = db.get_webhook(chain.value)
+
+            webhook_id = existing["webhook_id"]
+            registered = set(await client.list_addresses(webhook_id))
+            to_add = sorted(wanted - registered)
+            to_remove = sorted(registered - wanted)
+            if to_add or to_remove:
+                await client.update_addresses(
+                    webhook_id, add=to_add, remove=to_remove
+                )
+            db.mark_webhook_synced(chain.value, len(wanted))
+            return {
+                "chain": chain.value,
+                "webhook_id": webhook_id,
+                "addresses": len(wanted),
+                "added": len(to_add),
+                "removed": len(to_remove),
+            }
+    except alchemy.AlchemyError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
+@app.get("/api/settings/realtime")
+async def get_realtime_settings() -> dict[str, object]:
+    token = db.get_setting("alchemy_auth_token")
+    return {
+        "configured": bool(token),
+        "token_hint": _key_hint(token),
+        "public_base_url": _public_base_url(),
+        "supported_chains": alchemy.supported_chains(),
+        "webhooks": [
+            {
+                "chain": row["chain"],
+                "network": row["network"],
+                "webhook_id": row["webhook_id"],
+                "address_count": row["address_count"],
+                "synced_at": row["synced_at"],
+            }
+            for row in db.list_webhooks()
+        ],
+    }
+
+
+@app.put("/api/settings/realtime")
+async def save_realtime_settings(body: Annotated[dict, Body()]) -> dict[str, object]:
+    if "auth_token" in body:
+        token = str(body.get("auth_token") or "").strip()
+        if token:
+            db.set_setting("alchemy_auth_token", token)
+        else:
+            db.delete_setting("alchemy_auth_token")
+    if "public_base_url" in body:
+        url = str(body.get("public_base_url") or "").strip().rstrip("/")
+        if url and not url.startswith(("http://", "https://")):
+            raise HTTPException(
+                status_code=422, detail="The public URL must start with https://"
+            )
+        if url:
+            db.set_setting("public_base_url", url)
+        else:
+            db.delete_setting("public_base_url")
+    return await get_realtime_settings()
+
+
+@app.post("/api/settings/realtime/sync")
+async def sync_realtime() -> dict[str, object]:
+    """Reconcile every chain that has live watchlists, and drop the rest."""
+    chains = set(db.realtime_chains()) | {row["chain"] for row in db.list_webhooks()}
+    results = []
+    for value in sorted(chains):
+        try:
+            results.append(await sync_realtime_chain(Chain(value)))
+        except HTTPException as exc:
+            results.append({"chain": value, "error": exc.detail})
+    return {"synced": results}
+
+
+@app.post("/api/webhooks/alchemy")
+async def receive_alchemy_webhook(request: Request) -> dict[str, object]:
+    """Alchemy Address Activity delivery — the live path into signals.
+
+    Authenticated by ``X-Alchemy-Signature`` (HMAC-SHA256 of the raw body with
+    the webhook's signing key), so this endpoint is safe to expose publicly.
+    An unknown or unsigned delivery is rejected without touching the database.
+    """
+    raw = await request.body()
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Body is not JSON.")
+
+    webhook_id = str(payload.get("webhookId") or "")
+    registration = db.webhook_by_id(webhook_id) if webhook_id else None
+    if registration is None:
+        # Not a webhook this server created: refuse rather than trust it.
+        raise HTTPException(status_code=404, detail="Unknown webhook id.")
+
+    signature = request.headers.get("X-Alchemy-Signature")
+    if not alchemy.verify_signature(raw, signature, registration["signing_key"]):
+        raise HTTPException(status_code=401, detail="Bad signature.")
+
+    if str(payload.get("type") or "") != "ADDRESS_ACTIVITY":
+        return {"ignored": payload.get("type")}
+
+    summary = await realtime.ingest(payload, chain=Chain(registration["chain"]))
+    if summary["signals"]:
+        log.info(
+            "live: %s events on %s produced %s signal(s)",
+            summary["events"],
+            registration["chain"],
+            summary["signals"],
+        )
+    return summary
+
+
 # ------------------------------------------------------------------ watchlists
 
 
@@ -640,6 +824,7 @@ def _watchlist_out(row: dict) -> WatchlistOut:
         auto_monitor=bool(row["auto_monitor"]),
         ignore_tokens=json.loads(row.get("ignore_tokens") or "[]"),
         buy_detection=row.get("buy_detection") or "both",
+        realtime=bool(row.get("realtime")),
         created_at=row["created_at"],
         last_run_at=row.get("last_run_at"),
         last_run_status=row.get("last_run_status"),
@@ -696,8 +881,20 @@ async def create_watchlist(req: Annotated[WatchlistCreate, Body()]) -> Watchlist
         auto_monitor=req.auto_monitor,
         ignore_tokens=ignore_tokens,
         buy_detection=req.buy_detection,
+        realtime=req.realtime,
     )
+    if req.realtime:
+        # Register the wallets with Alchemy now; a failure here must not lose
+        # the watchlist, so it is reported through last_sync rather than raised.
+        await _try_sync(req.chain)
     return _watchlist_out(_overview_or_404(watchlist_id))
+
+
+async def _try_sync(chain: Chain) -> None:
+    try:
+        await sync_realtime_chain(chain)
+    except HTTPException as exc:
+        log.warning("realtime sync for %s failed: %s", chain.value, exc.detail)
 
 
 @app.post("/api/watchlists/from-job/{job_id}", status_code=201)
@@ -741,6 +938,7 @@ async def create_watchlist_from_job(
         auto_monitor=req.auto_monitor,
         ignore_tokens=req.ignore_tokens,
         buy_detection=req.buy_detection,
+        realtime=req.realtime,
     )
     return await create_watchlist(create_req)
 
@@ -780,6 +978,8 @@ async def update_watchlist(
             fields[name] = value
     if req.auto_monitor is not None:
         fields["auto_monitor"] = int(req.auto_monitor)
+    if req.realtime is not None:
+        fields["realtime"] = int(req.realtime)
     try:
         if req.ignore_tokens is not None:
             fields["ignore_tokens"] = json.dumps(
@@ -815,13 +1015,26 @@ async def update_watchlist(
         fields["next_run_at"] = db.iso_plus_hours(base, interval)
 
     db.update_watchlist_fields(watchlist_id, fields)
+
+    # Anything that changes which wallets Alchemy should watch — the toggle
+    # itself, or the membership of an already-live list — needs a reconcile.
+    membership_changed = bool(add or remove)
+    if req.realtime is not None or (membership_changed and row.get("realtime")):
+        await _try_sync(chain_enum)
+
     return _watchlist_out(_overview_or_404(watchlist_id))
 
 
 @app.delete("/api/watchlists/{watchlist_id}", status_code=204)
 async def delete_watchlist(watchlist_id: int) -> Response:
+    row = db.get_watchlist(watchlist_id)
+    was_live = bool(row and row.get("realtime"))
+    chain = Chain(row["chain"]) if row else None
     if not db.delete_watchlist(watchlist_id):
         raise HTTPException(status_code=404, detail="Watchlist not found.")
+    if was_live and chain is not None:
+        # Stop paying Alchemy attention to wallets nothing watches any more.
+        await _try_sync(chain)
     # The reusable Dune query slot for this watchlist is meaningless now.
     db.drop_purpose_slots(f"monitor:{watchlist_id}")
     db.drop_purpose_slots(f"positions:{watchlist_id}")

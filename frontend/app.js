@@ -25,6 +25,7 @@ const state = {
   signals: [],
   editingWatchlist: null,   // watchlist object open in the edit modal
   expandedSignals: new Set(),
+  realtime: null,     // /api/settings/realtime payload
 };
 
 /* -------------------------------------------------------------------- utils */
@@ -469,6 +470,26 @@ async function withBusy(button, work) {
 
 /* ------------------------------------------------------- save as watchlist */
 
+/** Enable the Live switch only when Alchemy is set up and covers the chain. */
+function updateRealtimeAvailability() {
+  const chain = $("chain").value;
+  const supported = realtimeSupports(chain);
+  const ready = realtimeReady();
+  const toggle = $("watchlistRealtime");
+  toggle.disabled = !(ready && supported);
+  if (toggle.disabled) toggle.checked = false;
+  $("watchlistRealtimeLabel").textContent = !supported
+    ? "n/a here"
+    : ready
+      ? "Alchemy"
+      : "set up below";
+  $("watchlistRealtimeLabel").title = !supported
+    ? `Alchemy webhooks are not wired up for ${chain}.`
+    : ready
+      ? "Signals fire seconds after a buy instead of at the next scheduled check."
+      : "Add your Alchemy auth token and public URL in the Live monitoring card.";
+}
+
 function prepareWatchlistSave() {
   if (!state.lastRun) return;
   const { request, wallet_count } = state.lastRun;
@@ -497,6 +518,7 @@ async function saveWatchlist() {
       name: $("watchlistName").value.trim() || null,
       monitor_interval_hours: Number($("watchlistInterval").value) || 24,
       buy_detection: $("watchlistDetection").value,
+      realtime: $("watchlistRealtime").checked,
     };
     const topN = Number($("watchlistTopN").value);
     if (!$("topNField").classList.contains("d-none") && topN > 0) {
@@ -549,8 +571,8 @@ function renderWatchlists() {
 
   const headRow = table.tHead.insertRow();
   for (const title of [
-    "Watchlist", "Wallets", "Threshold", "Window", "Every", "Counts", "Auto",
-    "Last run", "Signals", "",
+    "Watchlist", "Wallets", "Threshold", "Window", "Every", "Counts", "Live",
+    "Auto", "Last run", "Signals", "",
   ]) {
     headRow.appendChild(el("th", "small text-body-secondary", title));
   }
@@ -589,6 +611,16 @@ function renderWatchlistRow(tbody, wl) {
         ? "Any token whose balance went 0 → positive counts"
         : "DEX swaps and new positions, each labelled (two Dune queries per run)";
   detectionCell.appendChild(detectionBadge);
+
+  const liveCell = tr.insertCell();
+  if (wl.realtime) {
+    const liveBadge = el("span", "badge text-bg-danger", "● live");
+    liveBadge.title =
+      "Alchemy pushes token arrivals for these wallets; signals fire in seconds.";
+    liveCell.appendChild(liveBadge);
+  } else {
+    liveCell.appendChild(el("span", "small text-body-secondary", "—"));
+  }
 
   const autoCell = tr.insertCell();
   const autoPossible =
@@ -668,6 +700,8 @@ function openWatchlistModal(wl) {
   ensureIntervalOption($("wlInterval"), wl.monitor_interval_hours);
   $("wlDetection").value = wl.buy_detection || "both";
   $("wlAuto").checked = wl.auto_monitor;
+  $("wlRealtime").checked = wl.realtime;
+  $("wlRealtime").disabled = !(realtimeReady() && realtimeSupports(wl.chain));
   $("wlIgnore").value = (wl.ignore_tokens || []).join("\n");
   $("wlAddWallets").value = "";
   setStatus("wlModalStatus", "", "");
@@ -685,6 +719,7 @@ async function saveWatchlistSettings() {
       monitor_interval_hours: Number($("wlInterval").value),
       min_buy_usd: Number($("wlMinUsd").value),
       auto_monitor: $("wlAuto").checked,
+      realtime: $("wlRealtime").checked,
       buy_detection: $("wlDetection").value,
       ignore_tokens: $("wlIgnore").value.split("\n").map((s) => s.trim()).filter(Boolean),
     };
@@ -816,21 +851,21 @@ function renderSignalRow(tbody, signal) {
   );
   // How the buyers were seen: confirmed DEX swaps vs. positions that simply
   // appeared. A signal made only of the latter deserves a closer look.
-  const dexCount = signal.buyers.filter((b) => b.via !== "balance").length;
-  const positionCount = signal.buyers.length - dexCount;
-  if (dexCount) {
+  const counts = { dex: 0, balance: 0, live: 0 };
+  for (const buyer of signal.buyers) counts[buyer.via || "dex"] += 1;
+  const badges = [
+    ["dex", "text-bg-success", "DEX", "Confirmed DEX swaps"],
+    ["live", "text-bg-danger", "live",
+      "Pushed by Alchemy within seconds of the block"],
+    ["balance", "text-bg-secondary", "pos",
+      "New position with no matching DEX trade (OTC, CEX, transfer…)"],
+  ];
+  for (const [key, cls, label, title] of badges) {
+    if (!counts[key]) continue;
     buyersCell.appendChild(
-      Object.assign(el("span", "badge text-bg-success ms-1", `${dexCount} DEX`), {
-        title: "Confirmed DEX swaps",
+      Object.assign(el("span", `badge ${cls} ms-1`, `${counts[key]} ${label}`), {
+        title,
       }),
-    );
-  }
-  if (positionCount) {
-    buyersCell.appendChild(
-      Object.assign(
-        el("span", "badge text-bg-secondary ms-1", `${positionCount} pos`),
-        { title: "New position with no matching DEX trade (OTC, CEX, transfer…)" },
-      ),
     );
   }
 
@@ -912,15 +947,17 @@ function renderSignalDetails(tbody, signal) {
     const row = body.insertRow();
     row.insertCell().appendChild(el("span", "mono", buyer.wallet_address));
     const viaCell = row.insertCell();
-    const isDex = buyer.via !== "balance";
-    const badge = el(
-      "span",
-      "badge " + (isDex ? "text-bg-success" : "text-bg-secondary"),
-      isDex ? "DEX buy" : "new position",
-    );
-    badge.title = isDex
-      ? "Confirmed swap in Dune's DEX trade tables"
-      : "Balance went 0 → positive with no matching DEX trade";
+    const via = buyer.via || "dex";
+    const style = {
+      dex: ["text-bg-success", "DEX buy",
+        "Confirmed swap in Dune's DEX trade tables"],
+      live: ["text-bg-danger", "live",
+        "Token arrival pushed by Alchemy seconds after the block"],
+      balance: ["text-bg-secondary", "new position",
+        "Balance went 0 → positive with no matching DEX trade"],
+    }[via] || ["text-bg-secondary", via, ""];
+    const badge = el("span", "badge " + style[0], style[1]);
+    badge.title = style[2];
     viaCell.appendChild(badge);
     row.insertCell().textContent = String(buyer.buy_count);
     row.insertCell().textContent = fmtUsd(buyer.amount_usd);
@@ -930,6 +967,99 @@ function renderSignalDetails(tbody, signal) {
   const wrap = el("div", "table-responsive");
   wrap.appendChild(table);
   cell.appendChild(wrap);
+}
+
+/* -------------------------------------------------------------- realtime */
+
+function realtimeReady() {
+  const rt = (state.config && state.config.realtime) || {};
+  return !!(rt.configured && rt.public_url_set);
+}
+
+function realtimeSupports(chain) {
+  const rt = (state.config && state.config.realtime) || {};
+  return (rt.supported_chains || []).includes(chain);
+}
+
+async function loadRealtimeSettings() {
+  try {
+    const data = await api("/api/settings/realtime");
+    state.realtime = data;
+    $("rtUrl").value = data.public_base_url || "";
+    $("rtToken").placeholder = data.token_hint
+      ? `Auth token saved (${data.token_hint}) — paste to replace`
+      : "Alchemy auth token";
+    const badge = $("rtBadge");
+    const live = data.configured && data.public_base_url;
+    badge.className = "badge rounded-pill " +
+      (live ? "text-bg-success" : "text-bg-secondary");
+    badge.textContent = live ? "On" : "Off";
+    $("rtChains").textContent =
+      "Chains available for live monitoring: " +
+      (data.supported_chains || []).join(", ") + ".";
+    renderWebhookTable(data.webhooks || []);
+  } catch {
+    /* non-fatal */
+  }
+}
+
+function renderWebhookTable(webhooks) {
+  const table = $("rtTable");
+  table.classList.toggle("d-none", !webhooks.length);
+  table.tHead.innerHTML = "";
+  table.tBodies[0].innerHTML = "";
+  if (!webhooks.length) return;
+
+  const head = table.tHead.insertRow();
+  for (const title of ["Chain", "Network", "Wallets watched", "Last synced"]) {
+    head.appendChild(el("th", "small text-body-secondary", title));
+  }
+  for (const hook of webhooks) {
+    const row = table.tBodies[0].insertRow();
+    row.insertCell().textContent = hook.chain;
+    row.insertCell().appendChild(el("span", "mono", hook.network));
+    row.insertCell().textContent = hook.address_count.toLocaleString();
+    row.insertCell().textContent = fmtTime(hook.synced_at);
+  }
+}
+
+async function saveRealtimeSettings() {
+  await withBusy($("rtSave"), async () => {
+    const body = { public_base_url: $("rtUrl").value.trim() };
+    const token = $("rtToken").value.trim();
+    if (token) body.auth_token = token;
+    try {
+      await api("/api/settings/realtime", { method: "PUT", body });
+      $("rtToken").value = "";
+      await Promise.all([loadRealtimeSettings(), refreshConfig()]);
+      setStatus("rtStatus", "Saved. Now switch on Live for a watchlist.", "ok");
+    } catch (error) {
+      setStatus("rtStatus", error.message, "error");
+    }
+  });
+}
+
+async function syncRealtime() {
+  await withBusy($("rtSync"), async () => {
+    setStatus("rtStatus", "Reconciling watched wallets with Alchemy…", "");
+    try {
+      const result = await api("/api/settings/realtime/sync", { method: "POST" });
+      const failures = result.synced.filter((entry) => entry.error);
+      const total = result.synced
+        .filter((entry) => !entry.error)
+        .reduce((sum, entry) => sum + (entry.addresses || 0), 0);
+      setStatus(
+        "rtStatus",
+        failures.length
+          ? `Failed: ${failures.map((f) => `${f.chain} — ${f.error}`).join("; ")}`
+          : `${total.toLocaleString()} wallets registered with Alchemy.`,
+        failures.length ? "error" : "ok",
+      );
+      await Promise.all([loadRealtimeSettings(), loadWatchlists()]);
+    } catch (error) {
+      setStatus("rtStatus", error.message, "error");
+    }
+  });
 }
 
 /* ----------------------------------------------------------- notifications */
@@ -1037,6 +1167,9 @@ function init() {
 
   $("tgSave").addEventListener("click", saveNotificationSettings);
   $("tgTest").addEventListener("click", testNotification);
+  $("rtSave").addEventListener("click", saveRealtimeSettings);
+  $("rtSync").addEventListener("click", syncRealtime);
+  $("chain").addEventListener("change", updateRealtimeAvailability);
 
   for (const tab of document.querySelectorAll(".tab")) {
     tab.addEventListener("click", () => {
@@ -1051,8 +1184,10 @@ function init() {
   refreshConfig().then(() => {
     loadWatchlists();
     loadSignals();
+    updateRealtimeAvailability();
   });
   loadNotificationSettings();
+  loadRealtimeSettings();
   startPolling();
 }
 

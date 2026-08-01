@@ -146,6 +146,41 @@ ignore list if you want re-accumulation alerts. Buys with a *known* USD value
 below `min_buy_usd` are dropped; buys with no USD price (very new tokens, and
 all bare positions) always pass.
 
+### Live monitoring (Alchemy webhooks)
+
+The Dune monitor only looks when it is scheduled, so a signal is at most one
+interval old — with a 24 h interval that is **12 h of average delay**, far more
+than Dune's own data lag. Live monitoring inverts that: register the watched
+wallets with Alchemy once, and it POSTs to this server the moment any of them
+receives a token. The rolling-window count runs locally in SQLite, so the
+signal fires **seconds after the block** and costs no Dune credits.
+
+Setup, once:
+
+1. In the Alchemy dashboard open **Webhooks** and copy the **auth token** from
+   the top of the page — this is not your app's API key.
+2. Paste it into the *Live monitoring* card along with the public HTTPS address
+   of this server (Alchemy has to reach `/api/webhooks/alchemy`).
+3. Switch **Live** on for a watchlist. DICE creates one webhook per network
+   holding the union of the wallets of every live watchlist on that chain, and
+   reconciles it whenever wallets or toggles change.
+
+Deliveries are authenticated by `X-Alchemy-Signature` — HMAC-SHA256 of the raw
+body with the webhook's signing key — so the endpoint is safe to expose. An
+unknown webhook id or a bad signature is rejected before anything is stored,
+and redeliveries are idempotent.
+
+What live mode counts as a buy: a token **arriving** at a watched wallet.
+Transfers *from* another wallet in the same watchlist are skipped (a token
+passed around the group is one position, not N buyers), as is the usual
+stablecoin/wrapped-native stoplist. Without a swap decode this matches the
+"new position" semantics, so these buyers are labelled `live` — and because
+the transfer feed carries no price, live signals have no USD total.
+
+Live and scheduled monitoring write to the same signals table and the same
+Telegram alerts, so a watchlist can run either or both. Chains covered are
+listed in the card; Solana is Dune-only here.
+
 **Scheduling uses the saved key.** Once a key is saved in the UI, scheduled
 runs are active — no environment configuration needed. The check interval is
 chosen when the watchlist is created (2 h – 48 h) and can be changed any time
@@ -173,6 +208,8 @@ holder side via `DUNE_QUERY_ID` but not scheduled monitoring.
 | `POST /api/key` · `DELETE /api/key` | Validate and save the key on the server / remove it. |
 | `POST /api/key/validate` | Check a key without saving. Header: `X-Dune-Api-Key`. |
 | `GET` / `PUT /api/settings/notifications` · `POST …/test` | Telegram bot token + chat id, and a test send. |
+| `GET` / `PUT /api/settings/realtime` · `POST …/sync` | Alchemy auth token + public URL; reconcile watched wallets. |
+| `POST /api/webhooks/alchemy` | Alchemy delivery endpoint (signature-verified). |
 | `POST /api/dune/archive-queries` | Archive every `DICE …` query in the Dune account (frees private-query slots). |
 | `POST /api/sql` | Preview the generated DuneSQL. Needs a key, since the table is resolved from the catalogue. |
 | `GET /api/source?chain=ethereum` | Which table DICE resolved, its shape and column mapping. Add `refresh=true` to re-resolve. |

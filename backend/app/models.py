@@ -230,6 +230,9 @@ class WatchlistSettings(BaseModel):
     #: how a "buy" is detected — confirmed DEX swaps, any new balance, or both
     #: (labelled per wallet). ``both`` costs two Dune executions per run.
     buy_detection: BuyDetection = "both"
+    #: stream this list's wallets through Alchemy webhooks as well, so signals
+    #: fire seconds after a buy instead of at the next scheduled check
+    realtime: bool = False
 
     @field_validator("ignore_tokens")
     @classmethod
@@ -286,6 +289,7 @@ class WatchlistUpdate(BaseModel):
     auto_monitor: bool | None = None
     ignore_tokens: list[str] | None = None
     buy_detection: BuyDetection | None = None
+    realtime: bool | None = None
     add_wallets: list[str] | None = None
     remove_wallets: list[str] | None = None
 
@@ -306,6 +310,7 @@ class WatchlistOut(BaseModel):
     auto_monitor: bool
     ignore_tokens: list[str]
     buy_detection: BuyDetection
+    realtime: bool
     created_at: str
     last_run_at: str | None
     last_run_status: str | None
@@ -322,9 +327,10 @@ class TokenBuyer(BaseModel):
     amount_usd: float | None
     first_buy_at: str | None
     last_buy_at: str | None
-    #: how this wallet was detected: ``dex`` (confirmed swap) or ``balance``
-    #: (new position appeared without a matching DEX trade)
-    via: Literal["dex", "balance"] = "dex"
+    #: how this wallet was detected: ``dex`` (confirmed swap), ``balance``
+    #: (new position found by the Dune monitor) or ``live`` (token arrival
+    #: pushed by Alchemy within seconds of the block)
+    via: Literal["dex", "balance", "live"] = "dex"
 
 
 class SignalOut(BaseModel):

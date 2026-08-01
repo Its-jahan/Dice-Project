@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS watchlists (
     auto_monitor           INTEGER NOT NULL DEFAULT 1,
     ignore_tokens          TEXT    NOT NULL DEFAULT '[]',
     buy_detection          TEXT    NOT NULL DEFAULT 'both',
+    realtime               INTEGER NOT NULL DEFAULT 0,
     created_at             TEXT    NOT NULL,
     last_run_at            TEXT,
     next_run_at            TEXT,
@@ -106,6 +107,38 @@ CREATE TABLE IF NOT EXISTS app_settings (
     value      TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+-- One Alchemy Address Activity webhook per network, holding the union of the
+-- wallets of every realtime-enabled watchlist on that chain.
+CREATE TABLE IF NOT EXISTS alchemy_webhooks (
+    chain       TEXT PRIMARY KEY,
+    network     TEXT NOT NULL,
+    webhook_id  TEXT NOT NULL,
+    signing_key TEXT NOT NULL,
+    webhook_url TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    synced_at   TEXT,
+    address_count INTEGER NOT NULL DEFAULT 0
+);
+
+-- Token arrivals pushed by Alchemy. The rolling-window signal check counts
+-- distinct wallets in here, so no Dune credit is spent per evaluation.
+CREATE TABLE IF NOT EXISTS wallet_events (
+    chain          TEXT    NOT NULL,
+    wallet_address TEXT    NOT NULL,
+    token_address  TEXT    NOT NULL,
+    tx_hash        TEXT    NOT NULL,
+    token_symbol   TEXT,
+    amount         REAL,
+    block_num      INTEGER,
+    seen_at        TEXT    NOT NULL,
+    PRIMARY KEY (chain, wallet_address, token_address, tx_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_window
+    ON wallet_events (chain, token_address, seen_at);
+CREATE INDEX IF NOT EXISTS idx_events_wallet
+    ON wallet_events (chain, wallet_address, seen_at);
 """
 
 _init_lock = threading.Lock()
@@ -116,6 +149,7 @@ _initialized_paths: set[str] = set()
 #: "duplicate column" error on ALTER means it is already present.
 _MIGRATIONS = (
     "ALTER TABLE watchlists ADD COLUMN buy_detection TEXT NOT NULL DEFAULT 'both'",
+    "ALTER TABLE watchlists ADD COLUMN realtime INTEGER NOT NULL DEFAULT 0",
 )
 
 
@@ -188,6 +222,7 @@ def create_watchlist(
     auto_monitor: bool,
     ignore_tokens: list[str],
     buy_detection: str = "both",
+    realtime: bool = False,
 ) -> int:
     now = utcnow_iso()
     with connect() as conn:
@@ -197,8 +232,8 @@ def create_watchlist(
                 name, chain, source_token_address, notes,
                 min_wallets, min_wallets_pct, buy_window_hours,
                 monitor_interval_hours, min_buy_usd, auto_monitor,
-                ignore_tokens, buy_detection, created_at, next_run_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ignore_tokens, buy_detection, realtime, created_at, next_run_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 name,
@@ -213,6 +248,7 @@ def create_watchlist(
                 int(auto_monitor),
                 json.dumps(ignore_tokens),
                 buy_detection,
+                int(realtime),
                 now,
                 iso_plus_hours(now, monitor_interval_hours),
             ),
@@ -628,6 +664,184 @@ def server_api_key() -> str | None:
     if stored:
         return stored
     return (settings.dune_api_key or "").strip() or None
+
+
+# ------------------------------------------------------ realtime (Alchemy)
+
+
+def get_webhook(chain: str) -> dict[str, Any] | None:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM alchemy_webhooks WHERE chain = ?", (chain,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def list_webhooks() -> list[dict[str, Any]]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM alchemy_webhooks ORDER BY chain"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def save_webhook(
+    *,
+    chain: str,
+    network: str,
+    webhook_id: str,
+    signing_key: str,
+    webhook_url: str,
+    address_count: int,
+) -> None:
+    now = utcnow_iso()
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO alchemy_webhooks
+                (chain, network, webhook_id, signing_key, webhook_url,
+                 created_at, synced_at, address_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (chain) DO UPDATE SET
+                network = excluded.network,
+                webhook_id = excluded.webhook_id,
+                signing_key = excluded.signing_key,
+                webhook_url = excluded.webhook_url,
+                synced_at = excluded.synced_at,
+                address_count = excluded.address_count
+            """,
+            (chain, network, webhook_id, signing_key, webhook_url, now, now,
+             address_count),
+        )
+
+
+def mark_webhook_synced(chain: str, address_count: int) -> None:
+    with connect() as conn:
+        conn.execute(
+            "UPDATE alchemy_webhooks SET synced_at = ?, address_count = ? "
+            "WHERE chain = ?",
+            (utcnow_iso(), address_count, chain),
+        )
+
+
+def delete_webhook(chain: str) -> None:
+    with connect() as conn:
+        conn.execute("DELETE FROM alchemy_webhooks WHERE chain = ?", (chain,))
+
+
+def webhook_by_id(webhook_id: str) -> dict[str, Any] | None:
+    """Find the registration a delivery belongs to, by Alchemy's webhook id."""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM alchemy_webhooks WHERE webhook_id = ?", (webhook_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def realtime_wallets(chain: str) -> set[str]:
+    """Union of the wallets of every realtime-enabled watchlist on a chain."""
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT ww.wallet_address
+            FROM watchlist_wallets ww
+            JOIN watchlists w ON w.id = ww.watchlist_id
+            WHERE w.chain = ? AND w.realtime = 1
+            """,
+            (chain,),
+        ).fetchall()
+        return {row["wallet_address"] for row in rows}
+
+
+def realtime_watchlists_for_wallet(chain: str, wallet: str) -> list[dict[str, Any]]:
+    """Every realtime watchlist on this chain that contains this wallet."""
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT w.* FROM watchlists w
+            JOIN watchlist_wallets ww ON ww.watchlist_id = w.id
+            WHERE w.chain = ? AND w.realtime = 1 AND ww.wallet_address = ?
+            """,
+            (chain, wallet),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def realtime_chains() -> list[str]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT chain FROM watchlists WHERE realtime = 1"
+        ).fetchall()
+        return [row["chain"] for row in rows]
+
+
+# --------------------------------------------------------------- wallet events
+
+
+def record_events(events: Iterable[dict[str, Any]]) -> int:
+    """Store token arrivals, ignoring ones already seen. Returns rows inserted.
+
+    A webhook can be redelivered — Alchemy retries on a non-2xx — so the
+    primary key makes replays free rather than double-counting a buyer.
+    """
+    rows = [
+        (
+            event["chain"],
+            event["wallet_address"],
+            event["token_address"],
+            event["tx_hash"],
+            event.get("token_symbol"),
+            event.get("amount"),
+            event.get("block_num"),
+            event.get("seen_at") or utcnow_iso(),
+        )
+        for event in events
+    ]
+    if not rows:
+        return 0
+    with connect() as conn:
+        before = conn.total_changes
+        conn.executemany(
+            "INSERT OR IGNORE INTO wallet_events VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+        return conn.total_changes - before
+
+
+def events_in_window(
+    *, chain: str, token_address: str, since_iso: str, wallets: Iterable[str]
+) -> list[dict[str, Any]]:
+    """Per-wallet aggregate of one token's arrivals inside the window."""
+    wallet_list = list(wallets)
+    if not wallet_list:
+        return []
+    placeholders = ", ".join("?" for _ in wallet_list)
+    with connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT
+                wallet_address,
+                COUNT(*)            AS buy_count,
+                MAX(token_symbol)   AS token_symbol,
+                MIN(seen_at)        AS first_buy_at,
+                MAX(seen_at)        AS last_buy_at
+            FROM wallet_events
+            WHERE chain = ? AND token_address = ? AND seen_at >= ?
+              AND wallet_address IN ({placeholders})
+            GROUP BY wallet_address
+            ORDER BY first_buy_at
+            """,
+            (chain, token_address, since_iso, *wallet_list),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def prune_events(older_than_iso: str) -> int:
+    with connect() as conn:
+        cursor = conn.execute(
+            "DELETE FROM wallet_events WHERE seen_at < ?", (older_than_iso,)
+        )
+        return cursor.rowcount
 
 
 def telegram_credentials() -> tuple[str | None, str | None]:
