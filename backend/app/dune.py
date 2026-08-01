@@ -189,7 +189,8 @@ class DuneClient:
         return queries, int(total) if isinstance(total, int) else len(queries)
 
     async def archive_query(self, query_id: int) -> None:
-        await self._request("PATCH", f"/query/{query_id}/archive")
+        """Archive a query — POST, not PATCH, unlike the other query mutations."""
+        await self._request("POST", f"/query/{query_id}/archive")
 
     async def execute_query(
         self,

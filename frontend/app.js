@@ -232,12 +232,11 @@ async function archiveQueries() {
     setStatus("keyStatus", "Listing and archiving DICE queries on Dune…", "");
     try {
       const result = await api("/api/dune/archive-queries", { method: "POST" });
-      setStatus(
-        "keyStatus",
-        `Archived ${result.archived} of ${result.found} DICE queries` +
-          (result.failed ? ` (${result.failed} failed)` : "") + ".",
-        result.failed ? "error" : "ok",
-      );
+      let message = `Archived ${result.archived} of ${result.found} DICE queries.`;
+      if (result.failed) {
+        message += ` ${result.failed} failed — ${(result.errors || []).join("; ")}`;
+      }
+      setStatus("keyStatus", message, result.failed ? "error" : "ok");
     } catch (error) {
       setStatus("keyStatus", error.message, "error");
     }

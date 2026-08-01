@@ -246,7 +246,7 @@ async def archive_dice_queries(x_dune_api_key: ApiKeyHeader = None) -> dict[str,
     """
     key = resolve_api_key(x_dune_api_key)
     archived = 0
-    failed = 0
+    errors: list[str] = []
     async with DuneClient(key) as client:
         page_size = 100
         offset = 0
@@ -266,16 +266,24 @@ async def archive_dice_queries(x_dune_api_key: ApiKeyHeader = None) -> dict[str,
             try:
                 await client.archive_query(query_id)
                 archived += 1
-            except DuneError:
-                failed += 1
+            except DuneError as exc:
+                # Keep going — one query the account cannot touch should not
+                # abandon the other 25 — but never swallow *why* it failed.
+                errors.append(f"{query_id}: {exc}")
 
-        slots_cleared = db.drop_account_slots(client.key_fingerprint)
+        # Only forget the reuse slots we actually archived; otherwise the next
+        # run would create new queries while the old ones still hold the cap.
+        slots_cleared = (
+            db.drop_account_slots(client.key_fingerprint) if archived else 0
+        )
 
     return {
         "found": len(targets),
         "archived": archived,
-        "failed": failed,
+        "failed": len(errors),
         "slots_cleared": slots_cleared,
+        # First few reasons; the UI shows them so a total failure is diagnosable.
+        "errors": errors[:3],
     }
 
 

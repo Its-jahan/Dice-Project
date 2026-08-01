@@ -8,7 +8,7 @@ from app import main
 from app import monitor as monitor_module
 from app.cache import DiskCache
 from app.config import settings
-from app.dune import DuneAuthError
+from app.dune import DuneAuthError, DuneError
 from app.jobs import JobStore
 
 WALLET = "0x" + "a" * 40
@@ -18,6 +18,7 @@ class FakeDuneClient:
     valid_key = True
     queries: list[dict] = []
     archived: list[int] = []
+    unarchivable: set[int] = set()
     calls: dict = {}
 
     def __init__(self, api_key, **_kwargs):
@@ -40,6 +41,8 @@ class FakeDuneClient:
         return page, len(FakeDuneClient.queries)
 
     async def archive_query(self, query_id):
+        if query_id in FakeDuneClient.unarchivable:
+            raise DuneError(f"Dune returned 403: query {query_id} is not yours")
         FakeDuneClient.archived.append(query_id)
 
 
@@ -48,6 +51,7 @@ def client(monkeypatch, tmp_path):
     FakeDuneClient.valid_key = True
     FakeDuneClient.queries = []
     FakeDuneClient.archived = []
+    FakeDuneClient.unarchivable = set()
     FakeDuneClient.calls = {}
     monkeypatch.setattr(settings, "db_path", str(tmp_path / "dice.db"))
     monkeypatch.setattr(settings, "monitor_enabled", False)
@@ -180,6 +184,37 @@ def test_archive_queries_touches_only_dice_queries(client):
     assert body["slots_cleared"] == 1
     assert FakeDuneClient.archived == [1, 3, 4]
     assert db.get_query_slot("fp-k", "holders") is None
+
+
+def test_archive_reports_why_queries_failed(client):
+    FakeDuneClient.queries = [
+        {"id": 7, "name": "DICE holders ethereum"},
+        {"id": 8, "name": "DICE monitor: list"},
+    ]
+    FakeDuneClient.unarchivable = {7, 8}
+    db.set_query_slot("fp-k", "holders", 7)
+
+    body = client.post(
+        "/api/dune/archive-queries", headers={"X-Dune-Api-Key": "k"}
+    ).json()
+
+    assert body["archived"] == 0
+    assert body["failed"] == 2
+    assert "403" in body["errors"][0]  # the reason reaches the caller
+    # Nothing was archived, so the reuse slot must survive — dropping it would
+    # make the next run create yet another query against a full cap.
+    assert body["slots_cleared"] == 0
+    assert db.get_query_slot("fp-k", "holders") == 7
+
+
+def test_archive_uses_post_not_patch():
+    """Dune archives via POST; PATCH answers 404 and silently archives nothing."""
+    import inspect
+
+    from app.dune import DuneClient
+
+    source = inspect.getsource(DuneClient.archive_query)
+    assert '"POST"' in source
 
 
 def test_archive_queries_requires_a_key(client):
