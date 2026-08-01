@@ -24,6 +24,7 @@ What it sets up:
 | Code | `/opt/dice`, owned by the `dice` system user |
 | Service | `dice.service` — uvicorn on `127.0.0.1:8000`, 2 workers, auto-restart |
 | Config | `/etc/dice/dice.env` (mode 640, root-owned) |
+| Results | `/var/lib/dice` — query results awaiting export, pruned after an hour |
 | Proxy | nginx site `dice`, shared body in `snippets/dice-proxy.conf` |
 | Certificate | `/etc/dice/tls/` when `--self-signed` is used |
 

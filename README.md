@@ -123,8 +123,11 @@ Request body:
 }
 ```
 
-Results are cached in memory for an hour keyed by `job_id`, so downloading four
-formats runs the Dune query once, not four times.
+Results are cached for an hour keyed by `job_id`, so downloading four formats
+runs the Dune query once, not four times. The cache is on disk (`DICE_JOB_DIR`,
+`/var/lib/dice` under systemd) rather than in memory, because uvicorn runs
+several workers and the worker serving the export is rarely the one that ran
+the query.
 
 ## Execution modes
 
