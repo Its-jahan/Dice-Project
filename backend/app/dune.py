@@ -173,6 +173,24 @@ class DuneClient:
         if payload:
             await self._request("PATCH", f"/query/{query_id}", json=payload)
 
+    async def list_queries(
+        self, *, limit: int = 100, offset: int = 0
+    ) -> tuple[list[dict[str, Any]], int]:
+        """One page of the account's queries: ``([{id, name, ...}], total)``.
+
+        Requires a Dune plan that includes the Queries endpoint (Analyst+);
+        lower plans answer 402/403, which surfaces as a clear DuneError.
+        """
+        data = await self._request(
+            "GET", "/queries", params={"limit": limit, "offset": offset}
+        )
+        queries = data.get("queries") or []
+        total = data.get("total")
+        return queries, int(total) if isinstance(total, int) else len(queries)
+
+    async def archive_query(self, query_id: int) -> None:
+        await self._request("PATCH", f"/query/{query_id}/archive")
+
     async def execute_query(
         self,
         query_id: int,

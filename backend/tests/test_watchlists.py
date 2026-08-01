@@ -6,9 +6,37 @@ from app.models import Chain
 from app.monitor import (
     aggregate_candidates,
     effective_min_wallets,
+    merge_buys,
+    parse_position_rows,
     parse_trade_rows,
 )
-from app.sql import DEFAULT_IGNORED_TOKENS, build_trades_sql, ignored_tokens_for
+from app.source import Source
+from app.sql import (
+    DEFAULT_IGNORED_TOKENS,
+    build_new_positions_sql,
+    build_trades_sql,
+    ignored_tokens_for,
+)
+
+INTERVAL_SOURCE = Source(
+    schema="balances_ethereum__spellbook_sqlmesh_490",
+    table="daily_updates",
+    shape="interval",
+    address="address",
+    token="token_address",
+    balance="balance",
+    valid_from="valid_from",
+    valid_to="valid_to",
+)
+DAILY_SOURCE = Source(
+    schema="tokens_solana",
+    table="balances_daily",
+    shape="daily",
+    address="address",
+    token="token_mint_address",
+    balance="balance",
+    day="day",
+)
 
 WALLET_A = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 WALLET_B = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -60,6 +88,44 @@ def test_solana_trades_sql_quotes_base58_strings():
     assert f"'{SOL_WALLET_1}'" in sql
     assert "interval '12' hour" in sql
     assert "'So11111111111111111111111111111111111111112'" in sql  # wSOL ignored
+
+
+# -------------------------------------------------------- SQL: new positions
+
+
+def test_interval_new_positions_sql_excludes_prior_holdings():
+    sql = build_new_positions_sql(
+        Chain.ethereum, INTERVAL_SOURCE, [WALLET_A, WALLET_B], window_hours=48
+    )
+
+    assert INTERVAL_SOURCE.qualified in sql
+    assert "interval '48' hour" in sql
+    # The anti-join is what makes it a *new* position rather than any holding.
+    assert "NOT EXISTS" in sql
+    assert "p.valid_from < now() - interval '48' hour" in sql
+    assert WALLET_A in sql and f"'{WALLET_A}'" not in sql  # varbinary literal
+    assert "dex.trades" not in sql
+
+
+def test_daily_new_positions_sql_rounds_the_window_to_days():
+    sql = build_new_positions_sql(
+        Chain.solana, DAILY_SOURCE, [SOL_WALLET_1], window_hours=36
+    )
+
+    # 36h rounds up to 2 days on a day-granularity table.
+    assert "date_add('day', -2, current_date)" in sql
+    assert f"'{SOL_WALLET_1}'" in sql
+    assert "'So11111111111111111111111111111111111111112'" in sql  # wSOL ignored
+    assert "NOT EXISTS" in sql
+
+
+def test_new_positions_sql_validates_wallets():
+    with pytest.raises(ValueError):
+        build_new_positions_sql(
+            Chain.ethereum, INTERVAL_SOURCE, ["nope"], window_hours=24
+        )
+    with pytest.raises(ValueError):
+        build_new_positions_sql(Chain.ethereum, INTERVAL_SOURCE, [], window_hours=24)
 
 
 # ------------------------------------------------------------------- stoplist
@@ -128,6 +194,72 @@ def test_parse_trade_rows_filters_and_normalises():
     assert buy["wallet_address"] == WALLET_A
     assert buy["amount_usd"] == pytest.approx(1250.50)
     assert buy["first_buy_at"] == "2026-08-01T10:22:33+00:00"
+    assert buy["via"] == "dex"
+
+
+def test_parse_position_rows_labels_balance_and_leaves_usd_unknown():
+    rows = [
+        {
+            "wallet_address": WALLET_A.upper().replace("0X", "0x"),
+            "token_address": TOKEN_1,
+            "first_seen_at": "2026-08-01 07:00:00.000 UTC",
+            "balance": 4200.0,
+        },
+        {"wallet_address": WALLET_A, "token_address": TOKEN_2},  # ignored token
+    ]
+
+    buys = parse_position_rows(
+        rows, chain=Chain.ethereum, wallets=[WALLET_A], ignored_tokens=[TOKEN_2]
+    )
+
+    assert len(buys) == 1
+    assert buys[0]["via"] == "balance"
+    assert buys[0]["amount_usd"] is None
+    assert buys[0]["first_buy_at"] == "2026-08-01T07:00:00+00:00"
+
+
+def test_merge_buys_prefers_the_dex_record_for_the_same_pair():
+    dex = [
+        {
+            "wallet_address": WALLET_A,
+            "token_address": TOKEN_1,
+            "token_symbol": "GEM",
+            "buy_count": 2,
+            "amount_usd": 900.0,
+            "first_buy_at": None,
+            "last_buy_at": None,
+            "via": "dex",
+        }
+    ]
+    positions = [
+        {
+            "wallet_address": WALLET_A,   # same pair, seen both ways
+            "token_address": TOKEN_1,
+            "token_symbol": None,
+            "buy_count": 1,
+            "amount_usd": None,
+            "first_buy_at": None,
+            "last_buy_at": None,
+            "via": "balance",
+        },
+        {
+            "wallet_address": WALLET_B,   # position only
+            "token_address": TOKEN_1,
+            "token_symbol": None,
+            "buy_count": 1,
+            "amount_usd": None,
+            "first_buy_at": None,
+            "last_buy_at": None,
+            "via": "balance",
+        },
+    ]
+
+    merged = {b["wallet_address"]: b for b in merge_buys(dex, positions)}
+
+    assert len(merged) == 2  # not three: the duplicate pair collapsed
+    assert merged[WALLET_A]["via"] == "dex"
+    assert merged[WALLET_A]["amount_usd"] == pytest.approx(900.0)
+    assert merged[WALLET_B]["via"] == "balance"
 
 
 # --------------------------------------------------------------- aggregation

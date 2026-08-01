@@ -26,33 +26,29 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ```
 
 Open <http://127.0.0.1:8000>, paste your Dune API key into the **Dune API key**
-field, hit **Test key**, then run a query.
+field, hit **Save key**, then run a query.
 
-## Entering your Dune API key in the website
+## The Dune API key lives on the server
 
-There is no key in any config file by default. The UI has a key panel with:
+DICE is a **single-user deployment**: the first time you press *Save key* the
+key is validated against Dune and stored in the server's SQLite database.
+From then on every request — the queries you start in the UI *and* the
+scheduled watchlist monitoring — uses that stored key. Saving a new key
+replaces the old one; *Remove* deletes it.
 
-| Control | What it does |
-| --- | --- |
-| **API key** field | Masked input with a Show/Hide toggle. |
-| **Remember** | `On this browser` (localStorage), `Until tab closes` (sessionStorage), or `Do not save` (kept in memory for the page only). |
-| **Save key** | Stores it per the Remember choice, clearing the other store so no stale copy survives a switch. |
-| **Test key** | Calls `POST /api/key/validate`, which asks Dune whether the key authenticates — before you spend any credits. |
-| **Clear** | Wipes the key from both browser stores. |
+Details worth knowing:
 
-How the key is handled:
-
-- It travels in the `X-Dune-Api-Key` **header**, never in a URL — so it cannot
-  leak through server access logs, browser history, or the `Referer` header.
-- The server holds it only for the lifetime of the request. It is never written
-  to disk, never logged, and never included in any response body
-  (`GET /api/config` reports only *whether* a server-side key exists).
-- `DUNE_API_KEY` in the environment is an optional fallback for a private
-  single-user deployment; leave it unset for a shared one so each user brings
-  their own key. A header key always wins over the environment key.
-
-If you deploy DICE publicly, serve it over HTTPS — the key is only as protected
-as the transport carrying it.
+- The key travels in the `X-Dune-Api-Key` **header**, never in a URL, and is
+  never echoed back: `GET /api/config` reports only that a key exists plus its
+  last four characters.
+- A key typed into the field but not saved still works for one-off requests —
+  it rides along as a header and overrides the stored key for that request.
+- `DUNE_API_KEY` in the environment acts as a fallback when nothing has been
+  saved through the UI.
+- Because the key is stored server-side, protect the server: it sits in
+  `DICE_DB_PATH` (SQLite) readable by the service user only, and the systemd
+  unit runs hardened. Serve over HTTPS — the key crosses the wire when you
+  save it.
 
 ## Deploying to a server
 
@@ -127,33 +123,42 @@ The loop:
    inside the buy window (default 48 h).
 4. When enough distinct wallets bought the *same* token, it becomes a
    **signal**: token, buyer count, USD volume, and exactly which wallets bought
-   — with a DexScreener link to eyeball it.
+   — each tagged with how it was detected — plus a DexScreener link to eyeball
+   it.
 
 **Threshold.** A token fires when its distinct-buyer count reaches
 `max(min_wallets, ceil(min_wallets_pct% × watchlist size))` — with 100 wallets
 and the default 10 %, that is 10 co-buyers. Both knobs are per-watchlist and
 editable in the UI.
 
-**What counts as a buy.** DEX swaps where the wallet received the token.
-Wrapped-native tokens, major stables and liquid-staking tokens are ignored by
-default (every swap "buys" USDC as its other leg), and the watchlist's own
-source token is auto-ignored too — remove it from the ignore list if you want
-re-accumulation alerts. Plain transfers and CEX buys are invisible to this.
-Buys with a *known* USD value below `min_buy_usd` are dropped; buys with no
-USD price yet (very new tokens) always pass.
+**What counts as a buy** — picked per watchlist, changeable any time:
 
-**Scheduling needs a server key.** Manual **Run now** works with the key in
-your browser, like every other query. *Scheduled* runs happen with no browser
-attached, so they only run when `DUNE_API_KEY` is set server-side; otherwise
-watchlists simply wait for you to click. Every monitor run is one Dune
-execution on your plan's credits — a 2-hour interval spends 12× more than a
-daily one. Runs are serialized per process, and with several uvicorn workers a
-SQLite claim guarantees each due watchlist runs exactly once.
+| Mode | What it counts | Cost per check |
+| --- | --- | --- |
+| **Both, labelled** *(default)* | Runs the two below together and tags every buyer `DEX buy` or `new position`. When a wallet shows up both ways, the trade wins so the USD amount is kept. | 2 Dune executions |
+| **DEX swaps only** | Swaps in `dex.trades` / `dex_solana.trades` where the wallet received the token. Cleanest evidence — real money changed hands — but blind to OTC deals, CEX withdrawals and transfers between a person's own wallets. | 1 execution |
+| **Any new position** | Any token whose balance went from nothing to positive inside the window, read from the same balance table as the holder query. Catches every route, including airdrops and self-transfers, and has no USD amount attached. | 1 execution |
 
-**Telegram (optional).** Set `DICE_TELEGRAM_BOT_TOKEN` and
-`DICE_TELEGRAM_CHAT_ID` and every *new* or *strengthened* signal (buyer count
-grew) is pushed as a message. Dismissed signals stay quiet even if they
-re-trigger.
+Whichever mode you pick, wrapped-native tokens, major stables and
+liquid-staking tokens are ignored (every swap "buys" USDC as its other leg),
+and the watchlist's own source token is auto-ignored — remove it from the
+ignore list if you want re-accumulation alerts. Buys with a *known* USD value
+below `min_buy_usd` are dropped; buys with no USD price (very new tokens, and
+all bare positions) always pass.
+
+**Scheduling uses the saved key.** Once a key is saved in the UI, scheduled
+runs are active — no environment configuration needed. The check interval is
+chosen when the watchlist is created (2 h – 48 h) and can be changed any time
+from its Edit dialog. Every monitor run is one Dune execution on your plan's
+credits — a 2-hour interval spends 12× more than a daily one. With several
+uvicorn workers a SQLite claim guarantees each due watchlist runs exactly
+once.
+
+**Telegram (optional).** Configure a bot token and chat id in the UI's
+*Telegram alerts* card (or via `DICE_TELEGRAM_BOT_TOKEN` /
+`DICE_TELEGRAM_CHAT_ID` env vars) and every *new* or *strengthened* signal
+(buyer count grew) is pushed as a message; *Send test* verifies the wiring.
+Dismissed signals stay quiet even if they re-trigger.
 
 Watchlists, run history and signals persist in SQLite (`DICE_DB_PATH`,
 default `backend/data/dice.db`; the systemd unit uses `/var/lib/dice/dice.db`).
@@ -165,7 +170,10 @@ holder side via `DUNE_QUERY_ID` but not scheduled monitoring.
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /api/config` | UI bootstrap — key presence, execution mode, row caps. |
-| `POST /api/key/validate` | Check a Dune key. Header: `X-Dune-Api-Key`. |
+| `POST /api/key` · `DELETE /api/key` | Validate and save the key on the server / remove it. |
+| `POST /api/key/validate` | Check a key without saving. Header: `X-Dune-Api-Key`. |
+| `GET` / `PUT /api/settings/notifications` · `POST …/test` | Telegram bot token + chat id, and a test send. |
+| `POST /api/dune/archive-queries` | Archive every `DICE …` query in the Dune account (frees private-query slots). |
 | `POST /api/sql` | Preview the generated DuneSQL. Needs a key, since the table is resolved from the catalogue. |
 | `GET /api/source?chain=ethereum` | Which table DICE resolved, its shape and column mapping. Add `refresh=true` to re-resolve. |
 | `GET /api/discover` | Raw listing of curated balance tables the key can reach. |

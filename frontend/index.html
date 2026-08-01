@@ -3,231 +3,440 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>DICE — Historical Token Holders</title>
+  <title>DICE — Token Holders &amp; Wallet Signals</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%233b5bdb'/%3E%3Cpath d='M16 6l10 10-10 10L6 16z' fill='%23fff'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/vendor/bootstrap.min.css">
   <link rel="stylesheet" href="/static/styles.css">
+  <script>
+    // Follow the OS theme; Bootstrap 5.3 color modes do the rest.
+    const applyTheme = () => document.documentElement.setAttribute(
+      "data-bs-theme",
+      window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light",
+    );
+    applyTheme();
+    window.matchMedia("(prefers-color-scheme: dark)")
+      .addEventListener("change", applyTheme);
+  </script>
 </head>
-<body>
-  <header class="topbar">
-    <div class="brand">
-      <span class="logo" aria-hidden="true">◈</span>
-      <div>
-        <h1>DICE</h1>
-        <p>Historical token holders, straight from Dune.</p>
-      </div>
+<body class="bg-body-tertiary">
+
+  <nav class="navbar navbar-expand-lg bg-body border-bottom sticky-top">
+    <div class="container-xxl">
+      <span class="navbar-brand d-flex align-items-center gap-2">
+        <span class="fs-4 text-primary">&#9672;</span>
+        <span>
+          <strong>DICE</strong>
+          <span class="d-none d-md-inline text-body-secondary small ms-2">
+            Historical token holders &amp; wallet buy signals
+          </span>
+        </span>
+      </span>
+      <span id="keyPill" class="badge rounded-pill text-bg-secondary">No API key</span>
     </div>
-    <span id="keyPill" class="pill pill--muted">No API key</span>
-  </header>
+  </nav>
 
-  <main>
-    <!-- ------------------------------------------------ API key -->
-    <section class="card" aria-labelledby="keyHeading">
-      <h2 id="keyHeading">Dune API key</h2>
-      <p class="hint">
-        Your key stays in your browser and is sent only with your own requests —
-        it is never stored on the server or written to logs.
-        Create one at <code>dune.com → Settings → API</code>.
-      </p>
+  <main class="container-xxl py-4 d-grid gap-4">
 
-      <div class="field-row">
-        <div class="field grow">
-          <label for="apiKey">API key</label>
-          <div class="input-with-button">
-            <input id="apiKey" type="password" autocomplete="off" spellcheck="false"
-                   placeholder="dQ…your Dune API key">
-            <button type="button" id="toggleKey" class="ghost" aria-label="Show or hide the key">Show</button>
+    <!-- ================================================== API key -->
+    <section class="card shadow-sm" aria-labelledby="keyHeading">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <h2 id="keyHeading" class="h6 mb-0">Dune API key</h2>
+        <span class="text-body-secondary small">dune.com → Settings → API</span>
+      </div>
+      <div class="card-body">
+        <p class="form-text mt-0 mb-3">
+          The key is saved <strong>on this server</strong> the first time you press
+          Save, and it powers everything — queries you run here and the scheduled
+          watchlist monitoring. Saving a new key replaces the old one.
+        </p>
+        <div class="row g-2 align-items-center">
+          <div class="col-lg-6">
+            <div class="input-group">
+              <input id="apiKey" type="password" class="form-control"
+                     autocomplete="off" spellcheck="false"
+                     placeholder="Paste your Dune API key">
+              <button type="button" id="toggleKey" class="btn btn-outline-secondary">Show</button>
+            </div>
+          </div>
+          <div class="col-auto">
+            <button type="button" id="saveKey" class="btn btn-primary">Save key</button>
+            <button type="button" id="testKey" class="btn btn-outline-secondary">Test</button>
+            <button type="button" id="clearKey" class="btn btn-outline-danger">Remove</button>
           </div>
         </div>
-        <div class="field shrink">
-          <label for="keyStorage">Remember</label>
-          <select id="keyStorage">
-            <option value="local">On this browser</option>
-            <option value="session">Until tab closes</option>
-            <option value="none">Do not save</option>
+        <div id="keyStatus" class="small mt-2" role="status" aria-live="polite"></div>
+        <hr>
+        <div class="d-flex flex-wrap align-items-center gap-2">
+          <button type="button" id="archiveQueries" class="btn btn-outline-secondary btn-sm">
+            Archive DICE queries on Dune
+          </button>
+          <span class="form-text m-0">
+            Frees your account's private-query slots by archiving every query named
+            “DICE …” (older versions created one per run). Your other queries are
+            not touched.
+          </span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================================================== query -->
+    <section class="card shadow-sm" aria-labelledby="queryHeading">
+      <div class="card-header"><h2 id="queryHeading" class="h6 mb-0">Holder query</h2></div>
+      <div class="card-body">
+        <form id="queryForm">
+          <div class="row g-3">
+            <div class="col-md-3">
+              <label class="form-label" for="chain">Chain</label>
+              <select id="chain" name="chain" class="form-select">
+                <option value="ethereum">Ethereum</option>
+                <option value="arbitrum">Arbitrum</option>
+                <option value="avalanche_c">Avalanche C-Chain</option>
+                <option value="base">Base</option>
+                <option value="bnb">BNB Chain</option>
+                <option value="celo">Celo</option>
+                <option value="flare">Flare</option>
+                <option value="gnosis">Gnosis</option>
+                <option value="hyperevm">HyperEVM</option>
+                <option value="ink">Ink</option>
+                <option value="kaia">Kaia</option>
+                <option value="linea">Linea</option>
+                <option value="mantle">Mantle</option>
+                <option value="monad">Monad</option>
+                <option value="optimism">Optimism</option>
+                <option value="plasma">Plasma</option>
+                <option value="polygon">Polygon</option>
+                <option value="sei">Sei</option>
+                <option value="sonic">Sonic</option>
+                <option value="unichain">Unichain</option>
+                <option value="solana">Solana</option>
+              </select>
+            </div>
+            <div class="col-md-6">
+              <label class="form-label" for="tokenAddress">Token contract / mint address</label>
+              <input id="tokenAddress" name="token_address" class="form-control"
+                     required spellcheck="false" placeholder="0x…">
+            </div>
+            <div class="col-md-3">
+              <label class="form-label" for="minBalance">Minimum balance</label>
+              <input id="minBalance" name="min_balance" type="number" min="0"
+                     step="any" value="0" class="form-control">
+            </div>
+            <div class="col-md-3">
+              <label class="form-label" for="startDate">Start date (UTC)</label>
+              <input id="startDate" name="start_date" type="date" required class="form-control">
+            </div>
+            <div class="col-md-3">
+              <label class="form-label" for="endDate">End date (UTC)</label>
+              <input id="endDate" name="end_date" type="date" required class="form-control">
+            </div>
+            <div class="col-md-3">
+              <label class="form-label" for="holderMode">Holder mode</label>
+              <select id="holderMode" name="holder_mode" class="form-select">
+                <option value="daily">Daily snapshots (default)</option>
+                <option value="any_time">Held at any time</option>
+                <option value="continuous">Continuous holders</option>
+              </select>
+            </div>
+            <div class="col-md-3 d-flex align-items-end">
+              <div>
+                <div class="form-check">
+                  <input type="checkbox" id="includeContracts" class="form-check-input" checked>
+                  <label class="form-check-label small" for="includeContracts">
+                    Include smart contracts
+                  </label>
+                </div>
+                <div class="form-check">
+                  <input type="checkbox" id="excludeBurn" class="form-check-input" checked>
+                  <label class="form-check-label small" for="excludeBurn">
+                    Exclude burn addresses
+                  </label>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="d-flex flex-wrap align-items-center gap-2 mt-3">
+            <button type="submit" class="btn btn-primary" id="runBtn">Run query</button>
+            <button type="button" class="btn btn-outline-secondary" id="showSql">Show SQL</button>
+            <button type="button" class="btn btn-outline-secondary" id="diagnoseBtn">Diagnose source</button>
+            <span id="runStatus" class="small" role="status" aria-live="polite"></span>
+          </div>
+        </form>
+      </div>
+    </section>
+
+    <!-- ================================================== generated SQL -->
+    <section class="card shadow-sm d-none" id="sqlCard" aria-labelledby="sqlHeading">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <h2 id="sqlHeading" class="h6 mb-0">Generated DuneSQL</h2>
+        <button type="button" class="btn-close" aria-label="Hide SQL"
+                onclick="document.getElementById('sqlCard').classList.add('d-none')"></button>
+      </div>
+      <div class="card-body">
+        <pre id="sqlOut" class="bg-body-tertiary border rounded p-3 small mb-0 overflow-auto"></pre>
+      </div>
+    </section>
+
+    <!-- ================================================== results -->
+    <section class="card shadow-sm d-none" id="resultsCard" aria-labelledby="resultsHeading">
+      <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
+        <button class="btn btn-link text-decoration-none p-0 h6 mb-0 d-flex align-items-center gap-2"
+                type="button" data-bs-toggle="collapse" data-bs-target="#resultsBody"
+                aria-expanded="true" aria-controls="resultsBody" id="resultsToggle">
+          <span id="resultsHeading">Results</span>
+          <span class="small text-body-secondary">(click to collapse)</span>
+        </button>
+        <div class="d-flex align-items-center gap-2">
+          <select id="format" class="form-select form-select-sm w-auto">
+            <option value="csv">CSV</option>
+            <option value="xlsx">Excel (.xlsx)</option>
+            <option value="json">JSON</option>
+            <option value="html">HTML</option>
           </select>
+          <button type="button" id="downloadBtn" class="btn btn-primary btn-sm">Download</button>
         </div>
       </div>
+      <div class="collapse show" id="resultsBody">
+        <div class="card-body">
+          <p id="resultsMeta" class="small text-body-secondary"></p>
 
-      <div class="actions">
-        <button type="button" id="saveKey" class="primary">Save key</button>
-        <button type="button" id="testKey">Test key</button>
-        <button type="button" id="clearKey" class="danger-ghost">Clear</button>
-        <span id="keyStatus" class="status" role="status" aria-live="polite"></span>
+          <div class="border rounded p-3 mb-3 bg-body-tertiary">
+            <div class="row g-2 align-items-end">
+              <div class="col-md-4">
+                <label class="form-label small" for="watchlistName">
+                  Save these wallets as a watchlist
+                </label>
+                <input id="watchlistName" class="form-control form-control-sm"
+                       placeholder="Watchlist name" maxlength="120">
+              </div>
+              <div class="col-md-2">
+                <label class="form-label small" for="watchlistInterval">Check every</label>
+                <select id="watchlistInterval" class="form-select form-select-sm">
+                  <option value="2">2 hours</option>
+                  <option value="6">6 hours</option>
+                  <option value="12">12 hours</option>
+                  <option value="24" selected>24 hours</option>
+                  <option value="48">48 hours</option>
+                </select>
+              </div>
+              <div class="col-md-3">
+                <label class="form-label small" for="watchlistDetection">
+                  Count a buy as
+                  <span class="text-body-secondary" title="Both runs two Dune queries per check, so it costs about twice the credits.">&#9432;</span>
+                </label>
+                <select id="watchlistDetection" class="form-select form-select-sm">
+                  <option value="both" selected>Both, labelled (recommended)</option>
+                  <option value="balance">Any new position</option>
+                  <option value="dex">DEX swaps only</option>
+                </select>
+              </div>
+              <div class="col-md-2 d-none" id="topNField">
+                <label class="form-label small" for="watchlistTopN">Keep top N</label>
+                <input id="watchlistTopN" type="number" min="1" step="1"
+                       class="form-control form-control-sm">
+              </div>
+              <div class="col-auto">
+                <button type="button" id="saveWatchlistBtn" class="btn btn-success btn-sm">
+                  Create watchlist
+                </button>
+              </div>
+              <div class="col-12">
+                <span id="watchlistSaveStatus" class="small" role="status" aria-live="polite"></span>
+              </div>
+            </div>
+          </div>
+
+          <ul class="nav nav-tabs mb-2" role="tablist">
+            <li class="nav-item"><button type="button" role="tab"
+              class="nav-link active tab" data-tab="snapshots">Snapshots</button></li>
+            <li class="nav-item"><button type="button" role="tab"
+              class="nav-link tab" data-tab="summary">Per-wallet summary</button></li>
+          </ul>
+          <div class="table-responsive">
+            <table id="resultsTable" class="table table-sm table-striped table-hover align-middle mb-2">
+              <thead></thead><tbody></tbody>
+            </table>
+          </div>
+          <div class="d-flex align-items-center gap-3">
+            <button type="button" id="showMoreBtn" class="btn btn-outline-secondary btn-sm d-none">
+              Show 50 more
+            </button>
+            <span id="previewNote" class="small text-body-secondary"></span>
+          </div>
+        </div>
       </div>
     </section>
 
-    <!-- ------------------------------------------------ query -->
-    <section class="card" aria-labelledby="queryHeading">
-      <h2 id="queryHeading">Query</h2>
-      <form id="queryForm">
-        <div class="grid">
-          <div class="field">
-            <label for="chain">Chain</label>
-            <select id="chain" name="chain">
-              <option value="ethereum">Ethereum</option>
-              <option value="arbitrum">Arbitrum</option>
-              <option value="avalanche_c">Avalanche</option>
-              <option value="base">Base</option>
-              <option value="bnb">BNB Chain</option>
-              <option value="celo">Celo</option>
-              <option value="flare">Flare</option>
-              <option value="gnosis">Gnosis</option>
-              <option value="hyperevm">HyperEVM</option>
-              <option value="ink">Ink</option>
-              <option value="kaia">Kaia</option>
-              <option value="linea">Linea</option>
-              <option value="mantle">Mantle</option>
-              <option value="monad">Monad</option>
-              <option value="optimism">Optimism</option>
-              <option value="plasma">Plasma</option>
-              <option value="polygon">Polygon</option>
-              <option value="sei">Sei</option>
-              <option value="sonic">Sonic</option>
-              <option value="unichain">Unichain</option>
-              <option value="solana">Solana</option>
-            </select>
-          </div>
-
-          <div class="field span2">
-            <label for="tokenAddress">Token contract / mint address</label>
-            <input id="tokenAddress" name="token_address" required
-                   spellcheck="false" placeholder="0x…">
-          </div>
-
-          <div class="field">
-            <label for="startDate">Start date (UTC)</label>
-            <input id="startDate" name="start_date" type="date" required>
-          </div>
-
-          <div class="field">
-            <label for="endDate">End date (UTC)</label>
-            <input id="endDate" name="end_date" type="date" required>
-          </div>
-
-          <div class="field">
-            <label for="minBalance">Minimum balance</label>
-            <input id="minBalance" name="min_balance" type="number" min="0"
-                   step="any" value="0">
-          </div>
-
-          <div class="field">
-            <label for="holderMode">Holder mode</label>
-            <select id="holderMode" name="holder_mode">
-              <option value="daily">Daily snapshots (default)</option>
-              <option value="any_time">Held at any time</option>
-              <option value="continuous">Continuous holders</option>
-            </select>
-          </div>
-
-          <div class="field">
-            <label for="format">Export format</label>
-            <select id="format">
-              <option value="csv">CSV</option>
-              <option value="xlsx">Excel (.xlsx)</option>
-              <option value="json">JSON</option>
-              <option value="html">HTML</option>
-            </select>
-          </div>
+    <!-- ================================================== watchlists -->
+    <section class="card shadow-sm" id="watchlistsCard" aria-labelledby="watchlistsHeading">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <h2 id="watchlistsHeading" class="h6 mb-0">Watchlists</h2>
+        <button type="button" id="refreshWatchlists" class="btn btn-outline-secondary btn-sm">
+          Refresh
+        </button>
+      </div>
+      <div class="card-body">
+        <p class="small text-body-secondary">
+          Wallets that bought a token early, watched for what they buy next. Each run
+          asks Dune what these wallets bought on DEXes inside the buy window; when
+          enough of them bought the same token it becomes a signal below.
+          <span id="autoMonitorHint"></span>
+        </p>
+        <p id="watchlistsEmpty" class="small text-body-secondary mb-0">
+          No watchlists yet — run a holder query over a token's first days, then save
+          its wallets from the results card.
+        </p>
+        <div class="table-responsive">
+          <table id="watchlistsTable" class="table table-sm table-hover align-middle d-none mb-0">
+            <thead></thead><tbody></tbody>
+          </table>
         </div>
-
-        <div class="checks">
-          <label><input type="checkbox" id="includeContracts" checked>
-            Include smart-contract addresses</label>
-          <label><input type="checkbox" id="excludeBurn" checked>
-            Exclude zero / burn addresses</label>
-        </div>
-
-        <div class="actions">
-          <button type="submit" class="primary" id="runBtn">Run query</button>
-          <button type="button" id="showSql">Show SQL</button>
-          <button type="button" id="diagnoseBtn" title="Ask Dune which balance table DICE will read for this chain">Check data source</button>
-          <span id="runStatus" class="status" role="status" aria-live="polite"></span>
-        </div>
-      </form>
+        <div id="watchlistsStatus" class="small mt-2" role="status" aria-live="polite"></div>
+      </div>
     </section>
 
-    <!-- ------------------------------------------------ results -->
-    <section class="card hidden" id="sqlCard" aria-labelledby="sqlHeading">
-      <h2 id="sqlHeading">Generated DuneSQL</h2>
-      <pre id="sqlOut" class="scroll"></pre>
+    <!-- ================================================== signals -->
+    <section class="card shadow-sm" id="signalsCard" aria-labelledby="signalsHeading">
+      <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
+        <h2 id="signalsHeading" class="h6 mb-0">Signals</h2>
+        <div class="d-flex align-items-center gap-3">
+          <div class="form-check form-switch mb-0">
+            <input class="form-check-input" type="checkbox" id="showDismissed">
+            <label class="form-check-label small" for="showDismissed">Show dismissed</label>
+          </div>
+          <button type="button" id="refreshSignals" class="btn btn-outline-secondary btn-sm">
+            Refresh
+          </button>
+        </div>
+      </div>
+      <div class="card-body">
+        <p class="small text-body-secondary">
+          A signal means N of the watched wallets bought the same token inside the buy
+          window. Click a row to see exactly who bought and for how much.
+        </p>
+        <p id="signalsEmpty" class="small text-body-secondary mb-0">No signals yet.</p>
+        <div class="table-responsive">
+          <table id="signalsTable" class="table table-sm table-hover align-middle d-none mb-0">
+            <thead></thead><tbody></tbody>
+          </table>
+        </div>
+        <div id="signalsStatus" class="small mt-2" role="status" aria-live="polite"></div>
+      </div>
     </section>
 
-    <section class="card hidden" id="resultsCard" aria-labelledby="resultsHeading">
-      <div class="results-head">
-        <h2 id="resultsHeading">Results</h2>
-        <div class="actions">
-          <button type="button" id="downloadBtn" class="primary">Download</button>
+    <!-- ================================================== notifications -->
+    <section class="card shadow-sm" aria-labelledby="tgHeading">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <h2 id="tgHeading" class="h6 mb-0">Telegram alerts</h2>
+        <span id="tgBadge" class="badge rounded-pill text-bg-secondary">Off</span>
+      </div>
+      <div class="card-body">
+        <p class="form-text mt-0 mb-3">
+          New and strengthened signals are pushed to a Telegram chat. Create a bot with
+          <strong>@BotFather</strong>, paste its token here, then the chat id that
+          should receive alerts (message <strong>@userinfobot</strong> to find yours,
+          and send your bot one message first so it can reach you).
+        </p>
+        <div class="row g-2 align-items-center">
+          <div class="col-lg-5">
+            <input id="tgToken" type="password" class="form-control" autocomplete="off"
+                   spellcheck="false" placeholder="Bot token (123456:ABC-…)">
+          </div>
+          <div class="col-lg-3">
+            <input id="tgChat" class="form-control" spellcheck="false"
+                   placeholder="Chat id (e.g. 123456789)">
+          </div>
+          <div class="col-auto">
+            <button type="button" id="tgSave" class="btn btn-primary">Save</button>
+            <button type="button" id="tgTest" class="btn btn-outline-secondary">Send test</button>
+          </div>
         </div>
+        <div id="tgStatus" class="small mt-2" role="status" aria-live="polite"></div>
       </div>
-      <p id="resultsMeta" class="hint"></p>
-      <div class="watchlist-save">
-        <div class="field grow">
-          <label for="watchlistName">Save these wallets as a watchlist</label>
-          <input id="watchlistName" placeholder="Watchlist name" maxlength="120">
-        </div>
-        <div class="field shrink hidden" id="topNField">
-          <label for="watchlistTopN">Keep top N holders</label>
-          <input id="watchlistTopN" type="number" min="1" step="1">
-        </div>
-        <button type="button" id="saveWatchlistBtn">Create watchlist</button>
-        <span id="watchlistSaveStatus" class="status" role="status" aria-live="polite"></span>
-      </div>
-      <div class="tabs" role="tablist">
-        <button type="button" class="tab is-active" data-tab="snapshots" role="tab">Snapshots</button>
-        <button type="button" class="tab" data-tab="summary" role="tab">Per-wallet summary</button>
-      </div>
-      <div class="scroll">
-        <table id="resultsTable"><thead></thead><tbody></tbody></table>
-      </div>
-      <p id="previewNote" class="hint"></p>
     </section>
 
-    <!-- ------------------------------------------------ watchlists -->
-    <section class="card" id="watchlistsCard" aria-labelledby="watchlistsHeading">
-      <div class="results-head">
-        <h2 id="watchlistsHeading">Watchlists</h2>
-        <div class="actions">
-          <button type="button" id="refreshWatchlists">Refresh</button>
-        </div>
-      </div>
-      <p class="hint">
-        Wallets that bought a token early, watched for what they buy next.
-        Each monitor run asks Dune what these wallets bought on DEXes inside the
-        buy window; when enough of them bought the same token, it becomes a
-        signal below. <span id="autoMonitorHint"></span>
-      </p>
-      <p id="watchlistsEmpty" class="hint">
-        No watchlists yet — run a holder query over a token's first days, then
-        save its wallets from the results card.
-      </p>
-      <div class="scroll">
-        <table id="watchlistsTable" class="hidden"><thead></thead><tbody></tbody></table>
-      </div>
-      <span id="watchlistsStatus" class="status" role="status" aria-live="polite"></span>
-    </section>
-
-    <!-- ------------------------------------------------ signals -->
-    <section class="card" id="signalsCard" aria-labelledby="signalsHeading">
-      <div class="results-head">
-        <h2 id="signalsHeading">Signals</h2>
-        <div class="actions">
-          <label class="check-inline"><input type="checkbox" id="showDismissed">
-            Show dismissed</label>
-          <button type="button" id="refreshSignals">Refresh</button>
-        </div>
-      </div>
-      <p class="hint">
-        A signal means N of the watched wallets bought the same token inside the
-        buy window. Click a row to see exactly who bought and for how much.
-      </p>
-      <p id="signalsEmpty" class="hint">No signals yet.</p>
-      <div class="scroll">
-        <table id="signalsTable" class="hidden"><thead></thead><tbody></tbody></table>
-      </div>
-      <span id="signalsStatus" class="status" role="status" aria-live="polite"></span>
-    </section>
+    <footer class="text-center small text-body-secondary pb-3">
+      DICE · holder extraction &amp; wallet co-buy signals via Dune Analytics
+    </footer>
   </main>
 
+  <!-- ================================================== watchlist edit modal -->
+  <div class="modal fade" id="watchlistModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-lg">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h3 class="h6 modal-title" id="wlModalTitle">Edit watchlist</h3>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <div class="modal-body">
+          <div class="row g-3">
+            <div class="col-md-4">
+              <label class="form-label small" for="wlMinWallets">Min wallets (absolute)</label>
+              <input id="wlMinWallets" type="number" min="2" step="1" class="form-control form-control-sm">
+            </div>
+            <div class="col-md-4">
+              <label class="form-label small" for="wlPct">Min % of list</label>
+              <input id="wlPct" type="number" min="0" max="100" step="0.5" class="form-control form-control-sm">
+            </div>
+            <div class="col-md-4">
+              <label class="form-label small" for="wlMinUsd">Min buy (USD)</label>
+              <input id="wlMinUsd" type="number" min="0" step="1" class="form-control form-control-sm">
+            </div>
+            <div class="col-md-4">
+              <label class="form-label small" for="wlWindow">Buy window (hours)</label>
+              <input id="wlWindow" type="number" min="1" step="1" class="form-control form-control-sm">
+            </div>
+            <div class="col-md-4">
+              <label class="form-label small" for="wlInterval">Run every (hours)</label>
+              <select id="wlInterval" class="form-select form-select-sm">
+                <option value="2">2</option>
+                <option value="6">6</option>
+                <option value="12">12</option>
+                <option value="24">24</option>
+                <option value="48">48</option>
+              </select>
+            </div>
+            <div class="col-md-4 d-flex align-items-end">
+              <div class="form-check form-switch">
+                <input class="form-check-input" type="checkbox" id="wlAuto">
+                <label class="form-check-label small" for="wlAuto">Scheduled auto-runs</label>
+              </div>
+            </div>
+            <div class="col-md-6">
+              <label class="form-label small" for="wlDetection">Count a buy as</label>
+              <select id="wlDetection" class="form-select form-select-sm">
+                <option value="both">Both, labelled — DEX swaps and new positions</option>
+                <option value="balance">Any new position (balance 0 → positive)</option>
+                <option value="dex">DEX swaps only (confirmed purchases)</option>
+              </select>
+              <div class="form-text">
+                “Both” runs two Dune queries per check — roughly double the credits.
+              </div>
+            </div>
+            <div class="col-12">
+              <label class="form-label small" for="wlIgnore">
+                Ignored tokens — one address per line (stables &amp; wrapped native are always ignored)
+              </label>
+              <textarea id="wlIgnore" rows="3" class="form-control form-control-sm mono"></textarea>
+            </div>
+            <div class="col-12">
+              <label class="form-label small" for="wlAddWallets">
+                Add wallets — one address per line
+              </label>
+              <textarea id="wlAddWallets" rows="3" class="form-control form-control-sm mono"
+                        placeholder="0x…"></textarea>
+            </div>
+          </div>
+          <div id="wlModalStatus" class="small mt-2" role="status" aria-live="polite"></div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="button" class="btn btn-primary" id="wlSaveBtn">Save settings</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/vendor/bootstrap.bundle.min.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

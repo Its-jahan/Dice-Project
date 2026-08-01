@@ -21,6 +21,7 @@ class FakeDuneClient:
     """Serves canned rows for holder, catalogue and monitor trade queries."""
 
     rows: list[dict] = []
+    position_rows: list[dict] = []
     catalog_rows: list[dict] = []
     calls: dict = {}
 
@@ -42,12 +43,10 @@ class FakeDuneClient:
 
     async def create_query(self, *, name, query_sql):
         FakeDuneClient.calls["query_name"] = name
-        FakeDuneClient.calls["query_sql"] = query_sql
+        FakeDuneClient._record(query_sql)
         FakeDuneClient.calls["create_count"] = (
             FakeDuneClient.calls.get("create_count", 0) + 1
         )
-        if "information_schema" not in query_sql:
-            FakeDuneClient.calls["data_sql"] = query_sql
         return 777
 
     async def update_query(self, query_id, *, name=None, query_sql=None):
@@ -55,9 +54,14 @@ class FakeDuneClient:
             FakeDuneClient.calls.get("update_count", 0) + 1
         )
         if query_sql is not None:
-            FakeDuneClient.calls["query_sql"] = query_sql
-            if "information_schema" not in query_sql:
-                FakeDuneClient.calls["data_sql"] = query_sql
+            FakeDuneClient._record(query_sql)
+
+    @staticmethod
+    def _record(query_sql):
+        FakeDuneClient.calls["query_sql"] = query_sql
+        if "information_schema" not in query_sql:
+            FakeDuneClient.calls["data_sql"] = query_sql
+            FakeDuneClient.calls.setdefault("sqls", []).append(query_sql)
 
     async def execute_query(self, query_id, *, parameters=None, performance="medium"):
         return "exec-monitor"
@@ -69,6 +73,8 @@ class FakeDuneClient:
         sql = FakeDuneClient.calls.get("query_sql", "")
         if "information_schema.columns" in sql:
             return FakeDuneClient.catalog_rows, False
+        if "new positions" in sql:
+            return FakeDuneClient.position_rows, False
         return FakeDuneClient.rows, False
 
 
@@ -87,6 +93,7 @@ def _trade_row(wallet, token=GEM, usd=1000.0, symbol="GEM"):
 @pytest.fixture
 def client(monkeypatch, tmp_path):
     FakeDuneClient.rows = []
+    FakeDuneClient.position_rows = []
     FakeDuneClient.calls = {}
     # Catalogue rows so /api/holders can resolve a balance source (from-job).
     FakeDuneClient.catalog_rows = [
@@ -118,6 +125,9 @@ def _create_watchlist(client, **overrides):
         "source_token_address": TOKEN,
         "min_wallets": 3,
         "min_wallets_pct": 0,
+        # Most tests exercise the DEX path alone; the dual-detection default is
+        # covered explicitly further down.
+        "buy_detection": "dex",
         **overrides,
     }
     response = client.post("/api/watchlists", json=body)
@@ -292,6 +302,62 @@ def test_monitor_run_creates_signals_and_updates_them(client):
     # instead of creating another one.
     assert FakeDuneClient.calls["create_count"] == 1
     assert FakeDuneClient.calls["update_count"] == 1
+
+
+def test_both_detection_labels_dex_buys_and_bare_positions(client):
+    watchlist_id = _create_watchlist(client, buy_detection="both")["id"]
+
+    # Two wallets swapped on a DEX; two more simply ended up holding GEM.
+    FakeDuneClient.rows = [_trade_row(w) for w in WALLETS[:2]]
+    FakeDuneClient.position_rows = [
+        {
+            "wallet_address": w,
+            "token_address": GEM,
+            "first_seen_at": "2026-08-01 07:00:00.000 UTC",
+            "balance": 1000.0,
+        }
+        # WALLETS[1] appears in both: the DEX trade must win, not double-count.
+        for w in WALLETS[1:4]
+    ]
+
+    result = client.post(
+        f"/api/watchlists/{watchlist_id}/monitor", headers=HEADERS
+    ).json()
+
+    signal = result["new_signals"][0]
+    assert signal["wallet_count"] == 4  # 2 DEX + 2 position-only, deduplicated
+    via = {b["wallet_address"]: b["via"] for b in signal["buyers"]}
+    assert via[WALLETS[0]] == "dex"
+    assert via[WALLETS[1]] == "dex"  # seen both ways -> the trade wins
+    assert via[WALLETS[2]] == "balance"
+    assert via[WALLETS[3]] == "balance"
+
+    # Both queries ran, each through its own reusable slot.
+    sqls = FakeDuneClient.calls["sqls"]
+    assert any("dex.trades" in sql for sql in sqls)
+    assert any("new positions" in sql for sql in sqls)
+
+
+def test_balance_only_detection_skips_the_dex_query(client):
+    watchlist_id = _create_watchlist(client, buy_detection="balance")["id"]
+    FakeDuneClient.position_rows = [
+        {
+            "wallet_address": w,
+            "token_address": GEM,
+            "first_seen_at": "2026-08-01 07:00:00.000 UTC",
+            "balance": 500.0,
+        }
+        for w in WALLETS[:3]
+    ]
+
+    result = client.post(
+        f"/api/watchlists/{watchlist_id}/monitor", headers=HEADERS
+    ).json()
+
+    signal = result["new_signals"][0]
+    assert signal["wallet_count"] == 3
+    assert {b["via"] for b in signal["buyers"]} == {"balance"}
+    assert not any("dex.trades" in sql for sql in FakeDuneClient.calls["sqls"])
 
 
 def test_monitor_recreates_query_deleted_on_dune(client, monkeypatch):

@@ -501,3 +501,96 @@ WHERE t.block_time >= now() - interval '{window_hours}' hour
 GROUP BY 1, 2
 ORDER BY amount_usd DESC
 """.strip()
+
+
+def build_new_positions_sql(
+    chain: Chain,
+    source: Source,
+    wallets: list[str],
+    *,
+    window_hours: int,
+    extra_ignore_tokens: list[str] | None = None,
+) -> str:
+    """DuneSQL: which tokens did these wallets start holding inside the window?
+
+    The complement of :func:`build_trades_sql`: a *new position* is a token
+    whose balance went from nothing to positive during the window, whatever the
+    route — DEX buy, OTC, CEX withdrawal, or a transfer between own wallets.
+    The monitor labels these ``balance`` so they can be told apart from
+    confirmed DEX buys.
+
+    ``source`` is the chain's resolved balance table (:class:`app.source.Source`)
+    — the same one the holder query reads, so the table and column names come
+    from the catalogue, not hard-coded guesses.
+    """
+    if not wallets:
+        raise ValueError("build_new_positions_sql needs at least one wallet")
+    window_hours = int(window_hours)
+    ignore = ignored_tokens_for(chain, extra_ignore_tokens)
+
+    wallet_pattern = EVM_ADDRESS_RE if chain.is_evm else SOLANA_MINT_RE
+    for wallet in wallets:
+        if not wallet_pattern.match(wallet):
+            raise ValueError(f"invalid {chain.value} wallet address: {wallet!r}")
+
+    wallet_list = ",\n        ".join(_address_literal(chain, w) for w in wallets)
+    ignore_list = ", ".join(_address_literal(chain, t) for t in ignore)
+    window_start = f"now() - interval '{window_hours}' hour"
+
+    if source.shape == "interval":
+        return f"""
+-- DICE: watchlist new positions, last {window_hours}h ({chain.value})
+-- A balance interval starting inside the window, for a (wallet, token) that
+-- was NOT already held at the window start.
+SELECT
+    b.{source.address} AS wallet_address,
+    b.{source.token} AS token_address,
+    MIN(b.{source.valid_from}) AS first_seen_at,
+    MAX(b.{source.balance}) AS balance
+FROM {source.qualified} b
+WHERE b.{source.address} IN (
+        {wallet_list})
+  AND b.{source.balance} > 0
+  AND b.{source.valid_from} >= {window_start}
+  AND b.{source.token} NOT IN ({ignore_list})
+  AND NOT EXISTS (
+      SELECT 1 FROM {source.qualified} p
+      WHERE p.{source.address} = b.{source.address}
+        AND p.{source.token} = b.{source.token}
+        AND p.{source.balance} > 0
+        AND p.{source.valid_from} < {window_start}
+        AND (p.{source.valid_to} IS NULL OR p.{source.valid_to} > {window_start})
+  )
+GROUP BY 1, 2
+ORDER BY balance DESC
+""".strip()
+
+    # Daily shape: day granularity, so the window rounds up to whole days and
+    # "not held before" means no positive balance on the boundary day.
+    window_days = max(1, -(-window_hours // 24))
+    boundary = f"date_add('day', -{window_days}, current_date)"
+    return f"""
+-- DICE: watchlist new positions, last ~{window_days}d ({chain.value})
+-- Positive balance on a day inside the window, for a (wallet, token) that had
+-- no positive balance on the boundary day.
+SELECT
+    b.{source.address} AS wallet_address,
+    b.{source.token} AS token_address,
+    MIN(b.{source.day}) AS first_seen_at,
+    MAX(b.{source.balance}) AS balance
+FROM {source.qualified} b
+WHERE b.{source.address} IN (
+        {wallet_list})
+  AND b.{source.balance} > 0
+  AND b.{source.day} > {boundary}
+  AND b.{source.token} NOT IN ({ignore_list})
+  AND NOT EXISTS (
+      SELECT 1 FROM {source.qualified} p
+      WHERE p.{source.address} = b.{source.address}
+        AND p.{source.token} = b.{source.token}
+        AND p.{source.balance} > 0
+        AND p.{source.day} = {boundary}
+  )
+GROUP BY 1, 2
+ORDER BY balance DESC
+""".strip()

@@ -1,103 +1,42 @@
 /* DICE frontend.
  *
- * The Dune API key lives only in the browser. Depending on the "Remember"
- * choice it goes to localStorage, sessionStorage, or nowhere at all (kept in a
- * variable for the lifetime of the page). It is attached to API calls as the
- * X-Dune-Api-Key header and is never put in a URL, so it cannot leak through
- * server access logs or the Referer header.
+ * The Dune API key is saved on the server (single-user deployment): pressing
+ * "Save key" POSTs it to /api/key, where it is validated against Dune and
+ * stored. Every later request — including scheduled watchlist monitoring —
+ * uses that stored key. Typing a key without saving still works for one-off
+ * requests: it rides along as the X-Dune-Api-Key header and overrides the
+ * stored key for that request only.
  */
-
-const STORAGE_KEY = "dice.dune_api_key";
-const STORAGE_PREF = "dice.dune_api_key_storage";
 
 const $ = (id) => document.getElementById(id);
 
+const PREVIEW_INITIAL = 10;
+const PREVIEW_STEP = 50;
+
 const state = {
-  key: "",          // in-memory copy, always authoritative
+  config: null,       // /api/config payload
   jobId: null,
   preview: [],
   summary: [],
   tab: "snapshots",
-  config: null,       // /api/config payload (monitor caps, auto possibility)
+  shown: { snapshots: PREVIEW_INITIAL, summary: PREVIEW_INITIAL },
   lastRun: null,      // last successful holders response (for save-as-watchlist)
   watchlists: [],
   signals: [],
-  editingWatchlist: null,   // id with the settings editor open
+  editingWatchlist: null,   // watchlist object open in the edit modal
   expandedSignals: new Set(),
 };
 
-/* ------------------------------------------------------------------ key I/O */
+/* -------------------------------------------------------------------- utils */
 
-function storageFor(pref) {
-  if (pref === "local") return window.localStorage;
-  if (pref === "session") return window.sessionStorage;
-  return null;
-}
-
-function loadKey() {
-  const pref = window.localStorage.getItem(STORAGE_PREF) || "local";
-  $("keyStorage").value = pref;
-  const store = storageFor(pref);
-  const saved = store ? store.getItem(STORAGE_KEY) : null;
-  if (saved) {
-    state.key = saved;
-    $("apiKey").value = saved;
-  }
-  paintKeyPill(saved ? "set" : "none");
-}
-
-function saveKey() {
-  const value = $("apiKey").value.trim();
-  const pref = $("keyStorage").value;
-  window.localStorage.setItem(STORAGE_PREF, pref);
-
-  // Clear both stores first so switching preference never leaves a stale copy.
-  window.localStorage.removeItem(STORAGE_KEY);
-  window.sessionStorage.removeItem(STORAGE_KEY);
-
-  state.key = value;
-  if (!value) {
-    paintKeyPill("none");
-    setStatus("keyStatus", "Key cleared.", "");
-    return;
-  }
-  const store = storageFor(pref);
-  if (store) store.setItem(STORAGE_KEY, value);
-  paintKeyPill("set");
-  setStatus(
-    "keyStatus",
-    pref === "none" ? "Key kept for this page only." : "Key saved in your browser.",
-    "ok",
+function setStatus(id, message, kind) {
+  const el = $(id);
+  el.textContent = message;
+  el.classList.remove("text-success", "text-danger", "text-body-secondary");
+  el.classList.add(
+    kind === "ok" ? "text-success" : kind === "error" ? "text-danger" : "text-body-secondary",
   );
 }
-
-function clearKey() {
-  window.localStorage.removeItem(STORAGE_KEY);
-  window.sessionStorage.removeItem(STORAGE_KEY);
-  state.key = "";
-  $("apiKey").value = "";
-  paintKeyPill("none");
-  setStatus("keyStatus", "Key removed from this browser.", "");
-}
-
-function paintKeyPill(kind) {
-  const pill = $("keyPill");
-  pill.className = "pill";
-  if (kind === "valid") {
-    pill.classList.add("pill--ok");
-    pill.textContent = "API key verified";
-  } else if (kind === "invalid") {
-    pill.classList.add("pill--bad");
-    pill.textContent = "API key rejected";
-  } else if (kind === "set") {
-    pill.textContent = "API key set";
-  } else {
-    pill.classList.add("pill--muted");
-    pill.textContent = "No API key";
-  }
-}
-
-/* -------------------------------------------------------------------- utils */
 
 /* A Dune execution routinely runs for minutes. Without a moving number the
  * page looks hung, and people reload — which abandons a query they have
@@ -126,15 +65,13 @@ function stopElapsed() {
   }
 }
 
-function setStatus(id, message, kind) {
-  const el = $(id);
-  el.textContent = message;
-  el.className = "status" + (kind ? " " + kind : "");
+function currentKey() {
+  // A typed key overrides the server-stored one for this request only.
+  return $("apiKey").value.trim();
 }
 
-function currentKey() {
-  // A typed-but-unsaved key should still work.
-  return $("apiKey").value.trim() || state.key;
+function serverKeyConfigured() {
+  return !!(state.config && state.config.server_key_configured);
 }
 
 async function api(path, { method = "GET", body } = {}) {
@@ -157,253 +94,12 @@ function describeError(payload, status) {
   const detail = payload && payload.detail;
   if (typeof detail === "string") return detail;
   if (Array.isArray(detail) && detail.length) {
-    // FastAPI validation errors.
     return detail
       .map((d) => `${(d.loc || []).slice(1).join(".") || "input"}: ${d.msg}`)
       .join("; ");
   }
   return `Request failed (HTTP ${status}).`;
 }
-
-const EVM_ADDRESS = /^0x[0-9a-fA-F]{40}$/;
-const SOLANA_MINT = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
-
-/** Return a human message if the form cannot possibly be valid, else null. */
-function validateForm() {
-  const chain = $("chain").value;
-  const token = $("tokenAddress").value.trim();
-  if (!token) return "Enter a token contract or mint address.";
-  if (chain === "solana") {
-    if (!SOLANA_MINT.test(token)) {
-      return "That is not a Solana mint address (base58, 32–44 characters).";
-    }
-  } else if (!EVM_ADDRESS.test(token)) {
-    return "That is not an EVM contract address (0x followed by 40 hex characters).";
-  }
-  const start = $("startDate").value;
-  const end = $("endDate").value;
-  if (!start || !end) return "Pick both a start and an end date.";
-  if (start > end) return "Start date must be on or before the end date.";
-  return null;
-}
-
-function readRequest() {
-  return {
-    chain: $("chain").value,
-    token_address: $("tokenAddress").value.trim(),
-    start_date: $("startDate").value,
-    end_date: $("endDate").value,
-    min_balance: Number($("minBalance").value || 0),
-    holder_mode: $("holderMode").value,
-    include_contracts: $("includeContracts").checked,
-    exclude_burn_addresses: $("excludeBurn").checked,
-  };
-}
-
-/* ------------------------------------------------------------------ actions */
-
-async function testKey() {
-  if (!currentKey()) {
-    setStatus("keyStatus", "Enter a key first.", "error");
-    return;
-  }
-  await withBusy($("testKey"), async () => {
-    setStatus("keyStatus", "Checking with Dune…", "");
-    try {
-      const { valid } = await api("/api/key/validate", { method: "POST" });
-      paintKeyPill(valid ? "valid" : "invalid");
-      setStatus(
-        "keyStatus",
-        valid ? "Key works." : "Dune rejected this key.",
-        valid ? "ok" : "error",
-      );
-    } catch (error) {
-      paintKeyPill("invalid");
-      setStatus("keyStatus", error.message, "error");
-    }
-  });
-}
-
-async function showSql() {
-  if (!currentKey()) {
-    setStatus("runStatus", "Enter your Dune API key above first.", "error");
-    $("apiKey").focus();
-    return;
-  }
-  const problem = validateForm();
-  if (problem) {
-    setStatus("runStatus", problem, "error");
-    return;
-  }
-  await withBusy($("showSql"), async () => {
-    startElapsed("runStatus", "Resolving the source table…");
-    try {
-      const data = await api("/api/sql", { method: "POST", body: readRequest() });
-      $("sqlOut").textContent = data.sql;
-      $("sqlCard").classList.remove("hidden");
-      stopElapsed();
-      setStatus("runStatus", "", "");
-    } catch (error) {
-      stopElapsed();
-      setStatus("runStatus", error.message, "error");
-    }
-  });
-}
-
-async function diagnose() {
-  if (!currentKey()) {
-    setStatus("runStatus", "Enter your Dune API key above first.", "error");
-    return;
-  }
-  await withBusy($("diagnoseBtn"), async () => {
-    startElapsed("runStatus", "Asking Dune which balance table to read…");
-    try {
-      // Ask what DICE actually resolved for this chain, rather than listing
-      // the whole catalogue — the resolver already made the decision.
-      const chain = $("chain").value;
-      const data = await api(
-        `/api/source?chain=${encodeURIComponent(chain)}&refresh=true`,
-      );
-      const cols = data.columns;
-      const lines = [
-        `Chain:  ${data.chain}`,
-        `Table:  ${data.table}`,
-        `Shape:  ${data.shape}` +
-          (data.shape === "interval"
-            ? "  (sparse [valid_from, valid_to) — expanded per day)"
-            : "  (already one row per day)"),
-        "",
-        "Column mapping:",
-        ...Object.entries(cols)
-          .filter(([, value]) => value)
-          .map(([role, value]) => {
-            const type = (data.column_types || {})[value];
-            return `  ${role.padEnd(11)}${value}${type ? `  (${type})` : ""}`;
-          }),
-      ];
-      $("sqlOut").textContent = lines.join("\n");
-      $("sqlCard").classList.remove("hidden");
-      stopElapsed();
-      setStatus("runStatus", "", "");
-    } catch (error) {
-      stopElapsed();
-      setStatus("runStatus", error.message, "error");
-    }
-  });
-}
-
-async function runQuery(event) {
-  event.preventDefault();
-  if (!currentKey()) {
-    setStatus("runStatus", "Enter your Dune API key above first.", "error");
-    $("apiKey").focus();
-    return;
-  }
-  const problem = validateForm();
-  if (problem) {
-    setStatus("runStatus", problem, "error");
-    return;
-  }
-
-  await withBusy($("runBtn"), async () => {
-    startElapsed("runStatus", "Running on Dune — this can take a few minutes…");
-    try {
-      const request = readRequest();
-      const data = await api("/api/holders", { method: "POST", body: request });
-      state.jobId = data.job_id;
-      state.preview = data.preview;
-      state.summary = data.summary_preview;
-      state.lastRun = { request, wallet_count: data.wallet_count };
-      stopElapsed();
-      renderResults(data);
-      prepareWatchlistSave();
-      setStatus(
-        "runStatus",
-        data.row_count ? "Done." : "No holders matched — try a wider range or a lower minimum.",
-        data.row_count ? "ok" : "",
-      );
-    } catch (error) {
-      stopElapsed();
-      setStatus("runStatus", error.message, "error");
-    }
-  });
-}
-
-function renderResults(data) {
-  $("resultsCard").classList.remove("hidden");
-  $("resultsMeta").textContent =
-    `${data.wallet_count.toLocaleString()} wallets · ` +
-    `${data.row_count.toLocaleString()} snapshot rows · ` +
-    `execution ${data.execution_id}` +
-    (data.truncated ? " · row cap reached, export is truncated" : "") +
-    (data.end_date_clamped
-      ? ` · end date clamped to ${data.effective_end_date} — no data exists after today`
-      : "");
-  $("previewNote").textContent =
-    data.row_count > state.preview.length
-      ? `Showing the first ${state.preview.length.toLocaleString()} rows — ` +
-        "download for the full result."
-      : "";
-  updateDownloadLabel();
-  renderTable();
-}
-
-function updateDownloadLabel() {
-  $("downloadBtn").textContent =
-    state.tab === "summary" ? "Download summary" : "Download snapshots";
-}
-
-function renderTable() {
-  const rows = state.tab === "summary" ? state.summary : state.preview;
-  const table = $("resultsTable");
-  const head = table.tHead;
-  const body = table.tBodies[0];
-  head.innerHTML = "";
-  body.innerHTML = "";
-  if (!rows.length) return;
-
-  const columns = Object.keys(rows[0]);
-  const headRow = head.insertRow();
-  for (const column of columns) {
-    const th = document.createElement("th");
-    th.textContent = column;
-    headRow.appendChild(th);
-  }
-  for (const row of rows) {
-    const tr = body.insertRow();
-    for (const column of columns) {
-      tr.insertCell().textContent = formatCell(row[column]);
-    }
-  }
-}
-
-function formatCell(value) {
-  if (typeof value === "number" && !Number.isInteger(value)) {
-    return value.toLocaleString(undefined, { maximumFractionDigits: 8 });
-  }
-  return String(value);
-}
-
-function download() {
-  if (!state.jobId) return;
-  const format = $("format").value;
-  // Download what the user is looking at: the active tab decides which table
-  // leads the file, not just the holder mode.
-  // Plain navigation: no key in the URL, the file streams straight from /api/export.
-  window.location.href =
-    `/api/export/${state.jobId}?format=${format}&dataset=${state.tab}`;
-}
-
-async function withBusy(button, work) {
-  button.disabled = true;
-  try {
-    await work();
-  } finally {
-    button.disabled = false;
-  }
-}
-
-/* --------------------------------------------------- watchlists & signals */
 
 function el(tag, className, text) {
   const node = document.createElement(tag);
@@ -437,6 +133,341 @@ function monitorCap() {
   return (state.config && state.config.monitor && state.config.monitor.max_wallets) || 2000;
 }
 
+/* ---------------------------------------------------------------- key panel */
+
+function paintKeyPill() {
+  const pill = $("keyPill");
+  pill.className = "badge rounded-pill";
+  if (serverKeyConfigured()) {
+    pill.classList.add("text-bg-success");
+    pill.textContent = `Key saved ${state.config.server_key_hint || ""}`.trim();
+  } else {
+    pill.classList.add("text-bg-secondary");
+    pill.textContent = "No API key saved";
+  }
+}
+
+async function refreshConfig() {
+  try {
+    state.config = await api("/api/config");
+  } catch {
+    return;
+  }
+  paintKeyPill();
+  const monitor = state.config.monitor || {};
+  let hint;
+  if (monitor.auto_possible) {
+    hint = "Scheduled runs are active — the saved key powers them.";
+  } else {
+    hint = "Save your Dune key above to activate scheduled runs.";
+  }
+  if (monitor.telegram_configured) hint += " Telegram alerts are on.";
+  $("autoMonitorHint").textContent = hint;
+}
+
+async function saveKey() {
+  const key = currentKey();
+  if (!key) {
+    setStatus("keyStatus", "Paste a key first.", "error");
+    return;
+  }
+  await withBusy($("saveKey"), async () => {
+    setStatus("keyStatus", "Checking the key with Dune…", "");
+    try {
+      const saved = await api("/api/key", { method: "POST", body: { key } });
+      $("apiKey").value = "";
+      await refreshConfig();
+      setStatus(
+        "keyStatus",
+        `Key ${saved.hint || ""} verified and saved on the server. ` +
+          "Scheduled monitoring will use it.",
+        "ok",
+      );
+    } catch (error) {
+      setStatus("keyStatus", error.message, "error");
+    }
+  });
+}
+
+async function testKey() {
+  if (!currentKey() && !serverKeyConfigured()) {
+    setStatus("keyStatus", "Paste a key first (or save one).", "error");
+    return;
+  }
+  await withBusy($("testKey"), async () => {
+    setStatus("keyStatus", "Checking with Dune…", "");
+    try {
+      const { valid } = await api("/api/key/validate", { method: "POST" });
+      setStatus(
+        "keyStatus",
+        valid ? "Key works." : "Dune rejected this key.",
+        valid ? "ok" : "error",
+      );
+    } catch (error) {
+      setStatus("keyStatus", error.message, "error");
+    }
+  });
+}
+
+async function clearKey() {
+  await withBusy($("clearKey"), async () => {
+    try {
+      await api("/api/key", { method: "DELETE" });
+      $("apiKey").value = "";
+      await refreshConfig();
+      setStatus("keyStatus", "Key removed from the server.", "");
+    } catch (error) {
+      setStatus("keyStatus", error.message, "error");
+    }
+  });
+}
+
+async function archiveQueries() {
+  const sure = window.confirm(
+    "Archive every query named “DICE …” in the Dune account?\n" +
+    "This frees private-query slots; your other queries are untouched.",
+  );
+  if (!sure) return;
+  await withBusy($("archiveQueries"), async () => {
+    setStatus("keyStatus", "Listing and archiving DICE queries on Dune…", "");
+    try {
+      const result = await api("/api/dune/archive-queries", { method: "POST" });
+      setStatus(
+        "keyStatus",
+        `Archived ${result.archived} of ${result.found} DICE queries` +
+          (result.failed ? ` (${result.failed} failed)` : "") + ".",
+        result.failed ? "error" : "ok",
+      );
+    } catch (error) {
+      setStatus("keyStatus", error.message, "error");
+    }
+  });
+}
+
+/* -------------------------------------------------------------- query form */
+
+const EVM_ADDRESS = /^0x[0-9a-fA-F]{40}$/;
+const SOLANA_MINT = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+
+function validateForm() {
+  const chain = $("chain").value;
+  const token = $("tokenAddress").value.trim();
+  if (!token) return "Enter a token contract or mint address.";
+  if (chain === "solana") {
+    if (!SOLANA_MINT.test(token)) {
+      return "That is not a Solana mint address (base58, 32–44 characters).";
+    }
+  } else if (!EVM_ADDRESS.test(token)) {
+    return "That is not an EVM contract address (0x followed by 40 hex characters).";
+  }
+  const start = $("startDate").value;
+  const end = $("endDate").value;
+  if (!start || !end) return "Pick both a start and an end date.";
+  if (start > end) return "Start date must be on or before the end date.";
+  return null;
+}
+
+function readRequest() {
+  return {
+    chain: $("chain").value,
+    token_address: $("tokenAddress").value.trim(),
+    start_date: $("startDate").value,
+    end_date: $("endDate").value,
+    min_balance: Number($("minBalance").value || 0),
+    holder_mode: $("holderMode").value,
+    include_contracts: $("includeContracts").checked,
+    exclude_burn_addresses: $("excludeBurn").checked,
+  };
+}
+
+function requireKey(statusId) {
+  if (!currentKey() && !serverKeyConfigured()) {
+    setStatus(statusId, "Save your Dune API key above first.", "error");
+    $("apiKey").focus();
+    return false;
+  }
+  return true;
+}
+
+async function showSql() {
+  if (!requireKey("runStatus")) return;
+  const problem = validateForm();
+  if (problem) {
+    setStatus("runStatus", problem, "error");
+    return;
+  }
+  await withBusy($("showSql"), async () => {
+    startElapsed("runStatus", "Resolving the source table…");
+    try {
+      const data = await api("/api/sql", { method: "POST", body: readRequest() });
+      $("sqlOut").textContent = data.sql;
+      $("sqlCard").classList.remove("d-none");
+      stopElapsed();
+      setStatus("runStatus", "", "");
+    } catch (error) {
+      stopElapsed();
+      setStatus("runStatus", error.message, "error");
+    }
+  });
+}
+
+async function diagnose() {
+  if (!requireKey("runStatus")) return;
+  await withBusy($("diagnoseBtn"), async () => {
+    startElapsed("runStatus", "Asking Dune which balance table to read…");
+    try {
+      const chain = $("chain").value;
+      const data = await api(
+        `/api/source?chain=${encodeURIComponent(chain)}&refresh=true`,
+      );
+      const cols = data.columns;
+      const lines = [
+        `Chain:  ${data.chain}`,
+        `Table:  ${data.table}`,
+        `Shape:  ${data.shape}` +
+          (data.shape === "interval"
+            ? "  (sparse [valid_from, valid_to) — expanded per day)"
+            : "  (already one row per day)"),
+        "",
+        "Column mapping:",
+        ...Object.entries(cols)
+          .filter(([, value]) => value)
+          .map(([role, value]) => {
+            const type = (data.column_types || {})[value];
+            return `  ${role.padEnd(11)}${value}${type ? `  (${type})` : ""}`;
+          }),
+      ];
+      $("sqlOut").textContent = lines.join("\n");
+      $("sqlCard").classList.remove("d-none");
+      stopElapsed();
+      setStatus("runStatus", "", "");
+    } catch (error) {
+      stopElapsed();
+      setStatus("runStatus", error.message, "error");
+    }
+  });
+}
+
+async function runQuery(event) {
+  event.preventDefault();
+  if (!requireKey("runStatus")) return;
+  const problem = validateForm();
+  if (problem) {
+    setStatus("runStatus", problem, "error");
+    return;
+  }
+
+  await withBusy($("runBtn"), async () => {
+    startElapsed("runStatus", "Running on Dune — this can take a few minutes…");
+    try {
+      const request = readRequest();
+      const data = await api("/api/holders", { method: "POST", body: request });
+      state.jobId = data.job_id;
+      state.preview = data.preview;
+      state.summary = data.summary_preview;
+      state.shown = { snapshots: PREVIEW_INITIAL, summary: PREVIEW_INITIAL };
+      state.lastRun = { request, wallet_count: data.wallet_count, row_count: data.row_count };
+      stopElapsed();
+      renderResults(data);
+      prepareWatchlistSave();
+      setStatus(
+        "runStatus",
+        data.row_count ? "Done." : "No holders matched — try a wider range or a lower minimum.",
+        data.row_count ? "ok" : "",
+      );
+    } catch (error) {
+      stopElapsed();
+      setStatus("runStatus", error.message, "error");
+    }
+  });
+}
+
+/* ----------------------------------------------------------------- results */
+
+function renderResults(data) {
+  $("resultsCard").classList.remove("d-none");
+  bootstrap.Collapse.getOrCreateInstance($("resultsBody"), { toggle: false }).show();
+  $("resultsMeta").textContent =
+    `${data.wallet_count.toLocaleString()} wallets · ` +
+    `${data.row_count.toLocaleString()} snapshot rows · ` +
+    `execution ${data.execution_id}` +
+    (data.truncated ? " · row cap reached, export is truncated" : "") +
+    (data.end_date_clamped
+      ? ` · end date clamped to ${data.effective_end_date} — no data exists after today`
+      : "");
+  renderTable();
+}
+
+function activeRows() {
+  return state.tab === "summary" ? state.summary : state.preview;
+}
+
+function renderTable() {
+  const rows = activeRows();
+  const visible = rows.slice(0, state.shown[state.tab]);
+  const table = $("resultsTable");
+  const head = table.tHead;
+  const body = table.tBodies[0];
+  head.innerHTML = "";
+  body.innerHTML = "";
+
+  if (visible.length) {
+    const columns = Object.keys(visible[0]);
+    const headRow = head.insertRow();
+    for (const column of columns) {
+      headRow.appendChild(el("th", null, column));
+    }
+    for (const row of visible) {
+      const tr = body.insertRow();
+      for (const column of columns) {
+        tr.insertCell().textContent = formatCell(row[column]);
+      }
+    }
+  }
+
+  const remaining = rows.length - visible.length;
+  $("showMoreBtn").classList.toggle("d-none", remaining <= 0);
+  if (remaining > 0) {
+    $("showMoreBtn").textContent = `Show ${Math.min(PREVIEW_STEP, remaining)} more`;
+  }
+
+  const total = state.lastRun ? state.lastRun.row_count : rows.length;
+  $("previewNote").textContent = rows.length
+    ? `Showing ${visible.length.toLocaleString()} of ${rows.length.toLocaleString()} ` +
+      `loaded rows (${total.toLocaleString()} total — download for everything).`
+    : "";
+}
+
+function showMore() {
+  state.shown[state.tab] += PREVIEW_STEP;
+  renderTable();
+}
+
+function formatCell(value) {
+  if (typeof value === "number" && !Number.isInteger(value)) {
+    return value.toLocaleString(undefined, { maximumFractionDigits: 8 });
+  }
+  return String(value);
+}
+
+function download() {
+  if (!state.jobId) return;
+  const format = $("format").value;
+  // Download what the user is looking at: the active tab decides which table
+  // leads the file. No key in the URL.
+  window.location.href =
+    `/api/export/${state.jobId}?format=${format}&dataset=${state.tab}`;
+}
+
+async function withBusy(button, work) {
+  button.disabled = true;
+  try {
+    await work();
+  } finally {
+    button.disabled = false;
+  }
+}
+
 /* ------------------------------------------------------- save as watchlist */
 
 function prepareWatchlistSave() {
@@ -447,7 +478,7 @@ function prepareWatchlistSave() {
     `${request.chain} ${token.slice(0, 10)}… buyers ` +
     `${request.start_date}→${request.end_date}`;
   const over = wallet_count > monitorCap();
-  $("topNField").classList.toggle("hidden", !over);
+  $("topNField").classList.toggle("d-none", !over);
   if (over) $("watchlistTopN").value = monitorCap();
   setStatus(
     "watchlistSaveStatus",
@@ -463,9 +494,13 @@ async function saveWatchlist() {
   if (!state.jobId) return;
   await withBusy($("saveWatchlistBtn"), async () => {
     setStatus("watchlistSaveStatus", "Creating watchlist…", "");
-    const body = { name: $("watchlistName").value.trim() || null };
+    const body = {
+      name: $("watchlistName").value.trim() || null,
+      monitor_interval_hours: Number($("watchlistInterval").value) || 24,
+      buy_detection: $("watchlistDetection").value,
+    };
     const topN = Number($("watchlistTopN").value);
-    if (!$("topNField").classList.contains("hidden") && topN > 0) {
+    if (!$("topNField").classList.contains("d-none") && topN > 0) {
       body.top_n = Math.floor(topN);
     }
     try {
@@ -476,7 +511,8 @@ async function saveWatchlist() {
       setStatus(
         "watchlistSaveStatus",
         `Watchlist "${created.name}" created with ` +
-          `${created.wallet_count.toLocaleString()} wallets.`,
+          `${created.wallet_count.toLocaleString()} wallets — checking every ` +
+          `${created.monitor_interval_hours}h.`,
         "ok",
       );
       await loadWatchlists();
@@ -484,7 +520,7 @@ async function saveWatchlist() {
     } catch (error) {
       setStatus("watchlistSaveStatus", error.message, "error");
       if (/cap/i.test(error.message)) {
-        $("topNField").classList.remove("hidden");
+        $("topNField").classList.remove("d-none");
         if (!$("watchlistTopN").value) $("watchlistTopN").value = monitorCap();
       }
     }
@@ -506,18 +542,18 @@ async function loadWatchlists() {
 function renderWatchlists() {
   const table = $("watchlistsTable");
   const empty = $("watchlistsEmpty");
-  table.classList.toggle("hidden", !state.watchlists.length);
-  empty.classList.toggle("hidden", !!state.watchlists.length);
+  table.classList.toggle("d-none", !state.watchlists.length);
+  empty.classList.toggle("d-none", !!state.watchlists.length);
   table.tHead.innerHTML = "";
   table.tBodies[0].innerHTML = "";
   if (!state.watchlists.length) return;
 
   const headRow = table.tHead.insertRow();
   for (const title of [
-    "Watchlist", "Wallets", "Signal threshold", "Buy window",
-    "Every", "Auto", "Last run", "Signals", "",
+    "Watchlist", "Wallets", "Threshold", "Window", "Every", "Counts", "Auto",
+    "Last run", "Signals", "",
   ]) {
-    headRow.appendChild(el("th", null, title));
+    headRow.appendChild(el("th", "small text-body-secondary", title));
   }
 
   for (const watchlist of state.watchlists) {
@@ -529,8 +565,8 @@ function renderWatchlistRow(tbody, wl) {
   const tr = tbody.insertRow();
 
   const nameCell = tr.insertCell();
-  nameCell.appendChild(el("span", null, wl.name));
-  nameCell.appendChild(el("span", "chain-pill", wl.chain));
+  nameCell.appendChild(el("span", "fw-medium", wl.name));
+  nameCell.appendChild(el("span", "badge text-bg-light border ms-2", wl.chain));
   if (wl.notes) nameCell.title = wl.notes;
 
   tr.insertCell().textContent = wl.wallet_count.toLocaleString();
@@ -542,22 +578,31 @@ function renderWatchlistRow(tbody, wl) {
   tr.insertCell().textContent = `${wl.buy_window_hours}h`;
   tr.insertCell().textContent = `${wl.monitor_interval_hours}h`;
 
+  const detectionCell = tr.insertCell();
+  const detection = wl.buy_detection || "both";
+  const detectionLabel =
+    detection === "dex" ? "DEX only" : detection === "balance" ? "positions" : "both";
+  const detectionBadge = el("span", "badge text-bg-light border text-body-secondary", detectionLabel);
+  detectionBadge.title =
+    detection === "dex"
+      ? "Only confirmed DEX swaps count as a buy"
+      : detection === "balance"
+        ? "Any token whose balance went 0 → positive counts"
+        : "DEX swaps and new positions, each labelled (two Dune queries per run)";
+  detectionCell.appendChild(detectionBadge);
+
   const autoCell = tr.insertCell();
   const autoPossible =
     state.config && state.config.monitor && state.config.monitor.auto_possible;
-  const autoBadge = el(
-    "span",
-    "badge" + (wl.auto_monitor ? " badge--ok" : ""),
-    wl.auto_monitor ? "on" : "off",
-  );
-  if (wl.auto_monitor && wl.next_run_at) {
-    autoBadge.title = `next run ${fmtTime(wl.next_run_at)}`;
-  }
-  if (wl.auto_monitor && !autoPossible) {
-    autoBadge.className = "badge";
-    autoBadge.textContent = "on*";
-    autoBadge.title =
-      "Scheduled runs need DUNE_API_KEY configured on the server.";
+  let autoBadge;
+  if (!wl.auto_monitor) {
+    autoBadge = el("span", "badge text-bg-secondary", "off");
+  } else if (autoPossible) {
+    autoBadge = el("span", "badge text-bg-success", "on");
+    if (wl.next_run_at) autoBadge.title = `next run ${fmtTime(wl.next_run_at)}`;
+  } else {
+    autoBadge = el("span", "badge text-bg-warning", "needs key");
+    autoBadge.title = "Save your Dune API key to activate scheduled runs.";
   }
   autoCell.appendChild(autoBadge);
 
@@ -566,138 +611,103 @@ function renderWatchlistRow(tbody, wl) {
     const ok = wl.last_run_status === "ok";
     const badge = el(
       "span",
-      "badge " + (ok ? "badge--ok" : "badge--bad"),
-      `${wl.last_run_status} · ${fmtTime(wl.last_run_at)}`,
+      "badge " + (ok ? "text-bg-success" : "text-bg-danger"),
+      wl.last_run_status,
     );
-    if (!ok && wl.last_run_error) badge.title = wl.last_run_error;
+    badge.title = (ok ? "" : (wl.last_run_error || "") + " — ") + fmtTime(wl.last_run_at);
     lastRunCell.appendChild(badge);
+    lastRunCell.appendChild(
+      el("span", "small text-body-secondary ms-1", fmtTime(wl.last_run_at)),
+    );
   } else {
-    lastRunCell.textContent = "never";
+    lastRunCell.appendChild(el("span", "small text-body-secondary", "never"));
   }
 
   const signalsCell = tr.insertCell();
   signalsCell.appendChild(
     el(
       "span",
-      "badge" + (wl.active_signals ? " badge--hot" : ""),
+      "badge " + (wl.active_signals ? "text-bg-primary" : "text-bg-light border text-body-secondary"),
       String(wl.active_signals),
     ),
   );
 
   const actions = tr.insertCell();
-  const runBtn = el("button", "small primary", "Run now");
+  actions.className = "text-nowrap text-end";
+  const runBtn = el("button", "btn btn-primary btn-sm", "Run now");
   runBtn.type = "button";
   runBtn.addEventListener("click", () => runMonitorNow(wl, runBtn));
-  const editBtn = el("button", "small", state.editingWatchlist === wl.id ? "Close" : "Edit");
+  const editBtn = el("button", "btn btn-outline-secondary btn-sm ms-1", "Edit");
   editBtn.type = "button";
-  editBtn.addEventListener("click", () => {
-    state.editingWatchlist = state.editingWatchlist === wl.id ? null : wl.id;
-    renderWatchlists();
-  });
-  const deleteBtn = el("button", "small danger-ghost", "Delete");
+  editBtn.addEventListener("click", () => openWatchlistModal(wl));
+  const deleteBtn = el("button", "btn btn-outline-danger btn-sm ms-1", "Delete");
   deleteBtn.type = "button";
   deleteBtn.addEventListener("click", () => deleteWatchlist(wl));
-  actions.append(runBtn, " ", editBtn, " ", deleteBtn);
-
-  if (state.editingWatchlist === wl.id) {
-    renderWatchlistEditor(tbody, wl);
-  }
+  actions.append(runBtn, editBtn, deleteBtn);
 }
 
-function renderWatchlistEditor(tbody, wl) {
-  const tr = tbody.insertRow();
-  tr.className = "editor-row";
-  const cell = tr.insertCell();
-  cell.colSpan = 9;
+/* ------------------------------------------------------ watchlist modal */
 
-  const grid = el("div", "editor-grid");
-  const fields = [
-    ["min_wallets", "Min wallets", wl.min_wallets, { min: 2, step: 1 }],
-    ["min_wallets_pct", "Min % of list", wl.min_wallets_pct, { min: 0, max: 100, step: 0.5 }],
-    ["buy_window_hours", "Buy window (h)", wl.buy_window_hours, { min: 1, step: 1 }],
-    ["monitor_interval_hours", "Run every (h)", wl.monitor_interval_hours, { min: 1, step: 0.5 }],
-    ["min_buy_usd", "Min buy (USD)", wl.min_buy_usd, { min: 0, step: 1 }],
-  ];
-  const inputs = {};
-  for (const [key, label, value, attrs] of fields) {
-    const field = el("div", "field");
-    field.appendChild(el("label", null, label));
-    const input = document.createElement("input");
-    input.type = "number";
-    Object.assign(input, attrs);
-    input.value = value;
-    inputs[key] = input;
-    field.appendChild(input);
-    grid.appendChild(field);
+function ensureIntervalOption(select, value) {
+  const text = String(value);
+  if (![...select.options].some((option) => option.value === text)) {
+    const option = document.createElement("option");
+    option.value = text;
+    option.textContent = text;
+    select.appendChild(option);
   }
+  select.value = text;
+}
 
-  const autoField = el("div", "field");
-  autoField.appendChild(el("label", null, "Auto monitor"));
-  const autoLabel = el("label", "check-inline");
-  const autoInput = document.createElement("input");
-  autoInput.type = "checkbox";
-  autoInput.checked = wl.auto_monitor;
-  autoLabel.append(autoInput, " scheduled runs");
-  autoField.appendChild(autoLabel);
-  grid.appendChild(autoField);
+function openWatchlistModal(wl) {
+  state.editingWatchlist = wl;
+  $("wlModalTitle").textContent = `Edit “${wl.name}”`;
+  $("wlMinWallets").value = wl.min_wallets;
+  $("wlPct").value = wl.min_wallets_pct;
+  $("wlMinUsd").value = wl.min_buy_usd;
+  $("wlWindow").value = wl.buy_window_hours;
+  ensureIntervalOption($("wlInterval"), wl.monitor_interval_hours);
+  $("wlDetection").value = wl.buy_detection || "both";
+  $("wlAuto").checked = wl.auto_monitor;
+  $("wlIgnore").value = (wl.ignore_tokens || []).join("\n");
+  $("wlAddWallets").value = "";
+  setStatus("wlModalStatus", "", "");
+  bootstrap.Modal.getOrCreateInstance($("watchlistModal")).show();
+}
 
-  const ignoreField = el("div", "field span-all");
-  ignoreField.appendChild(
-    el("label", null, "Ignored tokens (one address per line; stables/wrapped native are always ignored)"),
-  );
-  const ignoreArea = document.createElement("textarea");
-  ignoreArea.value = wl.ignore_tokens.join("\n");
-  ignoreField.appendChild(ignoreArea);
-  grid.appendChild(ignoreField);
-
-  const addField = el("div", "field span-all");
-  addField.appendChild(el("label", null, "Add wallets (one address per line)"));
-  const addArea = document.createElement("textarea");
-  addArea.placeholder = "0x…";
-  addField.appendChild(addArea);
-  grid.appendChild(addField);
-
-  const actionsRow = el("div", "actions");
-  const saveBtn = el("button", "small primary", "Save settings");
-  saveBtn.type = "button";
-  const status = el("span", "status");
-  saveBtn.addEventListener("click", async () => {
-    await withBusy(saveBtn, async () => {
-      const body = {
-        min_wallets: Number(inputs.min_wallets.value),
-        min_wallets_pct: Number(inputs.min_wallets_pct.value),
-        buy_window_hours: Number(inputs.buy_window_hours.value),
-        monitor_interval_hours: Number(inputs.monitor_interval_hours.value),
-        min_buy_usd: Number(inputs.min_buy_usd.value),
-        auto_monitor: autoInput.checked,
-        ignore_tokens: ignoreArea.value.split("\n").map((s) => s.trim()).filter(Boolean),
-      };
-      const added = addArea.value.split("\n").map((s) => s.trim()).filter(Boolean);
-      if (added.length) body.add_wallets = added;
-      try {
-        await api(`/api/watchlists/${wl.id}`, { method: "PATCH", body });
-        state.editingWatchlist = null;
-        await loadWatchlists();
-      } catch (error) {
-        status.textContent = error.message;
-        status.className = "status error";
-      }
-    });
+async function saveWatchlistSettings() {
+  const wl = state.editingWatchlist;
+  if (!wl) return;
+  await withBusy($("wlSaveBtn"), async () => {
+    const body = {
+      min_wallets: Number($("wlMinWallets").value),
+      min_wallets_pct: Number($("wlPct").value),
+      buy_window_hours: Number($("wlWindow").value),
+      monitor_interval_hours: Number($("wlInterval").value),
+      min_buy_usd: Number($("wlMinUsd").value),
+      auto_monitor: $("wlAuto").checked,
+      buy_detection: $("wlDetection").value,
+      ignore_tokens: $("wlIgnore").value.split("\n").map((s) => s.trim()).filter(Boolean),
+    };
+    const added = $("wlAddWallets").value.split("\n").map((s) => s.trim()).filter(Boolean);
+    if (added.length) body.add_wallets = added;
+    try {
+      await api(`/api/watchlists/${wl.id}`, { method: "PATCH", body });
+      bootstrap.Modal.getOrCreateInstance($("watchlistModal")).hide();
+      state.editingWatchlist = null;
+      await loadWatchlists();
+    } catch (error) {
+      setStatus("wlModalStatus", error.message, "error");
+    }
   });
-  actionsRow.append(saveBtn, status);
-
-  cell.append(grid, actionsRow);
 }
 
 async function runMonitorNow(wl, button) {
-  if (!currentKey()) {
-    setStatus("watchlistsStatus", "Enter your Dune API key above first.", "error");
-    return;
-  }
+  if (!requireKey("watchlistsStatus")) return;
   await withBusy(button, async () => {
     setStatus(
       "watchlistsStatus",
-      `Checking what ${wl.name} bought in the last ${wl.buy_window_hours}h…`,
+      `Checking what “${wl.name}” bought in the last ${wl.buy_window_hours}h…`,
       "",
     );
     try {
@@ -747,8 +757,8 @@ async function loadSignals() {
 function renderSignals() {
   const table = $("signalsTable");
   const empty = $("signalsEmpty");
-  table.classList.toggle("hidden", !state.signals.length);
-  empty.classList.toggle("hidden", !!state.signals.length);
+  table.classList.toggle("d-none", !state.signals.length);
+  empty.classList.toggle("d-none", !!state.signals.length);
   table.tHead.innerHTML = "";
   table.tBodies[0].innerHTML = "";
   if (!state.signals.length) return;
@@ -757,7 +767,7 @@ function renderSignals() {
   for (const title of [
     "Updated", "Watchlist", "Token", "Buyers", "Volume", "Status", "",
   ]) {
-    headRow.appendChild(el("th", null, title));
+    headRow.appendChild(el("th", "small text-body-secondary", title));
   }
 
   for (const signal of state.signals) {
@@ -776,14 +786,19 @@ function renderSignalRow(tbody, signal) {
   tr.insertCell().textContent = signal.watchlist_name || `#${signal.watchlist_id}`;
 
   const tokenCell = tr.insertCell();
-  const link = el("a", "token-link", signal.token_symbol || shortAddress(signal.token_address));
+  const link = el(
+    "a",
+    "link-primary fw-medium text-decoration-none",
+    signal.token_symbol || shortAddress(signal.token_address),
+  );
   link.href = dexscreenerUrl(signal.chain, signal.token_address);
   link.target = "_blank";
   link.rel = "noopener noreferrer";
   link.title = "Open on DexScreener";
+  link.addEventListener("click", (event) => event.stopPropagation());
   tokenCell.appendChild(link);
-  tokenCell.appendChild(el("span", "mono", " " + shortAddress(signal.token_address)));
-  const copyBtn = el("button", "small ghost", "copy");
+  tokenCell.appendChild(el("span", "mono ms-2", shortAddress(signal.token_address)));
+  const copyBtn = el("button", "btn btn-link btn-sm p-0 ms-2 small", "copy");
   copyBtn.type = "button";
   copyBtn.title = "Copy token address";
   copyBtn.addEventListener("click", (event) => {
@@ -796,8 +811,29 @@ function renderSignalRow(tbody, signal) {
   tokenCell.appendChild(copyBtn);
 
   const share = Math.round((signal.wallet_count / signal.watchlist_size) * 100);
-  tr.insertCell().textContent =
-    `${signal.wallet_count}/${signal.watchlist_size} (${share}%)`;
+  const buyersCell = tr.insertCell();
+  buyersCell.appendChild(
+    el("span", null, `${signal.wallet_count}/${signal.watchlist_size} (${share}%)`),
+  );
+  // How the buyers were seen: confirmed DEX swaps vs. positions that simply
+  // appeared. A signal made only of the latter deserves a closer look.
+  const dexCount = signal.buyers.filter((b) => b.via !== "balance").length;
+  const positionCount = signal.buyers.length - dexCount;
+  if (dexCount) {
+    buyersCell.appendChild(
+      Object.assign(el("span", "badge text-bg-success ms-1", `${dexCount} DEX`), {
+        title: "Confirmed DEX swaps",
+      }),
+    );
+  }
+  if (positionCount) {
+    buyersCell.appendChild(
+      Object.assign(
+        el("span", "badge text-bg-secondary ms-1", `${positionCount} pos`),
+        { title: "New position with no matching DEX trade (OTC, CEX, transfer…)" },
+      ),
+    );
+  }
 
   tr.insertCell().textContent = fmtUsd(signal.total_usd);
 
@@ -807,15 +843,22 @@ function renderSignalRow(tbody, signal) {
   statusCell.appendChild(
     el(
       "span",
-      "badge " + (signal.status === "dismissed" ? "" : isNew ? "badge--hot" : "badge--ok"),
+      "badge " +
+        (signal.status === "dismissed"
+          ? "text-bg-secondary"
+          : isNew
+            ? "text-bg-primary"
+            : "text-bg-success"),
       signal.status === "dismissed" ? "dismissed" : isNew ? "new" : "active",
     ),
   );
 
   const actions = tr.insertCell();
+  actions.className = "text-nowrap text-end";
   const toggleBtn = el(
     "button",
-    "small" + (signal.status === "dismissed" ? "" : " danger-ghost"),
+    "btn btn-sm " +
+      (signal.status === "dismissed" ? "btn-outline-secondary" : "btn-outline-danger"),
     signal.status === "dismissed" ? "Restore" : "Dismiss",
   );
   toggleBtn.type = "button";
@@ -847,36 +890,95 @@ function renderSignalRow(tbody, signal) {
 
 function renderSignalDetails(tbody, signal) {
   const tr = tbody.insertRow();
-  tr.className = "signal-details";
+  tr.className = "table-active";
   const cell = tr.insertCell();
   cell.colSpan = 7;
 
   cell.appendChild(
     el(
       "div",
-      "row-note",
+      "small text-body-secondary mb-2",
       `Full address: ${signal.token_address} — wallets that bought inside the window:`,
     ),
   );
 
   const table = document.createElement("table");
+  table.className = "table table-sm mb-0";
   const head = table.createTHead().insertRow();
-  for (const title of ["Wallet", "Buys", "USD", "First buy", "Last buy"]) {
-    head.appendChild(el("th", null, title));
+  for (const title of ["Wallet", "Seen as", "Buys", "USD", "First buy", "Last buy"]) {
+    head.appendChild(el("th", "small text-body-secondary", title));
   }
   const body = table.createTBody();
   for (const buyer of signal.buyers) {
     const row = body.insertRow();
-    const walletCell = row.insertCell();
-    walletCell.appendChild(el("span", "mono", buyer.wallet_address));
+    row.insertCell().appendChild(el("span", "mono", buyer.wallet_address));
+    const viaCell = row.insertCell();
+    const isDex = buyer.via !== "balance";
+    const badge = el(
+      "span",
+      "badge " + (isDex ? "text-bg-success" : "text-bg-secondary"),
+      isDex ? "DEX buy" : "new position",
+    );
+    badge.title = isDex
+      ? "Confirmed swap in Dune's DEX trade tables"
+      : "Balance went 0 → positive with no matching DEX trade";
+    viaCell.appendChild(badge);
     row.insertCell().textContent = String(buyer.buy_count);
     row.insertCell().textContent = fmtUsd(buyer.amount_usd);
     row.insertCell().textContent = fmtTime(buyer.first_buy_at);
     row.insertCell().textContent = fmtTime(buyer.last_buy_at);
   }
-  const wrap = el("div", "scroll");
+  const wrap = el("div", "table-responsive");
   wrap.appendChild(table);
   cell.appendChild(wrap);
+}
+
+/* ----------------------------------------------------------- notifications */
+
+async function loadNotificationSettings() {
+  try {
+    const data = await api("/api/settings/notifications");
+    $("tgChat").value = data.chat_id || "";
+    $("tgToken").placeholder = data.bot_token_hint
+      ? `Bot token saved (${data.bot_token_hint}) — paste to replace`
+      : "Bot token (123456:ABC-…)";
+    const badge = $("tgBadge");
+    badge.className = "badge rounded-pill " +
+      (data.telegram_configured ? "text-bg-success" : "text-bg-secondary");
+    badge.textContent = data.telegram_configured ? "On" : "Off";
+  } catch {
+    /* non-fatal */
+  }
+}
+
+async function saveNotificationSettings() {
+  await withBusy($("tgSave"), async () => {
+    const body = {};
+    const token = $("tgToken").value.trim();
+    const chat = $("tgChat").value.trim();
+    if (token) body.bot_token = token;
+    body.chat_id = chat;   // empty clears the chat id deliberately
+    try {
+      await api("/api/settings/notifications", { method: "PUT", body });
+      $("tgToken").value = "";
+      await Promise.all([loadNotificationSettings(), refreshConfig()]);
+      setStatus("tgStatus", "Telegram settings saved.", "ok");
+    } catch (error) {
+      setStatus("tgStatus", error.message, "error");
+    }
+  });
+}
+
+async function testNotification() {
+  await withBusy($("tgTest"), async () => {
+    setStatus("tgStatus", "Sending a test message…", "");
+    try {
+      await api("/api/settings/notifications/test", { method: "POST" });
+      setStatus("tgStatus", "Test message sent — check the chat.", "ok");
+    } catch (error) {
+      setStatus("tgStatus", error.message, "error");
+    }
+  });
 }
 
 /* ---------------------------------------------------------------- polling */
@@ -898,94 +1000,52 @@ function initDates() {
   const start = new Date(today.getTime() - 6 * 86400000).toISOString().slice(0, 10);
   $("startDate").value = start;
   $("endDate").value = end;
-  // Nothing exists after today; a future end date would otherwise project
-  // current balances forward into days that have not happened.
-  $("startDate").max = end;
-  $("endDate").max = end;
 }
 
 function init() {
-  loadKey();
   initDates();
 
   $("saveKey").addEventListener("click", saveKey);
   $("clearKey").addEventListener("click", clearKey);
   $("testKey").addEventListener("click", testKey);
+  $("archiveQueries").addEventListener("click", archiveQueries);
   $("toggleKey").addEventListener("click", () => {
     const input = $("apiKey");
     const hidden = input.type === "password";
     input.type = hidden ? "text" : "password";
     $("toggleKey").textContent = hidden ? "Hide" : "Show";
   });
-  $("apiKey").addEventListener("input", () => {
-    state.key = $("apiKey").value.trim();
-    paintKeyPill(state.key ? "set" : "none");
-  });
 
   $("queryForm").addEventListener("submit", runQuery);
-  // Deliberately no dynamic min on the end date: a native constraint blocks
-  // the submit event silently, so our own validation never runs and whatever
-  // error was on screen stays there, describing the wrong problem. Let the
-  // form submit and report the range mistake in the same place as every
-  // other message.
-  //
-  // Clear a stale error as soon as anything is edited, so a message never
-  // outlives the input it was about.
-  for (const field of $("queryForm").querySelectorAll("input, select")) {
-    field.addEventListener("input", () => {
-      if ($("runStatus").classList.contains("error")) setStatus("runStatus", "", "");
-    });
-  }
-  $("chain").addEventListener("change", () => {
-    const solana = $("chain").value === "solana";
-    $("tokenAddress").placeholder = solana ? "Base58 mint address…" : "0x…";
-  });
   $("showSql").addEventListener("click", showSql);
   $("diagnoseBtn").addEventListener("click", diagnose);
   $("downloadBtn").addEventListener("click", download);
+  $("showMoreBtn").addEventListener("click", showMore);
 
   $("saveWatchlistBtn").addEventListener("click", saveWatchlist);
   $("refreshWatchlists").addEventListener("click", loadWatchlists);
   $("refreshSignals").addEventListener("click", loadSignals);
   $("showDismissed").addEventListener("change", loadSignals);
+  $("wlSaveBtn").addEventListener("click", saveWatchlistSettings);
+
+  $("tgSave").addEventListener("click", saveNotificationSettings);
+  $("tgTest").addEventListener("click", testNotification);
 
   for (const tab of document.querySelectorAll(".tab")) {
     tab.addEventListener("click", () => {
       for (const other of document.querySelectorAll(".tab")) {
-        other.classList.toggle("is-active", other === tab);
+        other.classList.toggle("active", other === tab);
       }
       state.tab = tab.dataset.tab;
-      updateDownloadLabel();
       renderTable();
     });
   }
 
-  api("/api/config")
-    .then((config) => {
-      state.config = config;
-      if (config.server_key_configured && !currentKey()) {
-        setStatus(
-          "keyStatus",
-          "A server-side key is configured; you can run queries without entering one.",
-          "",
-        );
-      }
-      const monitor = config.monitor || {};
-      let hint;
-      if (monitor.auto_possible) {
-        hint = "Scheduled runs are on (server-side key configured).";
-      } else {
-        hint =
-          "Scheduled auto-runs need DUNE_API_KEY on the server; " +
-          "the Run now button always works with your browser key.";
-      }
-      if (monitor.telegram_configured) hint += " Telegram alerts are on.";
-      $("autoMonitorHint").textContent = hint;
-    })
-    .catch(() => {});
-
-  loadWatchlists();
-  loadSignals();
+  refreshConfig().then(() => {
+    loadWatchlists();
+    loadSignals();
+  });
+  loadNotificationSettings();
   startPolling();
 }
 

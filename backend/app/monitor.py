@@ -36,7 +36,7 @@ from .config import settings
 from .dune import DuneClient, ensure_query
 from .holders import _to_float
 from .models import Chain, MonitorResult, MonitorRunOut, SignalOut, TokenBuyer
-from .sql import build_trades_sql, ignored_tokens_for
+from .sql import build_new_positions_sql, build_trades_sql, ignored_tokens_for
 
 log = logging.getLogger(__name__)
 
@@ -109,9 +109,70 @@ def parse_trade_rows(
                 "amount_usd": amount_usd,
                 "first_buy_at": _to_iso_datetime(row.get("first_buy_at")),
                 "last_buy_at": _to_iso_datetime(row.get("last_buy_at")),
+                "via": "dex",
             }
         )
     return buys
+
+
+def parse_position_rows(
+    rows: Iterable[dict[str, Any]],
+    *,
+    chain: Chain,
+    wallets: Iterable[str],
+    ignored_tokens: Iterable[str],
+) -> list[dict[str, Any]]:
+    """Normalise new-position rows into the same buy-record shape, ``via=balance``.
+
+    A position has no USD amount or symbol — the balance table doesn't carry
+    them — so those stay None and the aggregation treats unknown values
+    leniently (they pass ``min_buy_usd``).
+    """
+    wallet_set = set(wallets)
+    ignored = set(ignored_tokens)
+    buys: list[dict[str, Any]] = []
+    for row in rows:
+        wallet = str(row.get("wallet_address") or "").strip()
+        token = str(row.get("token_address") or "").strip()
+        if chain.is_evm:
+            wallet = wallet.lower()
+            token = token.lower()
+        if not wallet or not token:
+            continue
+        if wallet not in wallet_set or token in ignored:
+            continue
+        first_seen = _to_iso_datetime(row.get("first_seen_at"))
+        buys.append(
+            {
+                "wallet_address": wallet,
+                "token_address": token,
+                "token_symbol": None,
+                "buy_count": 1,
+                "amount_usd": None,
+                "first_buy_at": first_seen,
+                "last_buy_at": first_seen,
+                "via": "balance",
+            }
+        )
+    return buys
+
+
+def merge_buys(
+    dex_buys: list[dict[str, Any]], position_buys: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """One record per (wallet, token); DEX evidence wins over a bare position.
+
+    A new position that also shows up in dex.trades is simply that swap — the
+    labelled record keeps the trade's USD amount and symbol. A position with
+    no matching trade stays labelled ``balance``: acquired some other way
+    (OTC, CEX withdrawal, transfer).
+    """
+    merged: dict[tuple[str, str], dict[str, Any]] = {
+        (b["wallet_address"], b["token_address"]): b for b in position_buys
+    }
+    for buy in dex_buys:
+        merged[(buy["wallet_address"], buy["token_address"])] = buy
+    return list(merged.values())
 
 
 # ------------------------------------------------------------------ signals
@@ -165,6 +226,9 @@ def aggregate_candidates(
                 "token_address": token,
                 "token_symbol": symbol,
                 "wallet_count": distinct,
+                "dex_wallet_count": len(
+                    {b["wallet_address"] for b in buyers if b.get("via") == "dex"}
+                ),
                 "total_usd": round(sum(known_usd), 2) if known_usd else None,
                 "buyers": [
                     {
@@ -173,6 +237,7 @@ def aggregate_candidates(
                         "amount_usd": b["amount_usd"],
                         "first_buy_at": b["first_buy_at"],
                         "last_buy_at": b["last_buy_at"],
+                        "via": b.get("via", "dex"),
                     }
                     for b in buyers
                 ],
@@ -224,6 +289,26 @@ def run_to_out(row: dict[str, Any]) -> MonitorRunOut:
 # ------------------------------------------------------------------ the run
 
 
+async def _execute(
+    client: DuneClient, *, purpose: str, name: str, sql: str
+) -> tuple[list[dict[str, Any]], str]:
+    """Run one monitor query through its reusable slot; return (rows, exec id)."""
+    query_id = await ensure_query(client, purpose=purpose, name=name, query_sql=sql)
+    execution_id = await client.execute_query(query_id)
+    await client.wait_for_execution(execution_id)
+    rows, _ = await client.fetch_results(execution_id, max_rows=MONITOR_MAX_ROWS)
+    return rows, execution_id
+
+
+async def resolve_balance_source(client: DuneClient, chain: Chain):
+    """The chain's balance table, resolved and cached exactly like the holder
+    query does — importing here avoids a circular import at module load."""
+    from .main import resolve_for
+
+    source, _ = await resolve_for(client, chain)
+    return source
+
+
 async def run_monitor(
     watchlist_id: int, *, api_key: str, trigger: str = "manual"
 ) -> MonitorResult:
@@ -246,37 +331,54 @@ async def run_monitor(
     run_id = db.create_run(
         watchlist_id=watchlist_id, trigger=trigger, window_hours=window_hours
     )
-    try:
-        sql = build_trades_sql(
-            chain,
-            wallets,
-            window_hours=window_hours,
-            extra_ignore_tokens=extra_ignores,
-        )
-        async with DuneClient(api_key) as client:
-            # One reusable query slot per watchlist: concurrent monitors of
-            # different watchlists must not rewrite each other's SQL.
-            query_id = await ensure_query(
-                client,
-                purpose=f"monitor:{watchlist_id}",
-                name=(
-                    f"DICE monitor: {watchlist['name'][:40]} "
-                    f"({chain.value}, {len(wallets)} wallets, {window_hours}h)"
-                ),
-                query_sql=sql,
-            )
-            execution_id = await client.execute_query(query_id)
-            await client.wait_for_execution(execution_id)
-            rows, _ = await client.fetch_results(
-                execution_id, max_rows=MONITOR_MAX_ROWS
-            )
+    detection = str(watchlist["buy_detection"] or "both")
+    ignored = ignored_tokens_for(chain, extra_ignores)
+    label = f"{watchlist['name'][:40]} ({chain.value}, {len(wallets)}w, {window_hours}h)"
 
-        buys = parse_trade_rows(
-            rows,
-            chain=chain,
-            wallets=wallets,
-            ignored_tokens=ignored_tokens_for(chain, extra_ignores),
-        )
+    try:
+        dex_buys: list[dict[str, Any]] = []
+        position_buys: list[dict[str, Any]] = []
+        execution_id: str | None = None
+
+        async with DuneClient(api_key) as client:
+            if detection in ("dex", "both"):
+                # One reusable query slot per watchlist and mode: concurrent
+                # monitors must not rewrite each other's SQL.
+                rows, execution_id = await _execute(
+                    client,
+                    purpose=f"monitor:{watchlist_id}",
+                    name=f"DICE monitor: {label}",
+                    sql=build_trades_sql(
+                        chain,
+                        wallets,
+                        window_hours=window_hours,
+                        extra_ignore_tokens=extra_ignores,
+                    ),
+                )
+                dex_buys = parse_trade_rows(
+                    rows, chain=chain, wallets=wallets, ignored_tokens=ignored
+                )
+
+            if detection in ("balance", "both"):
+                source = await resolve_balance_source(client, chain)
+                rows, position_execution = await _execute(
+                    client,
+                    purpose=f"positions:{watchlist_id}",
+                    name=f"DICE positions: {label}",
+                    sql=build_new_positions_sql(
+                        chain,
+                        source,
+                        wallets,
+                        window_hours=window_hours,
+                        extra_ignore_tokens=extra_ignores,
+                    ),
+                )
+                position_buys = parse_position_rows(
+                    rows, chain=chain, wallets=wallets, ignored_tokens=ignored
+                )
+                execution_id = execution_id or position_execution
+
+        buys = merge_buys(dex_buys, position_buys)
         candidates = aggregate_candidates(
             buys,
             watchlist_size=len(wallets),
@@ -353,34 +455,16 @@ def _short_address(address: str) -> str:
     return address if len(address) <= 14 else f"{address[:6]}…{address[-4:]}"
 
 
-async def send_signal_notification(
-    *,
-    watchlist_name: str,
-    chain: Chain,
-    window_hours: int,
-    signals: list[tuple[SignalOut, bool]],
-) -> None:
-    """Push new/strengthened signals to Telegram, if configured. Best-effort."""
-    token = settings.telegram_bot_token
-    chat_id = settings.telegram_chat_id
-    if not token or not chat_id:
-        return
+async def send_telegram_message(text: str) -> str | None:
+    """Send one Telegram message; return an error description or None on success.
 
-    lines = [f"DICE signals — {watchlist_name} ({chain.value}, last {window_hours}h)"]
-    for signal, is_new in signals:
-        label = signal.token_symbol or _short_address(signal.token_address)
-        usd = (
-            f" ≈ ${signal.total_usd:,.0f}" if signal.total_usd is not None else ""
-        )
-        lines.append(
-            f"{'NEW' if is_new else 'UP'} {label}: "
-            f"{signal.wallet_count}/{signal.watchlist_size} wallets bought{usd}"
-        )
-        lines.append(signal.token_address)
-        lines.append(f"https://dexscreener.com/{chain.value}/{signal.token_address}")
-    text = "\n".join(lines)
-    if len(text) > 3900:
-        text = text[:3900] + "\n…"
+    Credentials come from the UI-saved settings, falling back to the
+    environment. Callers decide whether a failure matters: signal pushes log
+    and continue, the settings "send test" endpoint reports it to the user.
+    """
+    token, chat_id = db.telegram_credentials()
+    if not token or not chat_id:
+        return "Telegram is not configured (bot token / chat id missing)."
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -392,14 +476,50 @@ async def send_signal_notification(
                     "disable_web_page_preview": True,
                 },
             )
-            if response.status_code >= 400:
-                log.warning(
-                    "telegram notification failed (%s): %s",
-                    response.status_code,
-                    response.text[:200],
-                )
     except httpx.HTTPError as exc:
-        log.warning("telegram notification failed: %s", exc)
+        return f"could not reach Telegram: {exc}"
+    if response.status_code >= 400:
+        detail = response.text[:200]
+        return f"Telegram answered {response.status_code}: {detail}"
+    return None
+
+
+async def send_signal_notification(
+    *,
+    watchlist_name: str,
+    chain: Chain,
+    window_hours: int,
+    signals: list[tuple[SignalOut, bool]],
+) -> None:
+    """Push new/strengthened signals to Telegram, if configured. Best-effort."""
+    token, chat_id = db.telegram_credentials()
+    if not token or not chat_id:
+        return
+
+    lines = [f"DICE signals — {watchlist_name} ({chain.value}, last {window_hours}h)"]
+    for signal, is_new in signals:
+        label = signal.token_symbol or _short_address(signal.token_address)
+        usd = (
+            f" ≈ ${signal.total_usd:,.0f}" if signal.total_usd is not None else ""
+        )
+        dex = sum(1 for buyer in signal.buyers if buyer.via == "dex")
+        positions = len(signal.buyers) - dex
+        breakdown = f" [{dex} DEX"
+        breakdown += f", {positions} new position]" if positions else "]"
+        lines.append(
+            f"{'NEW' if is_new else 'UP'} {label}: "
+            f"{signal.wallet_count}/{signal.watchlist_size} wallets bought{usd}"
+            f"{breakdown}"
+        )
+        lines.append(signal.token_address)
+        lines.append(f"https://dexscreener.com/{chain.value}/{signal.token_address}")
+    text = "\n".join(lines)
+    if len(text) > 3900:
+        text = text[:3900] + "\n…"
+
+    error = await send_telegram_message(text)
+    if error:
+        log.warning("telegram notification failed: %s", error)
 
 
 # ------------------------------------------------------------------ scheduler
@@ -410,14 +530,16 @@ async def scheduler_loop() -> None:
     log.info(
         "watchlist scheduler running (tick %ss, server key %s)",
         settings.monitor_tick_seconds,
-        "configured" if settings.dune_api_key else "missing — scheduled runs idle",
+        "configured" if db.server_api_key() else "not saved yet — runs idle",
     )
     while True:
         try:
             await asyncio.sleep(settings.monitor_tick_seconds)
             if not settings.monitor_enabled:
                 continue
-            api_key = (settings.dune_api_key or "").strip()
+            # Re-read every tick: a key saved through the UI starts working
+            # without a restart.
+            api_key = db.server_api_key() or ""
             if not api_key:
                 continue
 
@@ -460,10 +582,13 @@ async def scheduler_loop() -> None:
 __all__ = [
     "aggregate_candidates",
     "effective_min_wallets",
+    "merge_buys",
+    "parse_position_rows",
     "parse_trade_rows",
     "run_monitor",
     "run_to_out",
     "scheduler_loop",
     "send_signal_notification",
+    "send_telegram_message",
     "signal_to_out",
 ]

@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from datetime import date, datetime, timezone
 from enum import Enum
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -170,6 +171,12 @@ class HoldersResponse(BaseModel):
 
 # ---------------------------------------------------------------- watchlists
 
+#: ``dex``: only swaps from the DEX trade tables count — cleanest, misses
+#: OTC/CEX routes. ``balance``: any token whose balance went from zero to
+#: positive — catches everything, including airdrops and self-transfers.
+#: ``both``: run the two together and label each wallet with how it was seen.
+BuyDetection = Literal["dex", "balance", "both"]
+
 
 def normalize_addresses(chain: Chain, addresses: list[str]) -> list[str]:
     """Validate and canonicalise addresses (wallets or tokens) for one chain.
@@ -220,6 +227,9 @@ class WatchlistSettings(BaseModel):
     auto_monitor: bool = True
     #: token addresses to ignore on top of the built-in quote/stable stoplist
     ignore_tokens: list[str] = Field(default_factory=list)
+    #: how a "buy" is detected — confirmed DEX swaps, any new balance, or both
+    #: (labelled per wallet). ``both`` costs two Dune executions per run.
+    buy_detection: BuyDetection = "both"
 
     @field_validator("ignore_tokens")
     @classmethod
@@ -275,6 +285,7 @@ class WatchlistUpdate(BaseModel):
     min_buy_usd: float | None = Field(default=None, ge=0)
     auto_monitor: bool | None = None
     ignore_tokens: list[str] | None = None
+    buy_detection: BuyDetection | None = None
     add_wallets: list[str] | None = None
     remove_wallets: list[str] | None = None
 
@@ -294,6 +305,7 @@ class WatchlistOut(BaseModel):
     min_buy_usd: float
     auto_monitor: bool
     ignore_tokens: list[str]
+    buy_detection: BuyDetection
     created_at: str
     last_run_at: str | None
     last_run_status: str | None
@@ -310,6 +322,9 @@ class TokenBuyer(BaseModel):
     amount_usd: float | None
     first_buy_at: str | None
     last_buy_at: str | None
+    #: how this wallet was detected: ``dex`` (confirmed swap) or ``balance``
+    #: (new position appeared without a matching DEX trade)
+    via: Literal["dex", "balance"] = "dex"
 
 
 class SignalOut(BaseModel):

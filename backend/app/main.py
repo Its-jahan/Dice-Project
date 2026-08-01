@@ -2,11 +2,13 @@
 
 API key policy
 --------------
-The Dune API key is supplied per request in the ``X-Dune-Api-Key`` header, sent
-by the browser from a field in the UI. It is never written to disk, never
-logged, and never returned in a response; it lives only for the duration of the
-request. ``DUNE_API_KEY`` in the environment is an optional fallback for
-single-user/CLI deployments.
+Single-user deployment: the key saved through the UI (``POST /api/key``) is
+validated against Dune and stored in the server's SQLite settings, and it
+powers both interactive queries and the scheduled watchlist monitoring. An
+``X-Dune-Api-Key`` header still overrides it per request, and ``DUNE_API_KEY``
+in the environment is the fallback when nothing has been saved. The key is
+never logged and never returned in full by any endpoint — only a last-four
+hint.
 """
 
 from __future__ import annotations
@@ -110,13 +112,14 @@ async def _dune_error_handler(_request: Request, exc: DuneError) -> JSONResponse
 
 
 def resolve_api_key(header_key: str | None) -> str:
-    """Header key wins; fall back to the server key only if one is configured."""
-    key = (header_key or "").strip() or (settings.dune_api_key or "").strip()
+    """Header key wins; otherwise the server-saved key (UI or environment)."""
+    key = (header_key or "").strip() or db.server_api_key() or ""
     if not key:
         raise HTTPException(
             status_code=401,
-            detail="No Dune API key. Enter your key in the UI (it is kept in your "
-            "browser and sent only with your own requests).",
+            detail="No Dune API key saved yet. Enter your key in the UI and "
+            "press Save — it is stored on this server so scheduled "
+            "monitoring can use it too.",
         )
     return key
 
@@ -124,11 +127,18 @@ def resolve_api_key(header_key: str | None) -> str:
 ApiKeyHeader = Annotated[str | None, Header(alias="X-Dune-Api-Key")]
 
 
+def _key_hint(key: str | None) -> str | None:
+    return f"…{key[-4:]}" if key and len(key) >= 8 else None
+
+
 @app.get("/api/config")
 async def get_config() -> dict[str, object]:
     """What the UI needs to render itself — never includes the key itself."""
+    server_key = db.server_api_key()
+    telegram_token, telegram_chat = db.telegram_credentials()
     return {
-        "server_key_configured": bool(settings.dune_api_key),
+        "server_key_configured": bool(server_key),
+        "server_key_hint": _key_hint(server_key),
         "saved_query_id": settings.dune_query_id,
         "execution_mode": "saved_query" if settings.dune_query_id else "ad_hoc",
         "max_rows": settings.max_rows,
@@ -137,12 +147,9 @@ async def get_config() -> dict[str, object]:
             "enabled": settings.monitor_enabled,
             "max_wallets": settings.monitor_max_wallets,
             # Scheduled (unattended) runs execute server-side, so they only
-            # happen when the server has its own key.
-            "auto_possible": settings.monitor_enabled
-            and bool(settings.dune_api_key),
-            "telegram_configured": bool(
-                settings.telegram_bot_token and settings.telegram_chat_id
-            ),
+            # happen once a key has been saved on the server.
+            "auto_possible": settings.monitor_enabled and bool(server_key),
+            "telegram_configured": bool(telegram_token and telegram_chat),
         },
     }
 
@@ -153,6 +160,123 @@ async def validate_key(x_dune_api_key: ApiKeyHeader = None) -> dict[str, bool]:
     key = resolve_api_key(x_dune_api_key)
     async with DuneClient(key) as client:
         return {"valid": await client.validate_key()}
+
+
+@app.post("/api/key")
+async def save_key(body: Annotated[dict, Body()]) -> dict[str, object]:
+    """Validate a Dune key and store it on the server, replacing any old one.
+
+    Single-user deployment model: the saved key is what runs both the queries
+    started from the UI and the scheduled watchlist monitoring, so it lives on
+    the server (SQLite) rather than in a browser.
+    """
+    key = str(body.get("key") or "").strip()
+    if not key:
+        raise HTTPException(status_code=422, detail="Provide a key to save.")
+    async with DuneClient(key) as client:
+        if not await client.validate_key():
+            raise HTTPException(
+                status_code=401,
+                detail="Dune rejected this key — nothing was saved.",
+            )
+    db.set_setting("dune_api_key", key)
+    return {"saved": True, "hint": _key_hint(key)}
+
+
+@app.delete("/api/key")
+async def clear_key() -> dict[str, bool]:
+    db.delete_setting("dune_api_key")
+    return {"saved": False}
+
+
+# ------------------------------------------------------------- notifications
+
+
+@app.get("/api/settings/notifications")
+async def get_notification_settings() -> dict[str, object]:
+    token, chat_id = db.telegram_credentials()
+    return {
+        "telegram_configured": bool(token and chat_id),
+        "bot_token_hint": _key_hint(token),
+        "chat_id": chat_id,
+    }
+
+
+@app.put("/api/settings/notifications")
+async def save_notification_settings(
+    body: Annotated[dict, Body()],
+) -> dict[str, object]:
+    """Save Telegram credentials. Empty strings clear a value."""
+    if "bot_token" in body:
+        token = str(body.get("bot_token") or "").strip()
+        if token:
+            db.set_setting("telegram_bot_token", token)
+        else:
+            db.delete_setting("telegram_bot_token")
+    if "chat_id" in body:
+        chat_id = str(body.get("chat_id") or "").strip()
+        if chat_id:
+            db.set_setting("telegram_chat_id", chat_id)
+        else:
+            db.delete_setting("telegram_chat_id")
+    return await get_notification_settings()
+
+
+@app.post("/api/settings/notifications/test")
+async def test_notification() -> dict[str, object]:
+    error = await monitor.send_telegram_message(
+        "DICE test message — signal alerts will arrive in this chat."
+    )
+    if error:
+        raise HTTPException(status_code=502, detail=error)
+    return {"sent": True}
+
+
+# ---------------------------------------------------------- dune maintenance
+
+
+@app.post("/api/dune/archive-queries")
+async def archive_dice_queries(x_dune_api_key: ApiKeyHeader = None) -> dict[str, object]:
+    """Archive every query named ``DICE …`` in the Dune account.
+
+    Cleans up the per-run queries older DICE versions accumulated (the cause
+    of "Max number of private queries reached"). Only queries whose name
+    starts with "DICE" are touched; the reusable slots are forgotten so the
+    next run recreates them fresh.
+    """
+    key = resolve_api_key(x_dune_api_key)
+    archived = 0
+    failed = 0
+    async with DuneClient(key) as client:
+        page_size = 100
+        offset = 0
+        targets: list[int] = []
+        while True:
+            queries, total = await client.list_queries(limit=page_size, offset=offset)
+            for query in queries:
+                query_id = query.get("id") or query.get("query_id")
+                name = str(query.get("name") or "")
+                if isinstance(query_id, int) and name.startswith("DICE"):
+                    targets.append(query_id)
+            offset += page_size
+            if not queries or offset >= total:
+                break
+
+        for query_id in targets:
+            try:
+                await client.archive_query(query_id)
+                archived += 1
+            except DuneError:
+                failed += 1
+
+        slots_cleared = db.drop_account_slots(client.key_fingerprint)
+
+    return {
+        "found": len(targets),
+        "archived": archived,
+        "failed": failed,
+        "slots_cleared": slots_cleared,
+    }
 
 
 @app.post("/api/sql")
@@ -496,6 +620,7 @@ def _watchlist_out(row: dict) -> WatchlistOut:
         min_buy_usd=row["min_buy_usd"],
         auto_monitor=bool(row["auto_monitor"]),
         ignore_tokens=json.loads(row.get("ignore_tokens") or "[]"),
+        buy_detection=row.get("buy_detection") or "both",
         created_at=row["created_at"],
         last_run_at=row.get("last_run_at"),
         last_run_status=row.get("last_run_status"),
@@ -551,6 +676,7 @@ async def create_watchlist(req: Annotated[WatchlistCreate, Body()]) -> Watchlist
         min_buy_usd=req.min_buy_usd,
         auto_monitor=req.auto_monitor,
         ignore_tokens=ignore_tokens,
+        buy_detection=req.buy_detection,
     )
     return _watchlist_out(_overview_or_404(watchlist_id))
 
@@ -595,6 +721,7 @@ async def create_watchlist_from_job(
         min_buy_usd=req.min_buy_usd,
         auto_monitor=req.auto_monitor,
         ignore_tokens=req.ignore_tokens,
+        buy_detection=req.buy_detection,
     )
     return await create_watchlist(create_req)
 
@@ -627,6 +754,7 @@ async def update_watchlist(
         "buy_window_hours",
         "monitor_interval_hours",
         "min_buy_usd",
+        "buy_detection",
     ):
         value = getattr(req, name)
         if value is not None:
@@ -677,6 +805,7 @@ async def delete_watchlist(watchlist_id: int) -> Response:
         raise HTTPException(status_code=404, detail="Watchlist not found.")
     # The reusable Dune query slot for this watchlist is meaningless now.
     db.drop_purpose_slots(f"monitor:{watchlist_id}")
+    db.drop_purpose_slots(f"positions:{watchlist_id}")
     return Response(status_code=204)
 
 

@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS watchlists (
     min_buy_usd            REAL    NOT NULL DEFAULT 0.0,
     auto_monitor           INTEGER NOT NULL DEFAULT 1,
     ignore_tokens          TEXT    NOT NULL DEFAULT '[]',
+    buy_detection          TEXT    NOT NULL DEFAULT 'both',
     created_at             TEXT    NOT NULL,
     last_run_at            TEXT,
     next_run_at            TEXT,
@@ -99,10 +100,32 @@ CREATE TABLE IF NOT EXISTS dune_query_slots (
     updated_at TEXT    NOT NULL,
     PRIMARY KEY (key_hash, purpose)
 );
+
+CREATE TABLE IF NOT EXISTS app_settings (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 _init_lock = threading.Lock()
 _initialized_paths: set[str] = set()
+
+#: Columns added after the first release. ``CREATE TABLE IF NOT EXISTS`` never
+#: alters an existing table, so databases created earlier get them here; the
+#: "duplicate column" error on ALTER means it is already present.
+_MIGRATIONS = (
+    "ALTER TABLE watchlists ADD COLUMN buy_detection TEXT NOT NULL DEFAULT 'both'",
+)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    for statement in _MIGRATIONS:
+        try:
+            conn.execute(statement)
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc).lower():
+                raise
 
 
 def utcnow_iso() -> str:
@@ -130,6 +153,7 @@ def connect() -> Iterator[sqlite3.Connection]:
                 try:
                     setup.execute("PRAGMA journal_mode=WAL")
                     setup.executescript(_SCHEMA)
+                    _migrate(setup)
                     setup.commit()
                 finally:
                     setup.close()
@@ -163,6 +187,7 @@ def create_watchlist(
     min_buy_usd: float,
     auto_monitor: bool,
     ignore_tokens: list[str],
+    buy_detection: str = "both",
 ) -> int:
     now = utcnow_iso()
     with connect() as conn:
@@ -172,8 +197,8 @@ def create_watchlist(
                 name, chain, source_token_address, notes,
                 min_wallets, min_wallets_pct, buy_window_hours,
                 monitor_interval_hours, min_buy_usd, auto_monitor,
-                ignore_tokens, created_at, next_run_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ignore_tokens, buy_detection, created_at, next_run_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 name,
@@ -187,6 +212,7 @@ def create_watchlist(
                 min_buy_usd,
                 int(auto_monitor),
                 json.dumps(ignore_tokens),
+                buy_detection,
                 now,
                 iso_plus_hours(now, monitor_interval_hours),
             ),
@@ -554,3 +580,62 @@ def drop_purpose_slots(purpose: str) -> None:
     """Forget a purpose across every account (e.g. a deleted watchlist)."""
     with connect() as conn:
         conn.execute("DELETE FROM dune_query_slots WHERE purpose = ?", (purpose,))
+
+
+def drop_account_slots(key_hash: str) -> int:
+    """Forget every slot of one account (after its queries were archived)."""
+    with connect() as conn:
+        cursor = conn.execute(
+            "DELETE FROM dune_query_slots WHERE key_hash = ?", (key_hash,)
+        )
+        return cursor.rowcount
+
+
+# ------------------------------------------------------------------- settings
+#
+# Small key/value store for operator-editable configuration: the server-side
+# Dune API key and the Telegram credentials. The deployment is single-user by
+# design (see README), so persisting the key server-side is a deliberate
+# trade: it is what lets scheduled monitor runs work without a browser open.
+
+
+def get_setting(key: str) -> str | None:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT value FROM app_settings WHERE key = ?", (key,)
+        ).fetchone()
+        return row["value"] if row else None
+
+
+def set_setting(key: str, value: str) -> None:
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO app_settings VALUES (?, ?, ?) "
+            "ON CONFLICT (key) DO UPDATE "
+            "SET value = excluded.value, updated_at = excluded.updated_at",
+            (key, value, utcnow_iso()),
+        )
+
+
+def delete_setting(key: str) -> None:
+    with connect() as conn:
+        conn.execute("DELETE FROM app_settings WHERE key = ?", (key,))
+
+
+def server_api_key() -> str | None:
+    """The key scheduled runs use: saved via the UI, else the environment."""
+    stored = (get_setting("dune_api_key") or "").strip()
+    if stored:
+        return stored
+    return (settings.dune_api_key or "").strip() or None
+
+
+def telegram_credentials() -> tuple[str | None, str | None]:
+    """(bot_token, chat_id) — UI-saved values win over the environment."""
+    token = (get_setting("telegram_bot_token") or "").strip() or (
+        settings.telegram_bot_token or ""
+    ).strip()
+    chat_id = (get_setting("telegram_chat_id") or "").strip() or (
+        settings.telegram_chat_id or ""
+    ).strip()
+    return (token or None, chat_id or None)
