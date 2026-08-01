@@ -28,7 +28,9 @@ def parse_rows(rows: Iterable[dict[str, Any]], req: HoldersRequest) -> list[Snap
         balance = _to_float(raw_balance)
         if snapshot_date is None or balance is None:
             continue
-        if balance <= 0 or balance < req.min_balance:
+        # Strictly greater, matching the SQL filter. "Minimum balance: 100"
+        # means more than 100, and 0 means any positive balance.
+        if balance <= 0 or balance <= req.min_balance:
             continue
         if not (req.start_date <= snapshot_date <= req.effective_end_date):
             continue
@@ -59,6 +61,10 @@ def apply_holder_mode(
     """
     if req.holder_mode is not HolderMode.continuous:
         return snapshots
+    if req.days <= 0:
+        # No days in range at all; every wallet would vacuously "hold" on all
+        # of them, which is the wrong answer.
+        return []
 
     expected_days = {
         req.start_date + timedelta(days=offset) for offset in range(req.days)

@@ -1,6 +1,7 @@
 import csv
 import io
 import json
+from datetime import timedelta
 
 from app.exporters import export, filename_for
 from app.holders import build_summary, parse_rows
@@ -139,3 +140,23 @@ def test_filename_says_which_table_it_holds():
 
     assert "_summary_" in filename_for(result, ExportFormat.csv, "summary")
     assert "_snapshots_" in filename_for(result, ExportFormat.csv, "snapshots")
+
+
+def test_html_reports_the_range_it_actually_contains():
+    """The header must not claim days that were clamped away."""
+    from app.models import utc_today
+
+    req = HoldersRequest(
+        chain="ethereum",
+        token_address="0x1234567890abcdef1234567890abcdef12345678",
+        start_date=utc_today().isoformat(),
+        end_date=(utc_today() + timedelta(days=10)).isoformat(),
+    )
+    result = HoldersResponse(
+        request=req, row_count=0, wallet_count=0, snapshots=[], summary=[]
+    )
+
+    page = export(result, ExportFormat.html).decode("utf-8")
+
+    assert req.effective_end_date.isoformat() in page
+    assert req.end_date.isoformat() not in page

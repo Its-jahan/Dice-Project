@@ -204,7 +204,7 @@ def _to_html(result: HoldersResponse, dataset: str = "auto") -> bytes:
 </style>
 <h1>{html.escape(title)}</h1>
 <div class="meta">
-  {html.escape(req.start_date.isoformat())} → {html.escape(req.end_date.isoformat())}
+  {html.escape(req.start_date.isoformat())} → {html.escape(req.effective_end_date.isoformat())}
   (UTC) · mode: {html.escape(req.holder_mode.value)} ·
   min balance: {req.min_balance} · {result.wallet_count} wallets ·
   {result.row_count} snapshot rows{" · TRUNCATED" if result.truncated else ""}

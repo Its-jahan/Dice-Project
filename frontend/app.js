@@ -93,6 +93,33 @@ function paintKeyPill(kind) {
 
 /* -------------------------------------------------------------------- utils */
 
+/* A Dune execution routinely runs for minutes. Without a moving number the
+ * page looks hung, and people reload — which abandons a query they have
+ * already paid for. */
+let elapsedTimer = null;
+
+function startElapsed(id, message) {
+  stopElapsed();
+  const startedAt = Date.now();
+  const tick = () => {
+    const seconds = Math.round((Date.now() - startedAt) / 1000);
+    const shown =
+      seconds < 60
+        ? `${seconds}s`
+        : `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, "0")}s`;
+    setStatus(id, `${message} (${shown})`, "");
+  };
+  tick();
+  elapsedTimer = setInterval(tick, 1000);
+}
+
+function stopElapsed() {
+  if (elapsedTimer !== null) {
+    clearInterval(elapsedTimer);
+    elapsedTimer = null;
+  }
+}
+
 function setStatus(id, message, kind) {
   const el = $(id);
   el.textContent = message;
@@ -130,6 +157,28 @@ function describeError(payload, status) {
       .join("; ");
   }
   return `Request failed (HTTP ${status}).`;
+}
+
+const EVM_ADDRESS = /^0x[0-9a-fA-F]{40}$/;
+const SOLANA_MINT = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+
+/** Return a human message if the form cannot possibly be valid, else null. */
+function validateForm() {
+  const chain = $("chain").value;
+  const token = $("tokenAddress").value.trim();
+  if (!token) return "Enter a token contract or mint address.";
+  if (chain === "solana") {
+    if (!SOLANA_MINT.test(token)) {
+      return "That is not a Solana mint address (base58, 32–44 characters).";
+    }
+  } else if (!EVM_ADDRESS.test(token)) {
+    return "That is not an EVM contract address (0x followed by 40 hex characters).";
+  }
+  const start = $("startDate").value;
+  const end = $("endDate").value;
+  if (!start || !end) return "Pick both a start and an end date.";
+  if (start > end) return "Start date must be on or before the end date.";
+  return null;
 }
 
 function readRequest() {
@@ -170,13 +219,26 @@ async function testKey() {
 }
 
 async function showSql() {
+  if (!currentKey()) {
+    setStatus("runStatus", "Enter your Dune API key above first.", "error");
+    $("apiKey").focus();
+    return;
+  }
+  const problem = validateForm();
+  if (problem) {
+    setStatus("runStatus", problem, "error");
+    return;
+  }
   await withBusy($("showSql"), async () => {
+    startElapsed("runStatus", "Resolving the source table…");
     try {
-      const { sql } = await api("/api/sql", { method: "POST", body: readRequest() });
-      $("sqlOut").textContent = sql;
+      const data = await api("/api/sql", { method: "POST", body: readRequest() });
+      $("sqlOut").textContent = data.sql;
       $("sqlCard").classList.remove("hidden");
+      stopElapsed();
       setStatus("runStatus", "", "");
     } catch (error) {
+      stopElapsed();
       setStatus("runStatus", error.message, "error");
     }
   });
@@ -188,7 +250,7 @@ async function diagnose() {
     return;
   }
   await withBusy($("diagnoseBtn"), async () => {
-    setStatus("runStatus", "Asking Dune which balance table to read…", "");
+    startElapsed("runStatus", "Asking Dune which balance table to read…");
     try {
       // Ask what DICE actually resolved for this chain, rather than listing
       // the whole catalogue — the resolver already made the decision.
@@ -215,8 +277,10 @@ async function diagnose() {
       ];
       $("sqlOut").textContent = lines.join("\n");
       $("sqlCard").classList.remove("hidden");
+      stopElapsed();
       setStatus("runStatus", "", "");
     } catch (error) {
+      stopElapsed();
       setStatus("runStatus", error.message, "error");
     }
   });
@@ -229,17 +293,28 @@ async function runQuery(event) {
     $("apiKey").focus();
     return;
   }
+  const problem = validateForm();
+  if (problem) {
+    setStatus("runStatus", problem, "error");
+    return;
+  }
 
   await withBusy($("runBtn"), async () => {
-    setStatus("runStatus", "Running on Dune — this can take a few minutes…", "");
+    startElapsed("runStatus", "Running on Dune — this can take a few minutes…");
     try {
       const data = await api("/api/holders", { method: "POST", body: readRequest() });
       state.jobId = data.job_id;
       state.preview = data.preview;
       state.summary = data.summary_preview;
+      stopElapsed();
       renderResults(data);
-      setStatus("runStatus", "Done.", "ok");
+      setStatus(
+        "runStatus",
+        data.row_count ? "Done." : "No holders matched — try a wider range or a lower minimum.",
+        data.row_count ? "ok" : "",
+      );
     } catch (error) {
+      stopElapsed();
       setStatus("runStatus", error.message, "error");
     }
   });
@@ -352,6 +427,23 @@ function init() {
   });
 
   $("queryForm").addEventListener("submit", runQuery);
+  // Deliberately no dynamic min on the end date: a native constraint blocks
+  // the submit event silently, so our own validation never runs and whatever
+  // error was on screen stays there, describing the wrong problem. Let the
+  // form submit and report the range mistake in the same place as every
+  // other message.
+  //
+  // Clear a stale error as soon as anything is edited, so a message never
+  // outlives the input it was about.
+  for (const field of $("queryForm").querySelectorAll("input, select")) {
+    field.addEventListener("input", () => {
+      if ($("runStatus").classList.contains("error")) setStatus("runStatus", "", "");
+    });
+  }
+  $("chain").addEventListener("change", () => {
+    const solana = $("chain").value === "solana";
+    $("tokenAddress").placeholder = solana ? "Base58 mint address…" : "0x…";
+  });
   $("showSql").addEventListener("click", showSql);
   $("diagnoseBtn").addEventListener("click", diagnose);
   $("downloadBtn").addEventListener("click", download);

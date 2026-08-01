@@ -5,6 +5,8 @@ from fastapi.testclient import TestClient
 
 from app import main
 from app.config import settings
+from app.cache import DiskCache
+from app.jobs import JobStore
 from app.dune import DuneAuthError
 from app.sql import DISCOVERY_LIMIT
 
@@ -66,7 +68,7 @@ class FakeDuneClient:
 
 
 @pytest.fixture
-def client(monkeypatch):
+def client(monkeypatch, tmp_path):
     FakeDuneClient.calls = {}
     FakeDuneClient.valid_key = True
     FakeDuneClient.rows = [
@@ -84,7 +86,10 @@ def client(monkeypatch):
         }
         for column in ("address", "token_address", "balance", "valid_from", "valid_to")
     ]
-    main._SOURCE_CACHE.clear()
+    # Point the shared resolution cache at a scratch dir per test, so one
+    # test's resolved source cannot leak into the next.
+    monkeypatch.setattr(main, "cache", DiskCache(directory=tmp_path / "cache"))
+    monkeypatch.setattr(main, "store", JobStore(directory=tmp_path / "jobs"))
     monkeypatch.setattr(main, "DuneClient", FakeDuneClient)
     monkeypatch.setattr(settings, "dune_api_key", None, raising=False)
     monkeypatch.setattr(settings, "dune_query_id", None, raising=False)
@@ -253,7 +258,6 @@ def test_source_resolution_is_cached_across_requests(client):
 
 def test_no_readable_table_is_a_clear_404(client):
     FakeDuneClient.catalog_rows = []
-    main._SOURCE_CACHE.clear()
 
     response = client.post(
         "/api/holders", json=BASE_REQUEST, headers={"X-Dune-Api-Key": "k"}

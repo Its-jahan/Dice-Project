@@ -156,6 +156,11 @@ paid plan. Use `POST /api/sql` to get SQL to paste into that saved query.
 
 ## Chains and source tables
 
+Twenty EVM chains plus Solana are selectable. Chain values are Dune's own
+schema names (`balances_<value>`), so `avalanche_c` rather than `avalanche`. A
+chain your plan cannot reach reports a clear "no readable balance table"
+instead of failing obscurely.
+
 DICE does **not** hard-code a Dune table name, because there isn't a stable one.
 Reading a live Dune account's catalogue shows all of this at once:
 
@@ -207,6 +212,13 @@ the curated balance tables are not on every Dune tier.
   someone has decoded. If no such table is readable the request fails rather
   than quietly returning the contracts you asked to exclude.
 - A single job is capped at 366 days and `DICE_MAX_ROWS` rows.
+- `min_balance` is strict: `100` means *more than* 100, and the default `0`
+  means any positive balance. The SQL filter and the row filter agree on this.
+- A start date in the future is rejected; an end date in the future is clamped
+  to today.
+- Resolved source tables are cached on disk for 6 hours (`DICE_CACHE_DIR`,
+  falling back under `DICE_JOB_DIR`) because resolving one costs a Dune
+  execution. **Check data source** re-resolves immediately.
 
 ## Tests
 

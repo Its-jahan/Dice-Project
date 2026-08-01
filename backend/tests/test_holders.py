@@ -148,3 +148,42 @@ def test_rows_after_today_are_dropped_even_if_dune_returns_them():
     snapshots = parse_rows(rows, req)
 
     assert [s.snapshot_date for s in snapshots] == [today]
+
+
+def test_start_date_in_the_future_is_rejected_with_a_clear_message():
+    """An inverted range makes Dune's sequence() fail with an opaque error."""
+    from app.models import utc_today
+    from pydantic import ValidationError
+
+    future = (utc_today() + timedelta(days=3)).isoformat()
+
+    with pytest.raises(ValidationError, match="future"):
+        make_request(start_date=future, end_date=future)
+
+
+def test_minimum_balance_is_strict_matching_the_sql():
+    """"Minimum balance: 100" means more than 100, in both filters."""
+    req = make_request(min_balance=100)
+    rows = [
+        {"wallet_address": WALLET_A, "day": "2026-07-20", "balance": 100},
+        {"wallet_address": WALLET_B, "day": "2026-07-20", "balance": 100.01},
+    ]
+
+    snapshots = parse_rows(rows, req)
+
+    assert [s.wallet_address for s in snapshots] == [WALLET_B]
+
+
+def test_continuous_mode_with_no_days_in_range_returns_nothing():
+    """Otherwise every wallet vacuously "holds" on all zero required days."""
+    from app.models import utc_today
+
+    req = make_request(
+        start_date=utc_today().isoformat(),
+        end_date=utc_today().isoformat(),
+        holder_mode="continuous",
+    )
+    object.__setattr__(req, "start_date", utc_today() + timedelta(days=1))
+
+    assert req.days == 0
+    assert apply_holder_mode([], req) == []

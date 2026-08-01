@@ -52,6 +52,17 @@ class DuneAuthError(DuneError):
         super().__init__(message, status_code=401)
 
 
+class DuneUnreachable(DuneError):
+    """The request never got an answer — network, TLS or timeout.
+
+    Distinct from other failures because it says nothing about the key: a key
+    check must not report "valid" just because the network was down.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, status_code=503)
+
+
 class DuneClient:
     def __init__(self, api_key: str, *, base_url: str | None = None) -> None:
         if not api_key or not api_key.strip():
@@ -79,7 +90,7 @@ class DuneClient:
         try:
             response = await self._client.request(method, path, **kwargs)
         except httpx.HTTPError as exc:  # network/TLS/timeout
-            raise DuneError(f"could not reach Dune: {exc}") from exc
+            raise DuneUnreachable(f"could not reach Dune: {exc}") from exc
 
         if response.status_code in (401, 403):
             raise DuneAuthError(
@@ -110,6 +121,9 @@ class DuneClient:
             await self._request("GET", probe)
         except DuneAuthError:
             return False
+        except DuneUnreachable:
+            # Says nothing about the key — surface it instead of claiming valid.
+            raise
         except DuneError:
             # 404/400 for the bogus execution id means the key authenticated.
             return True

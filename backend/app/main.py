@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from dataclasses import asdict
 from typing import Annotated
 
 from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
+from .cache import cache
 from .config import settings
 from .dune import DuneClient, DuneError
 from .exporters import DATASETS, MEDIA_TYPES, export, filename_for
@@ -122,7 +124,7 @@ async def preview_sql(
     key = resolve_api_key(x_dune_api_key)
     async with DuneClient(key) as client:
         try:
-            source = await resolve_for(client, req.chain)
+            source, _ = await resolve_for(client, req.chain)
         except SourceNotFound as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         contracts = await contracts_if_needed(client, req)
@@ -182,20 +184,20 @@ async def discover_tables(
     }
 
 
-#: Resolved sources per chain, cached for the process. Resolution costs a Dune
-#: execution, and the catalogue only changes when Dune rebuilds its spellbook.
-_SOURCE_CACHE: dict[Chain, Source] = {}
-_CONTRACT_CACHE: dict[Chain, ContractSource] = {}
+#: Column types of each resolved table, carried in the cache entry so the
+#: diagnostics view can show whether valid_from is a date or a timestamp.
+def _source_key(chain: Chain) -> str:
+    return f"source.{chain.value}"
 
 
-#: Column types of the last resolved balance table, for the diagnostics view.
-_COLUMN_TYPES: dict[Chain, dict[str, str]] = {}
+def _contract_key(chain: Chain) -> str:
+    return f"contracts.{chain.value}"
 
 
 async def _read_catalog(
-    client: DuneClient, *, name: str, sql: str, types_for: Chain | None = None
-) -> dict[str, set[str]]:
-    """Run a catalogue query and fold it into ``{"schema.table": {columns}}``."""
+    client: DuneClient, *, name: str, sql: str
+) -> tuple[dict[str, set[str]], dict[str, dict[str, str]]]:
+    """Run a catalogue query, returning ``({table: columns}, {table: types})``."""
     rows = await _run_sql(client, name=name, sql=sql, max_rows=2000)
     catalog: dict[str, set[str]] = {}
     types: dict[str, dict[str, str]] = {}
@@ -205,25 +207,46 @@ async def _read_catalog(
         catalog.setdefault(key, set()).add(column)
         if row.get("data_type") is not None:
             types.setdefault(key, {})[column] = str(row["data_type"])
-    if types_for is not None:
-        _COLUMN_TYPES[types_for] = {k: v for k, v in types.items()}  # type: ignore[assignment]
-    return catalog
+    return catalog, types
 
 
-async def resolve_contracts_for(
-    client: DuneClient, chain: Chain
-) -> ContractSource:
+async def resolve_for(client: DuneClient, chain: Chain) -> tuple[Source, dict]:
+    """Find the balance table for a chain, caching across workers and restarts."""
+    cached = cache.get(_source_key(chain))
+    if cached:
+        try:
+            return Source(**cached["source"]), cached.get("column_types", {})
+        except TypeError:
+            cache.drop(_source_key(chain))  # cache written by an older version
+
+    catalog, types = await _read_catalog(
+        client, name=f"DICE catalogue {chain.value}", sql=build_catalog_sql(chain)
+    )
+    source = resolve_source(catalog)
+    column_types = types.get(source.qualified, {})
+    cache.put(
+        _source_key(chain),
+        {"source": asdict(source), "column_types": column_types},
+    )
+    return source, column_types
+
+
+async def resolve_contracts_for(client: DuneClient, chain: Chain) -> ContractSource:
     """Find a table identifying contract addresses, caching the answer."""
-    cached = _CONTRACT_CACHE.get(chain)
-    if cached is not None:
-        return cached
-    catalog = await _read_catalog(
+    cached = cache.get(_contract_key(chain))
+    if cached:
+        try:
+            return ContractSource(**cached)
+        except TypeError:
+            cache.drop(_contract_key(chain))
+
+    catalog, _ = await _read_catalog(
         client,
         name=f"DICE contract catalogue {chain.value}",
         sql=build_contracts_catalog_sql(chain),
     )
     contracts = resolve_contract_source(chain, catalog)
-    _CONTRACT_CACHE[chain] = contracts
+    cache.put(_contract_key(chain), asdict(contracts))
     return contracts
 
 
@@ -240,23 +263,6 @@ async def contracts_if_needed(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-async def resolve_for(client: DuneClient, chain: Chain) -> Source:
-    """Find the balance table to read for a chain, caching the answer."""
-    cached = _SOURCE_CACHE.get(chain)
-    if cached is not None:
-        return cached
-
-    catalog = await _read_catalog(
-        client,
-        name=f"DICE catalogue {chain.value}",
-        sql=build_catalog_sql(chain),
-        types_for=chain,
-    )
-    source = resolve_source(catalog)
-    _SOURCE_CACHE[chain] = source
-    return source
-
-
 @app.get("/api/source")
 async def get_source(
     chain: Chain = Chain.ethereum,
@@ -266,10 +272,11 @@ async def get_source(
     """Report which table DICE resolved for a chain, and its column mapping."""
     key = resolve_api_key(x_dune_api_key)
     if refresh:
-        _SOURCE_CACHE.pop(chain, None)
+        cache.drop(_source_key(chain))
+        cache.drop(_contract_key(chain))
     async with DuneClient(key) as client:
         try:
-            source = await resolve_for(client, chain)
+            source, column_types = await resolve_for(client, chain)
         except SourceNotFound as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {
@@ -286,7 +293,7 @@ async def get_source(
         },
         # Whether valid_from is a date or a timestamp decides how an
         # intra-day acquisition is attributed, so show it.
-        "column_types": (_COLUMN_TYPES.get(chain) or {}).get(source.qualified, {}),
+        "column_types": column_types,
     }
 
 
@@ -300,7 +307,7 @@ async def _run_holders_query(client: DuneClient, req: HoldersRequest) -> str:
     """
     for attempt in (1, 2):
         try:
-            source = await resolve_for(client, req.chain)
+            source, _ = await resolve_for(client, req.chain)
         except SourceNotFound as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -315,7 +322,10 @@ async def _run_holders_query(client: DuneClient, req: HoldersRequest) -> str:
             await client.wait_for_execution(execution_id)
         except DuneError as exc:
             stale = "does not exist" in str(exc)
-            if attempt == 1 and stale and _SOURCE_CACHE.pop(req.chain, None):
+            if attempt == 1 and stale:
+                # Both resolutions name tables that can rotate away.
+                cache.drop(_source_key(req.chain))
+                cache.drop(_contract_key(req.chain))
                 log.warning("source for %s went stale, re-resolving", req.chain.value)
                 continue
             raise

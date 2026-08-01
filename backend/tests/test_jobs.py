@@ -97,3 +97,30 @@ def test_writing_past_the_cap_drops_the_oldest(tmp_path):
         store.put(make_result())
 
     assert store.get(oldest) is None
+
+
+def test_disk_cache_is_shared_and_expires(tmp_path):
+    from app.cache import DiskCache
+
+    cache = DiskCache(directory=tmp_path)
+    cache.put("source.ethereum", {"table": "x"})
+
+    # a second instance — i.e. another worker — sees it
+    assert DiskCache(directory=tmp_path).get("source.ethereum") == {"table": "x"}
+
+    cache.drop("source.ethereum")
+    assert cache.get("source.ethereum") is None
+
+    expired = DiskCache(directory=tmp_path, ttl_seconds=0)
+    expired.put("source.base", {"table": "y"})
+    assert expired.get("source.base") is None
+
+
+def test_disk_cache_rejects_keys_that_could_escape_the_directory(tmp_path):
+    from app.cache import DiskCache
+
+    cache = DiskCache(directory=tmp_path)
+    cache.put("../../etc/passwd", {"bad": True})
+
+    assert cache.get("../../etc/passwd") is None
+    assert not (tmp_path.parent.parent / "etc").exists()

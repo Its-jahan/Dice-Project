@@ -22,11 +22,34 @@ def utc_today() -> date:
 
 
 class Chain(str, Enum):
+    """Chains DICE can query.
+
+    Values are Dune's own schema names (``balances_<value>``), so they must
+    match the catalogue exactly — ``avalanche_c``, not ``avalanche``. A chain
+    listed here that the caller's plan cannot reach reports a clear "no
+    readable balance table" rather than failing obscurely.
+    """
+
     ethereum = "ethereum"
-    base = "base"
     arbitrum = "arbitrum"
+    avalanche_c = "avalanche_c"
+    base = "base"
+    bnb = "bnb"
+    celo = "celo"
+    flare = "flare"
+    gnosis = "gnosis"
+    hyperevm = "hyperevm"
+    ink = "ink"
+    kaia = "kaia"
+    linea = "linea"
+    mantle = "mantle"
+    monad = "monad"
     optimism = "optimism"
+    plasma = "plasma"
     polygon = "polygon"
+    sei = "sei"
+    sonic = "sonic"
+    unichain = "unichain"
     solana = "solana"
 
     @property
@@ -71,6 +94,12 @@ class HoldersRequest(BaseModel):
     def _validate(self) -> "HoldersRequest":
         if self.end_date < self.start_date:
             raise ValueError("end_date must be on or after start_date")
+        # A future start date makes the generated calendar run backwards, which
+        # Dune rejects with an opaque sequence error. Catch it here instead.
+        if self.start_date > utc_today():
+            raise ValueError(
+                f"start_date is in the future (today is {utc_today()} UTC)"
+            )
         span = (self.end_date - self.start_date).days + 1
         if span > MAX_RANGE_DAYS:
             raise ValueError(
