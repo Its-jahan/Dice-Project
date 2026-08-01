@@ -140,3 +140,41 @@ def test_qualified_name_round_trips():
         valid_to="valid_to",
     )
     assert source.qualified == "balances_base.daily_updates"
+
+
+def test_contract_source_prefers_creation_traces():
+    """Every deployed contract appears there; a decoded mapping covers less."""
+    from app.source import resolve_contract_source
+
+    source = resolve_contract_source(
+        Chain.ethereum,
+        {
+            "ethereum.creation_traces": {"address", "block_time"},
+            "contracts.contract_mapping": {"contract_address", "blockchain"},
+        },
+    )
+
+    assert source.qualified == "ethereum.creation_traces"
+    assert source.address == "address"
+    assert source.blockchain is None
+
+
+def test_contract_source_falls_back_and_notes_the_chain_column():
+    from app.source import resolve_contract_source
+
+    source = resolve_contract_source(
+        Chain.ethereum,
+        {"contracts.contract_mapping": {"contract_address", "blockchain"}},
+    )
+
+    assert source.qualified == "contracts.contract_mapping"
+    assert source.address == "contract_address"
+    assert source.blockchain == "blockchain"
+
+
+def test_contract_source_missing_fails_loudly():
+    """Silently returning contracts the caller excluded would be worse."""
+    from app.source import resolve_contract_source
+
+    with pytest.raises(SourceNotFound, match="Include smart-contract"):
+        resolve_contract_source(Chain.ethereum, {})

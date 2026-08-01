@@ -165,3 +165,67 @@ def resolve_source(catalog: dict[str, set[str]]) -> Source:
 
     scored.sort(key=lambda item: item[0])
     return scored[0][1]
+
+
+# --------------------------------------------------------------- contracts
+
+#: Ways to tell "this address is a contract", best first. creation_traces is
+#: the most complete: every contract ever deployed appears there, whereas a
+#: decoded-contract mapping only covers projects someone has decoded.
+CONTRACT_CANDIDATES = (
+    ("{chain}", "creation_traces"),
+    ("{chain}", "contracts"),
+    ("contracts", "contract_mapping"),
+)
+CONTRACT_ADDRESS_COLUMNS = ("address", "contract_address")
+
+
+@dataclass(frozen=True)
+class ContractSource:
+    """A table that says which addresses are contracts."""
+
+    schema: str
+    table: str
+    address: str
+    #: Set when the table spans chains and must be filtered by one.
+    blockchain: str | None = None
+
+    @property
+    def qualified(self) -> str:
+        return f"{self.schema}.{self.table}"
+
+
+def contract_candidates(chain: Chain) -> tuple[tuple[str, str], ...]:
+    return tuple(
+        (schema.format(chain=chain.value), table)
+        for schema, table in CONTRACT_CANDIDATES
+    )
+
+
+def resolve_contract_source(
+    chain: Chain, catalog: dict[str, set[str]]
+) -> ContractSource:
+    """Pick a table for the "exclude smart contracts" filter.
+
+    Raises :class:`SourceNotFound` when none is readable, so the option fails
+    loudly rather than silently returning contracts the caller asked to drop.
+    """
+    for schema, table in contract_candidates(chain):
+        columns = catalog.get(f"{schema}.{table}")
+        if not columns:
+            continue
+        address = _pick(columns, CONTRACT_ADDRESS_COLUMNS)
+        if not address:
+            continue
+        return ContractSource(
+            schema=schema,
+            table=table,
+            address=address,
+            blockchain="blockchain" if "blockchain" in columns else None,
+        )
+
+    raise SourceNotFound(
+        "No table available to identify smart-contract addresses on "
+        f"{chain.value}. Re-tick 'Include smart-contract addresses' to run "
+        "without that filter."
+    )

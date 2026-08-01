@@ -2,9 +2,10 @@ import pytest
 from pydantic import ValidationError
 
 from app.models import Chain, HoldersRequest
-from app.source import Source
+from app.source import ContractSource, Source
 from app.sql import (
     build_catalog_sql,
+    build_contracts_catalog_sql,
     build_query_parameters,
     build_snapshot_sql,
 )
@@ -138,15 +139,53 @@ def test_column_names_come_from_the_source_not_from_assumptions():
     assert SOL_MINT in sql
 
 
+CONTRACT_SOURCE = ContractSource(
+    schema="ethereum", table="creation_traces", address="address"
+)
+MULTICHAIN_CONTRACT_SOURCE = ContractSource(
+    schema="contracts",
+    table="contract_mapping",
+    address="contract_address",
+    blockchain="blockchain",
+)
+
+
 @pytest.mark.parametrize("source", [INTERVAL_SOURCE, DENSE_SOURCE])
-def test_contract_filter_only_joins_when_excluding_contracts(source):
-    assert "contract_mapping" not in build_snapshot_sql(
-        make(include_contracts=True), source
+def test_contract_filter_is_absent_unless_excluding_contracts(source):
+    """The default path must not depend on any contract table existing."""
+    sql = build_snapshot_sql(make(include_contracts=True), source, CONTRACT_SOURCE)
+
+    assert "creation_traces" not in sql
+    assert "NOT EXISTS" not in sql
+
+
+@pytest.mark.parametrize("source", [INTERVAL_SOURCE, DENSE_SOURCE])
+def test_contract_filter_uses_the_resolved_table_and_column(source):
+    sql = build_snapshot_sql(make(include_contracts=False), source, CONTRACT_SOURCE)
+
+    assert "NOT EXISTS" in sql
+    assert "FROM ethereum.creation_traces c" in sql
+    assert f"c.address = b.{source.address}" in sql
+    # a LEFT JOIN would fan out on CREATE2 redeploys before the filter applied
+    assert "LEFT JOIN" not in sql
+
+
+def test_multichain_contract_table_is_filtered_by_chain():
+    sql = build_snapshot_sql(
+        make(include_contracts=False), INTERVAL_SOURCE, MULTICHAIN_CONTRACT_SOURCE
     )
 
-    excluded = build_snapshot_sql(make(include_contracts=False), source)
-    assert "contract_mapping" in excluded
-    assert "cm.address IS NULL" in excluded
+    assert "c.contract_address = b.address" in sql
+    assert "c.blockchain = 'ethereum'" in sql
+
+
+def test_contracts_catalog_sql_probes_every_candidate():
+    sql = build_contracts_catalog_sql(Chain.ethereum)
+
+    assert "information_schema.columns" in sql
+    assert "table_schema = 'ethereum'" in sql
+    assert "'creation_traces'" in sql
+    assert "'contract_mapping'" in sql
 
 
 def test_catalog_sql_covers_build_schemas_and_only_candidate_tables():

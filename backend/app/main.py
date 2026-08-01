@@ -25,10 +25,17 @@ from .exporters import MEDIA_TYPES, export, filename_for
 from .holders import apply_holder_mode, build_summary, parse_rows
 from .jobs import store
 from .models import Chain, ExportFormat, HoldersRequest, HoldersResponse
-from .source import Source, SourceNotFound, resolve_source
+from .source import (
+    ContractSource,
+    Source,
+    SourceNotFound,
+    resolve_contract_source,
+    resolve_source,
+)
 from .sql import (
     DISCOVERY_LIMIT,
     build_catalog_sql,
+    build_contracts_catalog_sql,
     build_discovery_sql,
     build_query_parameters,
     build_snapshot_sql,
@@ -118,8 +125,9 @@ async def preview_sql(
             source = await resolve_for(client, req.chain)
         except SourceNotFound as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        contracts = await contracts_if_needed(client, req)
     return {
-        "sql": build_snapshot_sql(req, source),
+        "sql": build_snapshot_sql(req, source, contracts),
         "source": source.qualified,
         "shape": source.shape,
         "parameters": build_query_parameters(req),
@@ -174,9 +182,52 @@ async def discover_tables(
     }
 
 
-#: Resolved source per chain, cached for the process. Resolution costs a Dune
+#: Resolved sources per chain, cached for the process. Resolution costs a Dune
 #: execution, and the catalogue only changes when Dune rebuilds its spellbook.
 _SOURCE_CACHE: dict[Chain, Source] = {}
+_CONTRACT_CACHE: dict[Chain, ContractSource] = {}
+
+
+async def _read_catalog(
+    client: DuneClient, *, name: str, sql: str
+) -> dict[str, set[str]]:
+    """Run a catalogue query and fold it into ``{"schema.table": {columns}}``."""
+    rows = await _run_sql(client, name=name, sql=sql, max_rows=2000)
+    catalog: dict[str, set[str]] = {}
+    for row in rows:
+        key = f"{row.get('table_schema')}.{row.get('table_name')}"
+        catalog.setdefault(key, set()).add(str(row.get("column_name")))
+    return catalog
+
+
+async def resolve_contracts_for(
+    client: DuneClient, chain: Chain
+) -> ContractSource:
+    """Find a table identifying contract addresses, caching the answer."""
+    cached = _CONTRACT_CACHE.get(chain)
+    if cached is not None:
+        return cached
+    catalog = await _read_catalog(
+        client,
+        name=f"DICE contract catalogue {chain.value}",
+        sql=build_contracts_catalog_sql(chain),
+    )
+    contracts = resolve_contract_source(chain, catalog)
+    _CONTRACT_CACHE[chain] = contracts
+    return contracts
+
+
+async def contracts_if_needed(
+    client: DuneClient, req: HoldersRequest
+) -> ContractSource | None:
+    """Resolve the contract table only when the request actually filters on it."""
+    if req.include_contracts:
+        return None
+    try:
+        return await resolve_contracts_for(client, req.chain)
+    except SourceNotFound as exc:
+        # Failing loudly beats returning the contracts they asked to exclude.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 async def resolve_for(client: DuneClient, chain: Chain) -> Source:
@@ -185,17 +236,11 @@ async def resolve_for(client: DuneClient, chain: Chain) -> Source:
     if cached is not None:
         return cached
 
-    rows = await _run_sql(
+    catalog = await _read_catalog(
         client,
         name=f"DICE catalogue {chain.value}",
         sql=build_catalog_sql(chain),
-        max_rows=2000,
     )
-    catalog: dict[str, set[str]] = {}
-    for row in rows:
-        key = f"{row.get('table_schema')}.{row.get('table_name')}"
-        catalog.setdefault(key, set()).add(str(row.get("column_name")))
-
     source = resolve_source(catalog)
     _SOURCE_CACHE[chain] = source
     return source
@@ -245,10 +290,11 @@ async def _run_holders_query(client: DuneClient, req: HoldersRequest) -> str:
         except SourceNotFound as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+        contracts = await contracts_if_needed(client, req)
         query_id = await client.create_query(
             name=f"DICE holders {req.chain.value} {req.token_address[:10]} "
             f"{req.start_date}..{req.end_date}",
-            query_sql=build_snapshot_sql(req, source),
+            query_sql=build_snapshot_sql(req, source, contracts),
         )
         execution_id = await client.execute_query(query_id)
         try:

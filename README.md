@@ -191,8 +191,11 @@ the curated balance tables are not on every Dune tier.
   protocol-specific queries.
 - Rebasing, wrapped and proxy tokens with unusual accounting may need a bespoke
   query; the generic snapshot query assumes standard balance semantics.
-- `include_contracts=false` filters via `contracts.contract_mapping`, so it only
-  removes contracts Dune has decoded.
+- `include_contracts=false` resolves a contract-identifying table from the
+  catalogue, preferring `<chain>.creation_traces` — every deployed contract
+  appears there, whereas a decoded-contract mapping only covers projects
+  someone has decoded. If no such table is readable the request fails rather
+  than quietly returning the contracts you asked to exclude.
 - A single job is capped at 366 days and `DICE_MAX_ROWS` rows.
 
 ## Tests

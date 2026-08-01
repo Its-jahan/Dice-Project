@@ -34,7 +34,13 @@ from __future__ import annotations
 import re
 
 from .models import Chain, HoldersRequest
-from .source import TABLE_PREFERENCE, Source, schema_pattern
+from .source import (
+    TABLE_PREFERENCE,
+    ContractSource,
+    Source,
+    contract_candidates,
+    schema_pattern,
+)
 
 # Sinks that hold tokens but are never "holders" in any meaningful sense.
 EVM_BURN_ADDRESSES = (
@@ -85,7 +91,27 @@ LIMIT 2000
 """.strip()
 
 
-def build_snapshot_sql(req: HoldersRequest, source: Source) -> str:
+def build_contracts_catalog_sql(chain: Chain) -> str:
+    """Columns of any table that could identify smart-contract addresses."""
+    pairs = " OR ".join(
+        f"(table_schema = {_quote(schema)} AND table_name = {_quote(table)})"
+        for schema, table in contract_candidates(chain)
+    )
+    return f"""
+-- DICE: readable contract-identifying tables for {chain.value}
+SELECT table_schema, table_name, column_name
+FROM information_schema.columns
+WHERE {pairs}
+ORDER BY table_schema, table_name, column_name
+LIMIT 500
+""".strip()
+
+
+def build_snapshot_sql(
+    req: HoldersRequest,
+    source: Source,
+    contracts: ContractSource | None = None,
+) -> str:
     """Return DuneSQL yielding ``wallet_address, snapshot_date, balance``.
 
     Every value interpolated here has already been validated by
@@ -95,8 +121,8 @@ def build_snapshot_sql(req: HoldersRequest, source: Source) -> str:
     carries free text from the caller.
     """
     if source.shape == "interval":
-        return _interval_sql(req, source)
-    return _daily_sql(req, source)
+        return _interval_sql(req, source, contracts)
+    return _daily_sql(req, source, contracts)
 
 
 def _calendar_cte(req: HoldersRequest) -> str:
@@ -117,25 +143,38 @@ def _burn_addresses(req: HoldersRequest) -> tuple[str, ...]:
     return SOLANA_BURN_ADDRESSES if req.chain is Chain.solana else EVM_BURN_ADDRESSES
 
 
-def _contract_filter(req: HoldersRequest, src: Source) -> tuple[str, str]:
-    """Optional LEFT JOIN that drops known smart-contract addresses.
+def _contract_filter(
+    req: HoldersRequest, src: Source, contracts: ContractSource | None
+) -> str:
+    """Optional predicate dropping smart-contract addresses.
 
-    Only applied when the caller unticks "include smart-contract addresses",
-    so the default path never depends on contracts.contract_mapping existing.
-    It filters via Dune's decoded-contract mapping, so it removes only
-    contracts Dune knows about.
+    Applied only when the caller unticks "include smart-contract addresses",
+    so the default path depends on no extra table. The table and its column
+    names are resolved from the catalogue, like the balance source — an
+    earlier hard-coded ``contracts.contract_mapping.address`` did not exist
+    and failed at execution time.
+
+    Written as NOT EXISTS rather than a LEFT JOIN: an address redeployed via
+    CREATE2 appears in creation_traces more than once, and a join would
+    multiply rows before the filter removed them.
     """
-    if req.include_contracts:
-        return "", ""
-    join = (
-        "\n  LEFT JOIN contracts.contract_mapping cm"
-        f"\n         ON cm.blockchain = {_quote(req.chain.value)}"
-        f"\n        AND cm.address = b.{src.address}"
+    if req.include_contracts or contracts is None:
+        return ""
+    predicates = [f"c.{contracts.address} = b.{src.address}"]
+    if contracts.blockchain:
+        predicates.append(f"c.{contracts.blockchain} = {_quote(req.chain.value)}")
+    conditions = "\n          AND ".join(predicates)
+    return (
+        f"NOT EXISTS (\n"
+        f"        SELECT 1 FROM {contracts.qualified} c\n"
+        f"        WHERE {conditions}\n"
+        f"      )"
     )
-    return join, "cm.address IS NULL"
 
 
-def _interval_sql(req: HoldersRequest, src: Source) -> str:
+def _interval_sql(
+    req: HoldersRequest, src: Source, contracts: ContractSource | None
+) -> str:
     """Sparse table: expand each ``[valid_from, valid_to)`` over the calendar."""
     start = f"date {_quote(req.start_date.isoformat())}"
     end = f"date {_quote(req.effective_end_date.isoformat())}"
@@ -157,7 +196,7 @@ def _interval_sql(req: HoldersRequest, src: Source) -> str:
             f"b.{src.address} NOT IN "
             f"({_address_list(req.chain, _burn_addresses(req))})"
         )
-    contract_join, contract_filter = _contract_filter(req, src)
+    contract_filter = _contract_filter(req, src, contracts)
     if contract_filter:
         filters.append(contract_filter)
 
@@ -173,13 +212,15 @@ SELECT
     cal.day AS snapshot_date,
     b.{src.balance} AS balance
 FROM {src.qualified} b
-CROSS JOIN calendar cal{contract_join}
+CROSS JOIN calendar cal
 WHERE {_where(filters, "")}
 ORDER BY cal.day, b.{src.balance} DESC
 """.strip()
 
 
-def _daily_sql(req: HoldersRequest, src: Source) -> str:
+def _daily_sql(
+    req: HoldersRequest, src: Source, contracts: ContractSource | None
+) -> str:
     """Dense table: one row per address, token and day already.
 
     Balances are summed per address and day. On Solana that is essential —
@@ -197,7 +238,7 @@ def _daily_sql(req: HoldersRequest, src: Source) -> str:
             f"b.{src.address} NOT IN "
             f"({_address_list(req.chain, _burn_addresses(req))})"
         )
-    contract_join, contract_filter = _contract_filter(req, src)
+    contract_filter = _contract_filter(req, src, contracts)
     if contract_filter:
         filters.append(contract_filter)
 
@@ -216,7 +257,7 @@ FROM (
         b.{src.token} AS token_address,
         b.{src.day} AS snapshot_date,
         SUM(b.{src.balance}) AS balance
-    FROM {src.qualified} b{contract_join}
+    FROM {src.qualified} b
     WHERE {_where(filters, "    ")}
     GROUP BY 1, 2, 3
 )
