@@ -25,13 +25,13 @@ from .exporters import MEDIA_TYPES, export, filename_for
 from .holders import apply_holder_mode, build_summary, parse_rows
 from .jobs import store
 from .models import Chain, ExportFormat, HoldersRequest, HoldersResponse
+from .source import Source, SourceNotFound, resolve_source
 from .sql import (
     DISCOVERY_LIMIT,
-    build_columns_sql,
+    build_catalog_sql,
     build_discovery_sql,
     build_query_parameters,
     build_snapshot_sql,
-    table_for,
 )
 
 log = logging.getLogger(__name__)
@@ -102,10 +102,26 @@ async def validate_key(x_dune_api_key: ApiKeyHeader = None) -> dict[str, bool]:
 
 
 @app.post("/api/sql")
-async def preview_sql(req: Annotated[HoldersRequest, Body()]) -> dict[str, object]:
-    """Show the DuneSQL DICE would run. No key needed, no credits spent."""
+async def preview_sql(
+    req: Annotated[HoldersRequest, Body()],
+    x_dune_api_key: ApiKeyHeader = None,
+) -> dict[str, object]:
+    """Show the DuneSQL DICE would run.
+
+    Needs a key now: the table and its column names are discovered from the
+    catalogue rather than assumed, so the preview would otherwise be a guess.
+    Resolution is cached, so repeat previews cost nothing.
+    """
+    key = resolve_api_key(x_dune_api_key)
+    async with DuneClient(key) as client:
+        try:
+            source = await resolve_for(client, req.chain)
+        except SourceNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {
-        "sql": build_snapshot_sql(req),
+        "sql": build_snapshot_sql(req, source),
+        "source": source.qualified,
+        "shape": source.shape,
         "parameters": build_query_parameters(req),
         "execution_mode": "saved_query" if settings.dune_query_id else "ad_hoc",
     }
@@ -155,34 +171,97 @@ async def discover_tables(
         # truncated list read as "these are all the tables that exist".
         "truncated": len(tables) >= DISCOVERY_LIMIT,
         "tables": tables,
-        "expected_by_dice": sorted({table_for(chain) for chain in Chain}),
     }
 
 
-@app.get("/api/columns")
-async def describe_source_table(
+#: Resolved source per chain, cached for the process. Resolution costs a Dune
+#: execution, and the catalogue only changes when Dune rebuilds its spellbook.
+_SOURCE_CACHE: dict[Chain, Source] = {}
+
+
+async def resolve_for(client: DuneClient, chain: Chain) -> Source:
+    """Find the balance table to read for a chain, caching the answer."""
+    cached = _SOURCE_CACHE.get(chain)
+    if cached is not None:
+        return cached
+
+    rows = await _run_sql(
+        client,
+        name=f"DICE catalogue {chain.value}",
+        sql=build_catalog_sql(chain),
+        max_rows=2000,
+    )
+    catalog: dict[str, set[str]] = {}
+    for row in rows:
+        key = f"{row.get('table_schema')}.{row.get('table_name')}"
+        catalog.setdefault(key, set()).add(str(row.get("column_name")))
+
+    source = resolve_source(catalog)
+    _SOURCE_CACHE[chain] = source
+    return source
+
+
+@app.get("/api/source")
+async def get_source(
     chain: Chain = Chain.ethereum,
+    refresh: bool = False,
     x_dune_api_key: ApiKeyHeader = None,
 ) -> dict[str, object]:
-    """Report the real column names of the balance table DICE reads.
-
-    Dune's balance tables are in Open Beta and have been renamed before. When a
-    query starts failing with "table/column does not exist", this says what the
-    source actually looks like today instead of leaving you to guess.
-    """
+    """Report which table DICE resolved for a chain, and its column mapping."""
     key = resolve_api_key(x_dune_api_key)
+    if refresh:
+        _SOURCE_CACHE.pop(chain, None)
     async with DuneClient(key) as client:
-        rows = await _run_sql(
-            client,
-            name=f"DICE schema probe {chain.value}",
-            sql=build_columns_sql(chain),
-            max_rows=1,
-        )
+        try:
+            source = await resolve_for(client, chain)
+        except SourceNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {
-        "table": table_for(chain),
-        "columns": sorted(rows[0].keys()) if rows else [],
-        "sample_row": rows[0] if rows else None,
+        "chain": chain.value,
+        "table": source.qualified,
+        "shape": source.shape,
+        "columns": {
+            "address": source.address,
+            "token": source.token,
+            "balance": source.balance,
+            "day": source.day,
+            "valid_from": source.valid_from,
+            "valid_to": source.valid_to,
+        },
     }
+
+
+async def _run_holders_query(client: DuneClient, req: HoldersRequest) -> str:
+    """Build and execute the snapshot query, re-resolving once if it goes stale.
+
+    Dune publishes the balance models into rotating ``__spellbook_sqlmesh_NNN``
+    build schemas, so a source cached earlier in the process can stop existing
+    when Dune rebuilds. Rather than surface "table does not exist" to the user,
+    drop the cached answer, resolve again and retry once.
+    """
+    for attempt in (1, 2):
+        try:
+            source = await resolve_for(client, req.chain)
+        except SourceNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        query_id = await client.create_query(
+            name=f"DICE holders {req.chain.value} {req.token_address[:10]} "
+            f"{req.start_date}..{req.end_date}",
+            query_sql=build_snapshot_sql(req, source),
+        )
+        execution_id = await client.execute_query(query_id)
+        try:
+            await client.wait_for_execution(execution_id)
+        except DuneError as exc:
+            stale = "does not exist" in str(exc)
+            if attempt == 1 and stale and _SOURCE_CACHE.pop(req.chain, None):
+                log.warning("source for %s went stale, re-resolving", req.chain.value)
+                continue
+            raise
+        return execution_id
+
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 @app.post("/api/holders")
@@ -197,16 +276,11 @@ async def get_holders(
         if settings.dune_query_id:
             query_id = settings.dune_query_id
             parameters = build_query_parameters(req)
+            execution_id = await client.execute_query(query_id, parameters=parameters)
+            await client.wait_for_execution(execution_id)
         else:
-            query_id = await client.create_query(
-                name=f"DICE holders {req.chain.value} {req.token_address[:10]} "
-                f"{req.start_date}..{req.end_date}",
-                query_sql=build_snapshot_sql(req),
-            )
-            parameters = None
+            execution_id = await _run_holders_query(client, req)
 
-        execution_id = await client.execute_query(query_id, parameters=parameters)
-        await client.wait_for_execution(execution_id)
         rows, truncated = await client.fetch_results(execution_id)
 
     snapshots = apply_holder_mode(parse_rows(rows, req), req)

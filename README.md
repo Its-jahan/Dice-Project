@@ -101,9 +101,9 @@ HTML is a standalone, filterable page with no external assets.
 | --- | --- |
 | `GET /api/config` | UI bootstrap — key presence, execution mode, row caps. |
 | `POST /api/key/validate` | Check a Dune key. Header: `X-Dune-Api-Key`. |
-| `POST /api/sql` | Preview the generated DuneSQL. No key, no credits. |
-| `GET /api/discover?pattern=balance` | Which balance tables your Dune key can actually reach. |
-| `GET /api/columns?chain=ethereum` | Real column names of the source balance table (Open Beta escape hatch). |
+| `POST /api/sql` | Preview the generated DuneSQL. Needs a key, since the table is resolved from the catalogue. |
+| `GET /api/source?chain=ethereum` | Which table DICE resolved, its shape and column mapping. Add `refresh=true` to re-resolve. |
+| `GET /api/discover` | Raw listing of curated balance tables the key can reach. |
 | `POST /api/holders` | Run the query; returns a preview + `job_id`. |
 | `GET /api/export/{job_id}?format=csv\|xlsx\|json\|html` | Download the full result. |
 | `GET /api/health` | Liveness. |
@@ -138,38 +138,41 @@ paid plan. Use `POST /api/sql` to get SQL to paste into that saved query.
 
 ## Chains and source tables
 
-EVM (Ethereum, Base, Arbitrum, Optimism, Polygon) reads
-`balances_<chain>.daily_updates` — the chain lives in the schema name, so there
-is no `blockchain` column to filter on.
+DICE does **not** hard-code a Dune table name, because there isn't a stable one.
+Reading a live Dune account's catalogue shows all of this at once:
 
-That table is **sparse**: one row per balance change, carrying a validity
-interval `[valid_from, valid_to)` rather than one row per day. A wallet that
-bought before the window and held through it is a *single* row spanning the
-whole range. DICE expands those intervals against a generated calendar to get
-one row per day — without that step the steady holders, the ones this tool
-exists to find, would each collapse to a single row.
+- the plain `balances_ethereum` schema holds only internal tables —
+  `stg_daily_updates`, `raw_updates`, `triggers` — and no `daily_updates`;
+- the usable table sits in a rotating build schema,
+  `balances_ethereum__spellbook_sqlmesh_490.daily_updates`, whose number
+  changes when Dune rebuilds;
+- other chains expose an older dense shape instead, `balances_polygon.erc20_day`;
+- and what any given API key can see depends on its plan.
 
-Solana reads `solana_utils.daily_balances`, which is already dense (one row per
-address, mint and day), aggregated **per owner** — a Solana wallet can control
-several token accounts for one mint, and summing them keeps one holder from
-appearing as several fragmented rows.
+So DICE asks `information_schema` what exists, picks the best candidate, and
+adapts its SQL to that table's columns. Preference order is by table
+semantics first (`daily_updates` over `erc20_day` over `stg_daily_updates`),
+then plain schemas over build schemas, then the highest build number.
 
-### When Dune says the table does not exist
+Two shapes are handled:
 
-Dune's balance tables are Open Beta: they get renamed, and some are gated
-behind plan tiers. Both failures look identical from the outside —
-*"does not exist or it is private"* — so don't guess. Click **Check data
-source** in the UI (or `GET /api/discover?pattern=balance`). It reads
-`information_schema`, which lists only what your key is entitled to, and prints
-what DICE expects beside what you can actually reach:
+| Shape | Table looks like | What DICE does |
+| --- | --- | --- |
+| `interval` | sparse rows with `[valid_from, valid_to)` | cross joins a generated calendar to expand each interval into one row per day |
+| `daily` | already one row per address, token and day | sums per address and day |
 
-- the table is listed under a *different name* → upstream rename; update
-  `backend/app/sql.py`, the only file that needs editing.
-- nothing relevant is listed at all → your Dune plan does not include these
-  tables; the fix is a plan change, not a code change.
+The interval expansion is the whole point. A wallet that bought before the
+window and held through it is a *single* row spanning the range — collapse that
+and you lose precisely the steady holders this tool exists to find.
 
-`GET /api/columns?chain=ethereum` then confirms the real column names of
-whichever table you settle on.
+Because build schemas rotate, a resolved source can go stale mid-process. On a
+"table does not exist" failure DICE drops the cached resolution, resolves
+again and retries once, rather than surfacing the error.
+
+Click **Check data source** in the UI (or `GET /api/source?chain=ethereum`) to
+see which table was chosen and how its columns were mapped. If nothing is
+readable at all, that is reported as a plan problem rather than a code one —
+the curated balance tables are not on every Dune tier.
 
 ## Known limits
 

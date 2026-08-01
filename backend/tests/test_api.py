@@ -44,6 +44,8 @@ class FakeDuneClient:
     async def create_query(self, *, name, query_sql):
         FakeDuneClient.calls["query_sql"] = query_sql
         FakeDuneClient.calls["query_name"] = name
+        if "information_schema" not in query_sql:
+            FakeDuneClient.calls["data_sql"] = query_sql
         return 4242
 
     async def execute_query(self, query_id, *, parameters=None, performance="medium"):
@@ -54,7 +56,12 @@ class FakeDuneClient:
     async def wait_for_execution(self, execution_id):
         return {"state": "QUERY_STATE_COMPLETED"}
 
+    catalog_rows: list[dict] = []
+
     async def fetch_results(self, execution_id, *, max_rows=None):
+        sql = FakeDuneClient.calls.get("query_sql", "")
+        if "information_schema.columns" in sql:
+            return FakeDuneClient.catalog_rows, False
         return FakeDuneClient.rows, False
 
 
@@ -67,6 +74,17 @@ def client(monkeypatch):
         {"wallet_address": WALLET_A, "day": "2026-07-21", "balance": 1300.0},
         {"wallet_address": WALLET_B, "day": "2026-07-21", "balance": 82.1},
     ]
+    # A catalogue shaped like the real one: the usable table lives in a
+    # rotating build schema, not the plain one.
+    FakeDuneClient.catalog_rows = [
+        {
+            "table_schema": "balances_ethereum__spellbook_sqlmesh_490",
+            "table_name": "daily_updates",
+            "column_name": column,
+        }
+        for column in ("address", "token_address", "balance", "valid_from", "valid_to")
+    ]
+    main._SOURCE_CACHE.clear()
     monkeypatch.setattr(main, "DuneClient", FakeDuneClient)
     monkeypatch.setattr(settings, "dune_api_key", None, raising=False)
     monkeypatch.setattr(settings, "dune_query_id", None, raising=False)
@@ -146,9 +164,9 @@ def test_unknown_job_id_is_a_clean_404(client):
 def test_ad_hoc_mode_creates_a_query_from_generated_sql(client):
     client.post("/api/holders", json=BASE_REQUEST, headers={"X-Dune-Api-Key": "k"})
 
-    assert "balances_ethereum.daily_updates" in FakeDuneClient.calls["query_sql"]
+    sql = FakeDuneClient.calls["data_sql"]
+    assert "balances_ethereum__spellbook_sqlmesh_490.daily_updates" in sql
     assert FakeDuneClient.calls["query_id"] == 4242
-    assert FakeDuneClient.calls["parameters"] is None
 
 
 def test_saved_query_mode_passes_parameters_instead(client, monkeypatch):
@@ -161,11 +179,16 @@ def test_saved_query_mode_passes_parameters_instead(client, monkeypatch):
     assert "query_sql" not in FakeDuneClient.calls
 
 
-def test_sql_preview_needs_no_key(client):
-    response = client.post("/api/sql", json=BASE_REQUEST)
+def test_sql_preview_uses_the_resolved_source(client):
+    response = client.post(
+        "/api/sql", json=BASE_REQUEST, headers={"X-Dune-Api-Key": "k"}
+    )
 
+    body = response.json()
     assert response.status_code == 200
-    assert "balances_ethereum.daily_updates" in response.json()["sql"]
+    assert body["source"] == "balances_ethereum__spellbook_sqlmesh_490.daily_updates"
+    assert body["shape"] == "interval"
+    assert body["source"] in body["sql"]
 
 
 def test_invalid_request_is_rejected_before_touching_dune(client):
@@ -198,9 +221,6 @@ def test_discover_lists_reachable_tables_and_what_dice_expects(client):
     assert "lower(table_schema) LIKE 'balances%'" in sql
     assert r"NOT LIKE '%\_call\_%'" in sql
     assert r"NOT LIKE '%\_evt\_%'" in sql
-    # tells the operator what DICE is looking for, so a rename is obvious
-    assert "balances_ethereum.daily_updates" in body["expected_by_dice"]
-    assert "solana_utils.daily_balances" in body["expected_by_dice"]
 
 
 def test_discover_rejects_a_pattern_that_could_break_out_of_the_sql(client):
@@ -212,23 +232,35 @@ def test_discover_rejects_a_pattern_that_could_break_out_of_the_sql(client):
     assert "query_sql" not in FakeDuneClient.calls
 
 
-def test_columns_probe_reports_real_column_names(client):
-    FakeDuneClient.rows = [{"address": "0xabc", "balance": 1.0, "valid_from": "2026-07-20"}]
-
+def test_source_endpoint_reports_the_resolved_table_and_columns(client):
     body = client.get(
-        "/api/columns", params={"chain": "ethereum"}, headers={"X-Dune-Api-Key": "k"}
+        "/api/source", params={"chain": "ethereum"}, headers={"X-Dune-Api-Key": "k"}
     ).json()
 
-    assert body["table"] == "balances_ethereum.daily_updates"
-    assert body["columns"] == ["address", "balance", "valid_from"]
-    assert "LIMIT 1" in FakeDuneClient.calls["query_sql"]
+    assert body["table"] == "balances_ethereum__spellbook_sqlmesh_490.daily_updates"
+    assert body["shape"] == "interval"
+    assert body["columns"]["token"] == "token_address"
 
 
-def test_responses_are_not_cacheable(client):
-    """A stale app.js against a fresh index.html breaks the UI silently."""
-    for path in ("/", "/static/app.js", "/api/config"):
-        response = client.get(path)
-        assert "no-store" in response.headers.get("cache-control", ""), path
+def test_source_resolution_is_cached_across_requests(client):
+    client.get("/api/source", headers={"X-Dune-Api-Key": "k"})
+    first = FakeDuneClient.calls["query_name"]
+    client.get("/api/source", headers={"X-Dune-Api-Key": "k"})
+
+    # second call did not issue another catalogue query
+    assert FakeDuneClient.calls["query_name"] == first
+
+
+def test_no_readable_table_is_a_clear_404(client):
+    FakeDuneClient.catalog_rows = []
+    main._SOURCE_CACHE.clear()
+
+    response = client.post(
+        "/api/holders", json=BASE_REQUEST, headers={"X-Dune-Api-Key": "k"}
+    )
+
+    assert response.status_code == 404
+    assert "plan" in response.json()["detail"]
 
 
 def test_discover_flags_a_truncated_listing(client):

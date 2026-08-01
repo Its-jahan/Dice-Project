@@ -188,23 +188,27 @@ async function diagnose() {
     return;
   }
   await withBusy($("diagnoseBtn"), async () => {
-    setStatus("runStatus", "Asking Dune which balance tables your key can see…", "");
+    setStatus("runStatus", "Asking Dune which balance table to read…", "");
     try {
-      // No pattern: the backend searches Dune's curated balance schemas.
-      // A free-text search drowns in per-contract decoded tables.
-      const data = await api("/api/discover");
-      const reachable = new Set(data.tables);
+      // Ask what DICE actually resolved for this chain, rather than listing
+      // the whole catalogue — the resolver already made the decision.
+      const chain = $("chain").value;
+      const data = await api(
+        `/api/source?chain=${encodeURIComponent(chain)}&refresh=true`,
+      );
+      const cols = data.columns;
       const lines = [
-        `Curated balance tables your key can reach: ${data.count}` +
-          (data.truncated ? " (list truncated)" : ""),
+        `Chain:  ${data.chain}`,
+        `Table:  ${data.table}`,
+        `Shape:  ${data.shape}` +
+          (data.shape === "interval"
+            ? "  (sparse [valid_from, valid_to) — expanded per day)"
+            : "  (already one row per day)"),
         "",
-        "What DICE expects:",
-        ...data.expected_by_dice.map(
-          (t) => `  ${reachable.has(t) ? "OK     " : "MISSING"}  ${t}`,
-        ),
-        "",
-        "All matching tables:",
-        ...(data.tables.length ? data.tables.map((t) => `  ${t}`) : ["  (none)"]),
+        "Column mapping:",
+        ...Object.entries(cols)
+          .filter(([, value]) => value)
+          .map(([role, value]) => `  ${role.padEnd(11)}${value}`),
       ];
       $("sqlOut").textContent = lines.join("\n");
       $("sqlCard").classList.remove("hidden");
