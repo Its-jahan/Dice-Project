@@ -26,6 +26,7 @@ import asyncio
 import json
 import logging
 import math
+import re
 from datetime import date, datetime, timezone
 from typing import Any, Iterable
 
@@ -455,12 +456,110 @@ def _short_address(address: str) -> str:
     return address if len(address) <= 14 else f"{address[:6]}…{address[-4:]}"
 
 
+#: Channels and supergroups carry a ``-100``-prefixed id. People routinely
+#: paste the bare internal number (from a t.me/c/ link or a helper bot), which
+#: Telegram then rejects with an unhelpful "chat not found".
+_TME_INVITE_RE = re.compile(r"^(?:https?://)?t\.me/c/(\d+)")
+_TME_PUBLIC_RE = re.compile(r"^(?:https?://)?t\.me/(?:s/)?([A-Za-z]\w{3,})/?$")
+
+
+def normalize_chat_id(raw: str) -> str:
+    """Turn the forms people actually paste into what the Bot API expects.
+
+    ``https://t.me/mychannel`` → ``@mychannel``;
+    ``https://t.me/c/1234567890/12`` → ``-1001234567890``.
+    Anything already in a valid shape (``@name``, ``-100…``, a bare user id)
+    is returned untouched — guessing at a bare number is left to
+    :func:`send_telegram_message`, which can test it against Telegram.
+    """
+    value = (raw or "").strip()
+    if not value:
+        return value
+    invite = _TME_INVITE_RE.match(value)
+    if invite:
+        return f"-100{invite.group(1)}"
+    public = _TME_PUBLIC_RE.match(value)
+    if public:
+        return f"@{public.group(1)}"
+    return value
+
+
+def _describe_telegram_error(status: int, payload: dict[str, Any], chat_id: str) -> str:
+    """Translate a Bot API rejection into the fix for it."""
+    description = str(payload.get("description") or f"HTTP {status}")
+    lowered = description.lower()
+
+    if "chat not found" in lowered:
+        return (
+            f"{description} — Telegram cannot see chat “{chat_id}”. For a "
+            "channel the id must be the -100… form (e.g. -1001234567890), and "
+            "the bot has to be added to the channel first. A public channel "
+            "can also be addressed as @channelusername."
+        )
+    if "not enough rights" in lowered or "need administrator" in lowered:
+        return (
+            f"{description} — the bot is in the channel but cannot post. Make "
+            "it an administrator with the “Post Messages” permission."
+        )
+    if "bot is not a member" in lowered or "bot was kicked" in lowered:
+        return (
+            f"{description} — add the bot to the channel and make it an "
+            "administrator."
+        )
+    if status == 401 or "unauthorized" in lowered:
+        return (
+            f"{description} — the bot token is wrong or was revoked. Get a "
+            "fresh one from @BotFather."
+        )
+    if "can't parse" in lowered or "chat_id is empty" in lowered:
+        return f"{description} — the chat id is malformed."
+    return f"Telegram answered {status}: {description}"
+
+
+async def describe_telegram_bot() -> str | None:
+    """The configured bot's @username via getMe, or None if it cannot be read.
+
+    Knowing which bot to add as a channel administrator is half the setup, and
+    a token holds no hint of its own name.
+    """
+    token, _ = db.telegram_credentials()
+    if not token:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(f"https://api.telegram.org/bot{token}/getMe")
+        payload = response.json()
+    except (httpx.HTTPError, ValueError):
+        return None
+    if not payload.get("ok"):
+        return None
+    return (payload.get("result") or {}).get("username")
+
+
+async def _post_message(
+    client: httpx.AsyncClient, token: str, chat_id: str, text: str
+) -> tuple[bool, int, dict[str, Any]]:
+    response = await client.post(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
+    )
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {"description": response.text[:200]}
+    return response.status_code < 400, response.status_code, payload
+
+
 async def send_telegram_message(text: str) -> str | None:
     """Send one Telegram message; return an error description or None on success.
 
     Credentials come from the UI-saved settings, falling back to the
     environment. Callers decide whether a failure matters: signal pushes log
     and continue, the settings "send test" endpoint reports it to the user.
+
+    A bare numeric chat id that Telegram does not recognise is retried once
+    with the ``-100`` channel prefix; if that works the corrected id is saved,
+    so the common "pasted the channel's internal number" mistake fixes itself.
     """
     token, chat_id = db.telegram_credentials()
     if not token or not chat_id:
@@ -468,20 +567,26 @@ async def send_telegram_message(text: str) -> str | None:
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                json={
-                    "chat_id": chat_id,
-                    "text": text,
-                    "disable_web_page_preview": True,
-                },
-            )
+            ok, status, payload = await _post_message(client, token, chat_id, text)
+            if ok:
+                return None
+
+            description = str(payload.get("description") or "").lower()
+            retryable = chat_id.lstrip("-").isdigit() and not chat_id.startswith("-100")
+            if "chat not found" in description and retryable:
+                candidate = f"-100{chat_id.lstrip('-')}"
+                ok, status, payload = await _post_message(
+                    client, token, candidate, text
+                )
+                if ok:
+                    db.set_setting("telegram_chat_id", candidate)
+                    log.info("corrected Telegram chat id to the channel form")
+                    return None
+                chat_id = candidate
     except httpx.HTTPError as exc:
         return f"could not reach Telegram: {exc}"
-    if response.status_code >= 400:
-        detail = response.text[:200]
-        return f"Telegram answered {response.status_code}: {detail}"
-    return None
+
+    return _describe_telegram_error(status, payload, chat_id)
 
 
 async def send_signal_notification(
@@ -587,6 +692,8 @@ __all__ = [
     "parse_trade_rows",
     "run_monitor",
     "run_to_out",
+    "describe_telegram_bot",
+    "normalize_chat_id",
     "scheduler_loop",
     "send_signal_notification",
     "send_telegram_message",

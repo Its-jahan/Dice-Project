@@ -214,7 +214,8 @@ async def save_notification_settings(
         else:
             db.delete_setting("telegram_bot_token")
     if "chat_id" in body:
-        chat_id = str(body.get("chat_id") or "").strip()
+        # Accept t.me links and other pasted forms, not just the raw id.
+        chat_id = monitor.normalize_chat_id(str(body.get("chat_id") or ""))
         if chat_id:
             db.set_setting("telegram_chat_id", chat_id)
         else:
@@ -224,12 +225,22 @@ async def save_notification_settings(
 
 @app.post("/api/settings/notifications/test")
 async def test_notification() -> dict[str, object]:
+    """Send a test message, naming the bot so channel setup is unambiguous."""
+    bot = await monitor.describe_telegram_bot()
     error = await monitor.send_telegram_message(
         "DICE test message — signal alerts will arrive in this chat."
     )
     if error:
-        raise HTTPException(status_code=502, detail=error)
-    return {"sent": True}
+        hint = (
+            f" The bot is @{bot}; a channel must have it added as an "
+            "administrator with permission to post."
+            if bot
+            else ""
+        )
+        raise HTTPException(status_code=502, detail=error + hint)
+    # The chat id may have been corrected during the send; report what stuck.
+    _, chat_id = db.telegram_credentials()
+    return {"sent": True, "bot_username": bot, "chat_id": chat_id}
 
 
 # ---------------------------------------------------------- dune maintenance

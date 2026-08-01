@@ -330,12 +330,24 @@
         <span id="tgBadge" class="badge rounded-pill text-bg-secondary">Off</span>
       </div>
       <div class="card-body">
-        <p class="form-text mt-0 mb-3">
-          New and strengthened signals are pushed to a Telegram chat. Create a bot with
-          <strong>@BotFather</strong>, paste its token here, then the chat id that
-          should receive alerts (message <strong>@userinfobot</strong> to find yours,
-          and send your bot one message first so it can reach you).
+        <p class="form-text mt-0 mb-2">
+          New and strengthened signals are pushed to Telegram. Create a bot with
+          <strong>@BotFather</strong> and paste its token here, then the destination:
         </p>
+        <ul class="form-text mt-0 mb-3 ps-3">
+          <li>
+            <strong>A channel</strong> — add the bot to the channel and make it an
+            <strong>administrator</strong> with “Post Messages” (a plain member cannot
+            post). Then use <code>@channelusername</code> for a public channel, or the
+            <code>-100…</code> id for a private one. Pasting a
+            <code>t.me/…</code> link or the bare internal number works too — it gets
+            converted.
+          </li>
+          <li>
+            <strong>A private chat</strong> — message the bot once, then use your own
+            numeric id (from <strong>@userinfobot</strong>).
+          </li>
+        </ul>
         <div class="row g-2 align-items-center">
           <div class="col-lg-5">
             <input id="tgToken" type="password" class="form-control" autocomplete="off"
@@ -343,7 +355,7 @@
           </div>
           <div class="col-lg-3">
             <input id="tgChat" class="form-control" spellcheck="false"
-                   placeholder="Chat id (e.g. 123456789)">
+                   placeholder="@channelusername or -1001234567890">
           </div>
           <div class="col-auto">
             <button type="button" id="tgSave" class="btn btn-primary">Save</button>

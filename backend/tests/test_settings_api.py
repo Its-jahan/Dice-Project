@@ -151,12 +151,29 @@ def test_notification_test_endpoint_reports_send_result(client, monkeypatch):
         return "Telegram answered 403: bot blocked"
 
     monkeypatch.setattr(monitor_module, "send_telegram_message", ok)
-    assert client.post("/api/settings/notifications/test").json() == {"sent": True}
+    client.put(
+        "/api/settings/notifications",
+        json={"bot_token": "123:abc", "chat_id": "-1001234567890"},
+    )
+
+    sent = client.post("/api/settings/notifications/test").json()
+    assert sent["sent"] is True
+    # The response echoes where it landed, so a corrected id is visible.
+    assert sent["chat_id"] == "-1001234567890"
 
     monkeypatch.setattr(monitor_module, "send_telegram_message", fail)
     response = client.post("/api/settings/notifications/test")
     assert response.status_code == 502
     assert "403" in response.json()["detail"]
+
+
+def test_saving_a_tme_link_stores_the_channel_id(client):
+    saved = client.put(
+        "/api/settings/notifications",
+        json={"bot_token": "123:abc", "chat_id": "https://t.me/c/1234567890/8"},
+    ).json()
+
+    assert saved["chat_id"] == "-1001234567890"
 
 
 # --------------------------------------------------------- dune maintenance

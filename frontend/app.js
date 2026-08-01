@@ -972,8 +972,16 @@ async function testNotification() {
   await withBusy($("tgTest"), async () => {
     setStatus("tgStatus", "Sending a test message…", "");
     try {
-      await api("/api/settings/notifications/test", { method: "POST" });
-      setStatus("tgStatus", "Test message sent — check the chat.", "ok");
+      const result = await api("/api/settings/notifications/test", { method: "POST" });
+      // The chat id may have been auto-corrected to the -100… channel form.
+      $("tgChat").value = result.chat_id || $("tgChat").value;
+      setStatus(
+        "tgStatus",
+        `Test message sent to ${result.chat_id}` +
+          (result.bot_username ? ` via @${result.bot_username}` : "") + ".",
+        "ok",
+      );
+      await loadNotificationSettings();
     } catch (error) {
       setStatus("tgStatus", error.message, "error");
     }
