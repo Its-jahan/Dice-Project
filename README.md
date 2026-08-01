@@ -110,6 +110,56 @@ CSV carries the leading table for the chosen mode; XLSX carries **both** plus a
 `Request` sheet recording exactly what was asked for; JSON carries everything;
 HTML is a standalone, filterable page with no external assets.
 
+## Watchlists & co-buy signals
+
+The holder query answers "who bought token X early". Watchlists answer the
+follow-up question: **what are those wallets buying now?**
+
+The loop:
+
+1. Run a holder query over a token's first day(s) — the wallets that aped in
+   early.
+2. In the results card, **save those wallets as a watchlist** (if the set is
+   bigger than the monitoring cap, keep the top-N holders by balance).
+3. DICE re-checks the watchlist on a schedule (default every 24 h, can be as
+   tight as hourly): one Dune query against the curated DEX trade tables
+   (`dex.trades` / `dex_solana.trades`) asking what each wallet **bought**
+   inside the buy window (default 48 h).
+4. When enough distinct wallets bought the *same* token, it becomes a
+   **signal**: token, buyer count, USD volume, and exactly which wallets bought
+   — with a DexScreener link to eyeball it.
+
+**Threshold.** A token fires when its distinct-buyer count reaches
+`max(min_wallets, ceil(min_wallets_pct% × watchlist size))` — with 100 wallets
+and the default 10 %, that is 10 co-buyers. Both knobs are per-watchlist and
+editable in the UI.
+
+**What counts as a buy.** DEX swaps where the wallet received the token.
+Wrapped-native tokens, major stables and liquid-staking tokens are ignored by
+default (every swap "buys" USDC as its other leg), and the watchlist's own
+source token is auto-ignored too — remove it from the ignore list if you want
+re-accumulation alerts. Plain transfers and CEX buys are invisible to this.
+Buys with a *known* USD value below `min_buy_usd` are dropped; buys with no
+USD price yet (very new tokens) always pass.
+
+**Scheduling needs a server key.** Manual **Run now** works with the key in
+your browser, like every other query. *Scheduled* runs happen with no browser
+attached, so they only run when `DUNE_API_KEY` is set server-side; otherwise
+watchlists simply wait for you to click. Every monitor run is one Dune
+execution on your plan's credits — a 2-hour interval spends 12× more than a
+daily one. Runs are serialized per process, and with several uvicorn workers a
+SQLite claim guarantees each due watchlist runs exactly once.
+
+**Telegram (optional).** Set `DICE_TELEGRAM_BOT_TOKEN` and
+`DICE_TELEGRAM_CHAT_ID` and every *new* or *strengthened* signal (buyer count
+grew) is pushed as a message. Dismissed signals stay quiet even if they
+re-trigger.
+
+Watchlists, run history and signals persist in SQLite (`DICE_DB_PATH`,
+default `backend/data/dice.db`; the systemd unit uses `/var/lib/dice/dice.db`).
+The monitor query is generated ad hoc, so plans without query CRUD can use the
+holder side via `DUNE_QUERY_ID` but not scheduled monitoring.
+
 ## API
 
 | Endpoint | Purpose |
@@ -121,6 +171,14 @@ HTML is a standalone, filterable page with no external assets.
 | `GET /api/discover` | Raw listing of curated balance tables the key can reach. |
 | `POST /api/holders` | Run the query; returns a preview + `job_id`. |
 | `GET /api/export/{job_id}?format=csv\|xlsx\|json\|html` | Download the full result. |
+| `GET /api/watchlists` · `POST /api/watchlists` | List / create watchlists (create takes explicit wallet lists). |
+| `POST /api/watchlists/from-job/{job_id}` | Turn a finished holders job into a watchlist (`top_n` optional). |
+| `GET` / `PATCH` / `DELETE /api/watchlists/{id}` | Inspect, tune (thresholds, wallets, ignores) or drop a watchlist. |
+| `GET /api/watchlists/{id}/wallets` | The full wallet list. |
+| `POST /api/watchlists/{id}/monitor` | Run the monitor now. Header: `X-Dune-Api-Key`. |
+| `GET /api/watchlists/{id}/runs` | Monitor run history. |
+| `GET /api/signals` | Active signals (`?include_dismissed=true` for all). |
+| `POST /api/signals/{id}/dismiss` · `/restore` | Mute / unmute a signal. |
 | `GET /api/health` | Liveness. |
 
 Request body:

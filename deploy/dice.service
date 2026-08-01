@@ -9,11 +9,13 @@ User=dice
 Group=dice
 WorkingDirectory=/opt/dice/backend
 EnvironmentFile=-/etc/dice/dice.env
-# Query results are written here so every worker — and a restarted service —
-# can serve the export that follows the query. ProtectSystem=strict makes the
-# rest of the filesystem read-only, so this must be an explicit StateDirectory.
+# Query results and the watchlist/signal SQLite DB are written here so every
+# worker — and a restarted service — can see them. ProtectSystem=strict makes
+# the rest of the filesystem read-only, so this must be an explicit
+# StateDirectory.
 StateDirectory=dice
 Environment=DICE_JOB_DIR=/var/lib/dice
+Environment=DICE_DB_PATH=/var/lib/dice/dice.db
 ExecStart=/opt/dice/backend/.venv/bin/uvicorn app.main:app \
     --host 127.0.0.1 --port 8000 --workers 2 --proxy-headers \
     --forwarded-allow-ips 127.0.0.1
