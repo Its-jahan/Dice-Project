@@ -139,7 +139,27 @@ CREATE INDEX IF NOT EXISTS idx_events_window
     ON wallet_events (chain, token_address, seen_at);
 CREATE INDEX IF NOT EXISTS idx_events_wallet
     ON wallet_events (chain, wallet_address, seen_at);
+
+-- Every webhook delivery, accepted or not. This is the evidence that the
+-- Alchemy side is actually working: without it a silent webhook and a chain
+-- where nobody happens to be buying look identical.
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    chain          TEXT,
+    received_at    TEXT    NOT NULL,
+    status         TEXT    NOT NULL,
+    activity_count INTEGER NOT NULL DEFAULT 0,
+    stored         INTEGER NOT NULL DEFAULT 0,
+    signals        INTEGER NOT NULL DEFAULT 0,
+    detail         TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_deliveries_recent
+    ON webhook_deliveries (id DESC);
 """
+
+#: Deliveries kept for the diagnostics panel; older rows are pruned.
+DELIVERY_HISTORY_LIMIT = 100
 
 _init_lock = threading.Lock()
 _initialized_paths: set[str] = set()
@@ -832,6 +852,43 @@ def events_in_window(
             ORDER BY first_buy_at
             """,
             (chain, token_address, since_iso, *wallet_list),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def record_delivery(
+    *,
+    chain: str | None,
+    status: str,
+    activity_count: int = 0,
+    stored: int = 0,
+    signals: int = 0,
+    detail: str | None = None,
+) -> None:
+    """Log one webhook delivery and keep the history bounded."""
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO webhook_deliveries
+                (chain, received_at, status, activity_count, stored, signals, detail)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (chain, utcnow_iso(), status, activity_count, stored, signals, detail),
+        )
+        conn.execute(
+            """
+            DELETE FROM webhook_deliveries WHERE id NOT IN (
+                SELECT id FROM webhook_deliveries ORDER BY id DESC LIMIT ?
+            )
+            """,
+            (DELIVERY_HISTORY_LIMIT,),
+        )
+
+
+def list_deliveries(limit: int = 20) -> list[dict[str, Any]]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM webhook_deliveries ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
         return [dict(row) for row in rows]
 

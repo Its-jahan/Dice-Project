@@ -16,11 +16,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import uuid
 from contextlib import asynccontextmanager, suppress
-from pathlib import Path
 from dataclasses import asdict
+from pathlib import Path
 from typing import Annotated, AsyncIterator
 
+import httpx
 from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -67,6 +69,11 @@ log = logging.getLogger(__name__)
 FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend"
 #: How many snapshot rows the JSON preview returns. Full data goes in exports.
 PREVIEW_ROWS = 500
+
+#: Deliberately unmistakable token for simulated signals, so a test result can
+#: never be confused with a real one.
+SIMULATED_TOKEN = "0xd1ce" + "0" * 36
+SIMULATED_SYMBOL = "DICETEST"
 
 
 @asynccontextmanager
@@ -761,21 +768,33 @@ async def sync_realtime() -> dict[str, object]:
     return {"synced": results}
 
 
+#: Marker used by the reachability probe so its own delivery is not mistaken
+#: for a misconfigured webhook in the log.
+PROBE_WEBHOOK_ID = "dice-reachability-probe"
+
+
 @app.post("/api/webhooks/alchemy")
 async def receive_alchemy_webhook(request: Request) -> dict[str, object]:
     """Alchemy Address Activity delivery — the live path into signals.
 
     Authenticated by ``X-Alchemy-Signature`` (HMAC-SHA256 of the raw body with
     the webhook's signing key), so this endpoint is safe to expose publicly.
-    An unknown or unsigned delivery is rejected without touching the database.
+    Every outcome is written to the delivery log: a webhook that is arriving
+    but failing looks nothing like one that never arrives, and the difference
+    is invisible without it.
     """
     raw = await request.body()
     try:
         payload = json.loads(raw)
     except ValueError:
+        db.record_delivery(chain=None, status="bad_json")
         raise HTTPException(status_code=400, detail="Body is not JSON.")
 
     webhook_id = str(payload.get("webhookId") or "")
+    if webhook_id == PROBE_WEBHOOK_ID:
+        db.record_delivery(chain=None, status="probe", detail="reachability check")
+        return {"probe": "ok"}
+
     registration = db.webhook_by_id(webhook_id) if webhook_id else None
     if registration is None:
         # Not a webhook this server created, so there is no signing key to
@@ -784,16 +803,37 @@ async def receive_alchemy_webhook(request: Request) -> dict[str, object]:
         # stored — and treats non-2xx replies as a failing endpoint worth
         # retrying and eventually disabling.
         log.warning("ignored delivery for unregistered webhook %r", webhook_id)
+        db.record_delivery(
+            chain=None, status="unknown_webhook", detail=webhook_id[:80]
+        )
         return {"ignored": "unknown webhook id", "events": 0, "signals": 0}
 
     signature = request.headers.get("X-Alchemy-Signature")
     if not alchemy.verify_signature(raw, signature, registration["signing_key"]):
+        db.record_delivery(
+            chain=registration["chain"],
+            status="bad_signature",
+            detail="signature did not match the stored signing key",
+        )
         raise HTTPException(status_code=401, detail="Bad signature.")
 
     if str(payload.get("type") or "") != "ADDRESS_ACTIVITY":
+        db.record_delivery(
+            chain=registration["chain"],
+            status="ignored_type",
+            detail=str(payload.get("type"))[:80],
+        )
         return {"ignored": payload.get("type")}
 
+    activity_count = len((payload.get("event") or {}).get("activity") or [])
     summary = await realtime.ingest(payload, chain=Chain(registration["chain"]))
+    db.record_delivery(
+        chain=registration["chain"],
+        status="ok",
+        activity_count=activity_count,
+        stored=int(summary["stored"]),
+        signals=int(summary["signals"]),
+    )
     if summary["signals"]:
         log.info(
             "live: %s events on %s produced %s signal(s)",
@@ -802,6 +842,133 @@ async def receive_alchemy_webhook(request: Request) -> dict[str, object]:
             summary["signals"],
         )
     return summary
+
+
+@app.get("/api/settings/realtime/deliveries")
+async def list_deliveries(
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+) -> dict[str, object]:
+    rows = db.list_deliveries(limit)
+    real = [row for row in rows if row["status"] == "ok"]
+    return {
+        "deliveries": rows,
+        "last_delivery_at": real[0]["received_at"] if real else None,
+        "total_shown": len(rows),
+    }
+
+
+@app.post("/api/settings/realtime/check-url")
+async def check_webhook_url() -> dict[str, object]:
+    """Call our own public webhook URL to prove Alchemy can reach it.
+
+    This is the half a simulated signal cannot test: DNS, TLS, the reverse
+    proxy and any firewall between the internet and this process.
+    """
+    url = _webhook_url()
+    probe = {"webhookId": PROBE_WEBHOOK_ID, "type": "ADDRESS_ACTIVITY", "event": {}}
+    try:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            response = await client.post(url, json=probe)
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not reach {url} — {exc}. Alchemy will not be able to "
+            "deliver either. Check the public URL, DNS and TLS.",
+        ) from exc
+
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"{url} answered {response.status_code}. Something other than "
+            "DICE is serving that path — check the reverse proxy.",
+        )
+    if (response.json() or {}).get("probe") != "ok":
+        raise HTTPException(
+            status_code=502,
+            detail=f"{url} is reachable but answered unexpectedly — the URL "
+            "probably points at a different application.",
+        )
+    return {"reachable": True, "url": url}
+
+
+@app.post("/api/settings/realtime/simulate")
+async def simulate_signal(body: Annotated[dict, Body()]) -> dict[str, object]:
+    """Push a synthetic buy through the real live path, to prove it end to end.
+
+    Uses the watchlist's own wallets and the genuine ingest code — parsing,
+    the event store, the threshold and the Telegram push — so a success here
+    means everything downstream of Alchemy works. The token is an obviously
+    fake address, and the resulting signal can be dismissed like any other.
+    """
+    watchlist_id = body.get("watchlist_id")
+    if not isinstance(watchlist_id, int):
+        raise HTTPException(status_code=422, detail="Provide a watchlist_id.")
+    watchlist = db.get_watchlist(watchlist_id)
+    if watchlist is None:
+        raise HTTPException(status_code=404, detail="Watchlist not found.")
+    if not watchlist.get("realtime"):
+        raise HTTPException(
+            status_code=422,
+            detail="Switch Live on for this watchlist first — the simulation "
+            "runs through the same path a real delivery takes.",
+        )
+
+    chain = Chain(watchlist["chain"])
+    wallets = db.get_wallets(watchlist_id)
+    needed = monitor.effective_min_wallets(
+        int(watchlist["min_wallets"]),
+        float(watchlist["min_wallets_pct"]),
+        len(wallets),
+    )
+    if len(wallets) < needed:
+        raise HTTPException(
+            status_code=422,
+            detail=f"The watchlist has {len(wallets)} wallets but needs "
+            f"{needed} buyers to fire — lower the threshold to test it.",
+        )
+
+    # A fresh tx hash per run, so repeat simulations are not deduplicated away.
+    run = uuid.uuid4().hex
+    payload = {
+        "webhookId": "simulated",
+        "type": "ADDRESS_ACTIVITY",
+        "event": {
+            "network": alchemy.network_for(chain) or chain.value,
+            "activity": [
+                {
+                    "fromAddress": "0x" + "1" * 40,
+                    "toAddress": wallet,
+                    "blockNum": "0x0",
+                    "hash": f"0x{run}{index:02x}",
+                    "value": 1234.5,
+                    "asset": SIMULATED_SYMBOL,
+                    "category": "erc20",
+                    "rawContract": {
+                        "address": SIMULATED_TOKEN,
+                        "decimals": 18,
+                        "rawValue": "0x1",
+                    },
+                }
+                for index, wallet in enumerate(wallets[:needed])
+            ],
+        },
+    }
+
+    summary = await realtime.ingest(payload, chain=chain)
+    db.record_delivery(
+        chain=chain.value,
+        status="simulated",
+        activity_count=needed,
+        stored=int(summary["stored"]),
+        signals=int(summary["signals"]),
+    )
+    telegram_token, telegram_chat = db.telegram_credentials()
+    return {
+        **summary,
+        "wallets_used": needed,
+        "token_address": SIMULATED_TOKEN,
+        "telegram_configured": bool(telegram_token and telegram_chat),
+    }
 
 
 # ------------------------------------------------------------------ watchlists

@@ -170,6 +170,15 @@ body with the webhook's signing key — so the endpoint is safe to expose. An
 unknown webhook id or a bad signature is rejected before anything is stored,
 and redeliveries are idempotent.
 
+**Checking it works.** The card has three tools, because "no signals yet" has
+two very different causes — a broken webhook, or simply nobody buying:
+
+| Tool | Proves |
+| --- | --- |
+| **Check URL is reachable** | The server calls its own public URL, so DNS, TLS and the reverse proxy are all exercised. This is the half a simulation cannot test. |
+| **Send test signal** | Injects a fake `DICETEST` buy by the threshold number of wallets through the *real* ingest path — event store, threshold, signal row, Telegram push. If it works, everything downstream of Alchemy works. Dismiss the signal afterwards. |
+| **Recent deliveries** | Every real delivery and its outcome: `delivered`, `bad signature`, `unknown webhook`. A webhook that arrives and fails looks nothing like one that never arrives. |
+
 What live mode counts as a buy: a token **arriving** at a watched wallet.
 Transfers *from* another wallet in the same watchlist are skipped (a token
 passed around the group is one position, not N buyers), as is the usual
@@ -209,6 +218,7 @@ holder side via `DUNE_QUERY_ID` but not scheduled monitoring.
 | `POST /api/key/validate` | Check a key without saving. Header: `X-Dune-Api-Key`. |
 | `GET` / `PUT /api/settings/notifications` · `POST …/test` | Telegram bot token + chat id, and a test send. |
 | `GET` / `PUT /api/settings/realtime` · `POST …/sync` | Alchemy auth token + public URL; reconcile watched wallets. |
+| `POST …/check-url` · `POST …/simulate` · `GET …/deliveries` | Reachability probe, synthetic signal, delivery log. |
 | `POST /api/webhooks/alchemy` | Alchemy delivery endpoint (signature-verified). |
 | `POST /api/dune/archive-queries` | Archive every `DICE …` query in the Dune account (frees private-query slots). |
 | `POST /api/sql` | Preview the generated DuneSQL. Needs a key, since the table is resolved from the catalogue. |

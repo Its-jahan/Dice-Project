@@ -554,6 +554,7 @@ async function loadWatchlists() {
   try {
     state.watchlists = await api("/api/watchlists");
     renderWatchlists();
+    refreshSimulateOptions();
     setStatus("watchlistsStatus", "", "");
   } catch (error) {
     setStatus("watchlistsStatus", error.message, "error");
@@ -1039,6 +1040,123 @@ async function saveRealtimeSettings() {
   });
 }
 
+/* --------------------------------------------------- realtime diagnostics */
+
+function refreshSimulateOptions() {
+  const select = $("rtSimWatchlist");
+  const live = state.watchlists.filter((wl) => wl.realtime);
+  const previous = select.value;
+  select.innerHTML = "";
+  if (!live.length) {
+    const option = document.createElement("option");
+    option.textContent = "— switch Live on for a watchlist first —";
+    option.value = "";
+    select.appendChild(option);
+    select.disabled = true;
+    $("rtSimulate").disabled = true;
+    return;
+  }
+  for (const wl of live) {
+    const option = document.createElement("option");
+    option.value = wl.id;
+    option.textContent = `${wl.name} (${wl.chain}, needs ${wl.effective_min_wallets})`;
+    select.appendChild(option);
+  }
+  select.disabled = false;
+  $("rtSimulate").disabled = false;
+  if (previous) select.value = previous;
+}
+
+async function checkWebhookUrl() {
+  await withBusy($("rtCheckUrl"), async () => {
+    setStatus("rtTestStatus", "Calling the public URL from this server…", "");
+    try {
+      const result = await api("/api/settings/realtime/check-url", { method: "POST" });
+      setStatus(
+        "rtTestStatus",
+        `${result.url} is reachable — Alchemy can deliver here.`,
+        "ok",
+      );
+    } catch (error) {
+      setStatus("rtTestStatus", error.message, "error");
+    }
+    loadDeliveries();
+  });
+}
+
+async function simulateSignal() {
+  const watchlistId = Number($("rtSimWatchlist").value);
+  if (!watchlistId) return;
+  await withBusy($("rtSimulate"), async () => {
+    setStatus("rtTestStatus", "Injecting a test buy…", "");
+    try {
+      const result = await api("/api/settings/realtime/simulate", {
+        method: "POST",
+        body: { watchlist_id: watchlistId },
+      });
+      const parts = [
+        `${result.wallets_used} wallets "bought" DICETEST`,
+        result.signals
+          ? "signal fired"
+          : "no signal (it may already exist from an earlier test)",
+      ];
+      if (result.signals && result.telegram_configured) {
+        parts.push("Telegram message sent");
+      } else if (result.signals) {
+        parts.push("Telegram not configured, so no message");
+      }
+      setStatus("rtTestStatus", parts.join(" · ") + ".", "ok");
+      await Promise.all([loadSignals(), loadDeliveries()]);
+    } catch (error) {
+      setStatus("rtTestStatus", error.message, "error");
+    }
+  });
+}
+
+async function loadDeliveries() {
+  try {
+    const data = await api("/api/settings/realtime/deliveries?limit=20");
+    renderDeliveries(data.deliveries || []);
+  } catch {
+    /* non-fatal */
+  }
+}
+
+function renderDeliveries(deliveries) {
+  const table = $("rtDeliveries");
+  $("rtDeliveriesEmpty").classList.toggle("d-none", !!deliveries.length);
+  table.classList.toggle("d-none", !deliveries.length);
+  table.tHead.innerHTML = "";
+  table.tBodies[0].innerHTML = "";
+  if (!deliveries.length) return;
+
+  const head = table.tHead.insertRow();
+  for (const title of ["When", "Chain", "Status", "Transfers", "Stored", "Signals"]) {
+    head.appendChild(el("th", "small text-body-secondary", title));
+  }
+  const styles = {
+    ok: ["text-bg-success", "delivered"],
+    simulated: ["text-bg-info", "test"],
+    probe: ["text-bg-secondary", "url check"],
+    bad_signature: ["text-bg-danger", "bad signature"],
+    unknown_webhook: ["text-bg-warning", "unknown webhook"],
+    ignored_type: ["text-bg-secondary", "other type"],
+    bad_json: ["text-bg-danger", "bad body"],
+  };
+  for (const delivery of deliveries) {
+    const row = table.tBodies[0].insertRow();
+    row.insertCell().textContent = fmtTime(delivery.received_at);
+    row.insertCell().textContent = delivery.chain || "—";
+    const [cls, label] = styles[delivery.status] || ["text-bg-secondary", delivery.status];
+    const badge = el("span", `badge ${cls}`, label);
+    if (delivery.detail) badge.title = delivery.detail;
+    row.insertCell().appendChild(badge);
+    row.insertCell().textContent = delivery.activity_count;
+    row.insertCell().textContent = delivery.stored;
+    row.insertCell().textContent = delivery.signals;
+  }
+}
+
 async function syncRealtime() {
   await withBusy($("rtSync"), async () => {
     setStatus("rtStatus", "Reconciling watched wallets with Alchemy…", "");
@@ -1169,6 +1287,9 @@ function init() {
   $("tgTest").addEventListener("click", testNotification);
   $("rtSave").addEventListener("click", saveRealtimeSettings);
   $("rtSync").addEventListener("click", syncRealtime);
+  $("rtCheckUrl").addEventListener("click", checkWebhookUrl);
+  $("rtSimulate").addEventListener("click", simulateSignal);
+  $("rtRefreshDeliveries").addEventListener("click", loadDeliveries);
   $("chain").addEventListener("change", updateRealtimeAvailability);
 
   for (const tab of document.querySelectorAll(".tab")) {
@@ -1188,6 +1309,7 @@ function init() {
   });
   loadNotificationSettings();
   loadRealtimeSettings();
+  loadDeliveries();
   startPolling();
 }
 

@@ -369,7 +369,50 @@
             <thead></thead><tbody></tbody>
           </table>
         </div>
-        <p class="form-text mb-0" id="rtChains"></p>
+        <p class="form-text" id="rtChains"></p>
+
+        <hr>
+        <h3 class="h6">Check it works</h3>
+        <div class="row g-2 align-items-end">
+          <div class="col-auto">
+            <button type="button" id="rtCheckUrl" class="btn btn-outline-secondary btn-sm">
+              1. Check URL is reachable
+            </button>
+          </div>
+          <div class="col-md-4">
+            <label class="form-label small" for="rtSimWatchlist">
+              2. Send a test signal through a live watchlist
+            </label>
+            <select id="rtSimWatchlist" class="form-select form-select-sm"></select>
+          </div>
+          <div class="col-auto">
+            <button type="button" id="rtSimulate" class="btn btn-outline-primary btn-sm">
+              Send test signal
+            </button>
+          </div>
+        </div>
+        <div class="form-text">
+          The test injects a fake token (<code>DICETEST</code>) through the same code
+          a real Alchemy delivery takes — event store, threshold, signal, Telegram —
+          so if it works, everything after Alchemy works. Dismiss the resulting
+          signal when you are done.
+        </div>
+        <div id="rtTestStatus" class="small mt-2" role="status" aria-live="polite"></div>
+
+        <div class="d-flex justify-content-between align-items-center mt-3">
+          <h3 class="h6 mb-0">Recent deliveries</h3>
+          <button type="button" id="rtRefreshDeliveries"
+                  class="btn btn-outline-secondary btn-sm">Refresh</button>
+        </div>
+        <p id="rtDeliveriesEmpty" class="form-text mb-0">
+          Nothing received yet. Real deliveries only arrive when a watched wallet
+          actually receives a token.
+        </p>
+        <div class="table-responsive">
+          <table id="rtDeliveries" class="table table-sm align-middle d-none mb-0">
+            <thead></thead><tbody></tbody>
+          </table>
+        </div>
       </div>
     </section>
 
