@@ -74,7 +74,7 @@ def test_interval_sql_reads_the_resolved_table_and_columns():
     sql = build_snapshot_sql(make(min_balance=100), INTERVAL_SOURCE)
 
     assert "FROM balances_ethereum__spellbook_sqlmesh_490.daily_updates b" in sql
-    assert "b.token_address = '" + EVM_TOKEN.lower() + "'" in sql
+    assert "b.token_address = " + EVM_TOKEN.lower() in sql
     assert "b.balance > 100.0" in sql
     # transfers must never be the source of truth for "who held"
     assert "transfers" not in sql.lower()
@@ -168,3 +168,36 @@ def test_query_parameters_are_serialisable_for_saved_queries():
         "end_date": "2026-07-31",
         "minimum_balance": 50.0,
     }
+
+
+def test_evm_addresses_are_bare_hex_literals_not_quoted_strings():
+    """EVM address columns are varbinary in DuneSQL.
+
+    Quoting the literal yields "Cannot apply operator: varbinary = varchar",
+    so addresses must be emitted as 0xabc, never '0xabc'.
+    """
+    sql = build_snapshot_sql(make(), INTERVAL_SOURCE)
+
+    assert f"b.token_address = {EVM_TOKEN.lower()}" in sql
+    assert f"'{EVM_TOKEN.lower()}'" not in sql
+    # burn sinks go through the same path
+    assert "(0x0000000000000000000000000000000000000000," in sql
+    assert "'0x0000000000000000000000000000000000000000'" not in sql
+
+
+def test_solana_addresses_stay_quoted_because_they_are_text():
+    solana_source = Source(
+        schema="solana_utils",
+        table="daily_balances",
+        shape="daily",
+        address="address",
+        token="token_mint_address",
+        balance="token_balance",
+        day="day",
+    )
+
+    sql = build_snapshot_sql(
+        make(chain="solana", token_address=SOL_MINT), solana_source
+    )
+
+    assert f"b.token_mint_address = '{SOL_MINT}'" in sql

@@ -47,8 +47,19 @@ def _quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def _address_list(addresses: tuple[str, ...]) -> str:
-    return ", ".join(_quote(a) for a in addresses)
+def _address_literal(chain: Chain, address: str) -> str:
+    """Render an address the way the engine's column type expects.
+
+    EVM address columns are ``varbinary``, and DuneSQL compares those against
+    bare hex literals — ``0xabc``, not ``'0xabc'``. Quoting one yields
+    "Cannot apply operator: varbinary = varchar". Solana addresses are base58
+    text, so those stay quoted.
+    """
+    return _quote(address) if chain is Chain.solana else address
+
+
+def _address_list(chain: Chain, addresses: tuple[str, ...]) -> str:
+    return ", ".join(_address_literal(chain, a) for a in addresses)
 
 
 def _where(filters: list[str], indent: str) -> str:
@@ -130,7 +141,7 @@ def _interval_sql(req: HoldersRequest, src: Source) -> str:
     end = f"date {_quote(req.end_date.isoformat())}"
 
     filters = [
-        f"b.{src.token} = {_quote(req.token_address)}",
+        f"b.{src.token} = {_address_literal(req.chain, req.token_address)}",
         # Narrow to intervals that can overlap the window at all, so the engine
         # prunes before the calendar cross join rather than after it.
         f"b.{src.valid_from} <= {end}",
@@ -143,7 +154,8 @@ def _interval_sql(req: HoldersRequest, src: Source) -> str:
     ]
     if req.exclude_burn_addresses:
         filters.append(
-            f"b.{src.address} NOT IN ({_address_list(_burn_addresses(req))})"
+            f"b.{src.address} NOT IN "
+            f"({_address_list(req.chain, _burn_addresses(req))})"
         )
     contract_join, contract_filter = _contract_filter(req, src)
     if contract_filter:
@@ -176,13 +188,14 @@ def _daily_sql(req: HoldersRequest, src: Source) -> str:
     a no-op over an already-unique key, so one code path serves both.
     """
     filters = [
-        f"b.{src.token} = {_quote(req.token_address)}",
+        f"b.{src.token} = {_address_literal(req.chain, req.token_address)}",
         f"b.{src.day} >= date {_quote(req.start_date.isoformat())}",
         f"b.{src.day} <= date {_quote(req.end_date.isoformat())}",
     ]
     if req.exclude_burn_addresses:
         filters.append(
-            f"b.{src.address} NOT IN ({_address_list(_burn_addresses(req))})"
+            f"b.{src.address} NOT IN "
+            f"({_address_list(req.chain, _burn_addresses(req))})"
         )
     contract_join, contract_filter = _contract_filter(req, src)
     if contract_filter:
