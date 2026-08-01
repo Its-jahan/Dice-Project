@@ -113,3 +113,188 @@ class HoldersResponse(BaseModel):
     snapshots: list[Snapshot]
     summary: list[WalletSummary]
     truncated: bool = False
+
+
+# ---------------------------------------------------------------- watchlists
+
+
+def normalize_addresses(chain: Chain, addresses: list[str]) -> list[str]:
+    """Validate and canonicalise addresses (wallets or tokens) for one chain.
+
+    EVM addresses are lowercased (Dune stores them lowercase); Solana addresses
+    are base58 and case-sensitive, so they pass through unchanged. Duplicates
+    are dropped while preserving order. Raises ``ValueError`` on the first bad
+    address so the caller can report exactly which one failed.
+    """
+    seen: set[str] = set()
+    result: list[str] = []
+    for raw in addresses:
+        address = raw.strip()
+        if not address:
+            continue
+        if chain.is_evm:
+            if not EVM_ADDRESS_RE.match(address):
+                raise ValueError(f"invalid {chain.value} address: {address!r}")
+            address = address.lower()
+        elif not SOLANA_MINT_RE.match(address):
+            raise ValueError(f"invalid Solana address: {address!r}")
+        if address not in seen:
+            seen.add(address)
+            result.append(address)
+    return result
+
+
+class WatchlistSettings(BaseModel):
+    """Tunable monitoring/signal parameters, shared by create and update.
+
+    The signal threshold is ``max(min_wallets, ceil(min_wallets_pct% of the
+    watchlist size))`` — the absolute floor keeps tiny lists from firing on two
+    wallets, the percentage keeps big lists honest. Set ``min_wallets_pct`` to
+    0 to use the absolute count alone.
+    """
+
+    #: distinct buyers required before a token becomes a signal (absolute floor)
+    min_wallets: int = Field(default=5, ge=2, le=10_000)
+    #: distinct buyers required as a percentage of the watchlist size
+    min_wallets_pct: float = Field(default=10.0, ge=0, le=100)
+    #: how far back each monitor run looks for buys ("bought within N hours")
+    buy_window_hours: int = Field(default=48, ge=1, le=24 * 14)
+    #: scheduled gap between automatic runs; each run costs Dune credits
+    monitor_interval_hours: float = Field(default=24.0, ge=1, le=24 * 7)
+    #: ignore a wallet's buys of one token when they total less than this (USD)
+    min_buy_usd: float = Field(default=0.0, ge=0)
+    #: whether the background scheduler runs this list (needs a server key)
+    auto_monitor: bool = True
+    #: token addresses to ignore on top of the built-in quote/stable stoplist
+    ignore_tokens: list[str] = Field(default_factory=list)
+
+    @field_validator("ignore_tokens")
+    @classmethod
+    def _strip_ignores(cls, value: list[str]) -> list[str]:
+        cleaned = []
+        for token in value:
+            token = token.strip()
+            if token:
+                cleaned.append(token)
+        return cleaned
+
+
+class WatchlistCreate(WatchlistSettings):
+    name: str = Field(min_length=1, max_length=120)
+    chain: Chain
+    wallets: list[str] = Field(min_length=1)
+    #: the token whose early buyers these wallets are (informational)
+    source_token_address: str | None = None
+    notes: str = Field(default="", max_length=2000)
+
+    @model_validator(mode="after")
+    def _validate_wallets(self) -> "WatchlistCreate":
+        normalized = normalize_addresses(self.chain, self.wallets)
+        if not normalized:
+            raise ValueError("wallets contained no valid addresses")
+        object.__setattr__(self, "wallets", normalized)
+        object.__setattr__(
+            self, "ignore_tokens", normalize_addresses(self.chain, self.ignore_tokens)
+        )
+        if self.source_token_address:
+            source = normalize_addresses(self.chain, [self.source_token_address])
+            object.__setattr__(self, "source_token_address", source[0])
+        return self
+
+
+class WatchlistFromJob(WatchlistSettings):
+    """Create a watchlist from a finished holders job (its full wallet set)."""
+
+    name: str | None = Field(default=None, max_length=120)
+    #: keep only the N wallets with the highest max balance (summary order)
+    top_n: int | None = Field(default=None, ge=1)
+
+
+class WatchlistUpdate(BaseModel):
+    """Partial update; only supplied fields change."""
+
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    notes: str | None = Field(default=None, max_length=2000)
+    min_wallets: int | None = Field(default=None, ge=2, le=10_000)
+    min_wallets_pct: float | None = Field(default=None, ge=0, le=100)
+    buy_window_hours: int | None = Field(default=None, ge=1, le=24 * 14)
+    monitor_interval_hours: float | None = Field(default=None, ge=1, le=24 * 7)
+    min_buy_usd: float | None = Field(default=None, ge=0)
+    auto_monitor: bool | None = None
+    ignore_tokens: list[str] | None = None
+    add_wallets: list[str] | None = None
+    remove_wallets: list[str] | None = None
+
+
+class WatchlistOut(BaseModel):
+    id: int
+    name: str
+    chain: Chain
+    source_token_address: str | None
+    notes: str
+    wallet_count: int
+    min_wallets: int
+    min_wallets_pct: float
+    effective_min_wallets: int
+    buy_window_hours: int
+    monitor_interval_hours: float
+    min_buy_usd: float
+    auto_monitor: bool
+    ignore_tokens: list[str]
+    created_at: str
+    last_run_at: str | None
+    last_run_status: str | None
+    last_run_error: str | None
+    next_run_at: str | None
+    active_signals: int
+
+
+class TokenBuyer(BaseModel):
+    """One watched wallet's aggregate buying of one token in the window."""
+
+    wallet_address: str
+    buy_count: int
+    amount_usd: float | None
+    first_buy_at: str | None
+    last_buy_at: str | None
+
+
+class SignalOut(BaseModel):
+    id: int
+    watchlist_id: int
+    watchlist_name: str | None = None
+    chain: Chain
+    token_address: str
+    token_symbol: str | None
+    wallet_count: int
+    watchlist_size: int
+    total_usd: float | None
+    buyers: list[TokenBuyer]
+    first_seen_at: str
+    last_updated_at: str
+    status: str
+
+
+class MonitorRunOut(BaseModel):
+    id: int
+    watchlist_id: int
+    trigger: str
+    started_at: str
+    finished_at: str | None
+    status: str
+    error: str | None
+    window_hours: int
+    wallets_checked: int
+    wallets_truncated: bool
+    buy_rows: int
+    tokens_seen: int
+    signals_fired: int
+    execution_id: str | None
+
+
+class MonitorResult(BaseModel):
+    """What a single monitor run produced, returned by the run-now endpoint."""
+
+    run: MonitorRunOut
+    new_signals: list[SignalOut]
+    updated_signals: list[SignalOut]

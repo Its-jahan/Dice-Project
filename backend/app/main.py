@@ -11,20 +11,37 @@ single-user/CLI deployments.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, AsyncIterator
 
 from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
+from . import db, monitor
 from .config import settings
 from .dune import DuneClient, DuneError
 from .exporters import MEDIA_TYPES, export, filename_for
 from .holders import apply_holder_mode, build_summary, parse_rows
 from .jobs import store
-from .models import ExportFormat, HoldersRequest, HoldersResponse
+from .models import (
+    Chain,
+    ExportFormat,
+    HoldersRequest,
+    HoldersResponse,
+    MonitorResult,
+    MonitorRunOut,
+    SignalOut,
+    WatchlistCreate,
+    WatchlistFromJob,
+    WatchlistOut,
+    WatchlistUpdate,
+    normalize_addresses,
+)
 from .sql import build_query_parameters, build_snapshot_sql
 
 log = logging.getLogger(__name__)
@@ -33,10 +50,27 @@ FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend"
 #: How many snapshot rows the JSON preview returns. Full data goes in exports.
 PREVIEW_ROWS = 500
 
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """Run the watchlist scheduler for the lifetime of the process."""
+    scheduler_task: asyncio.Task[None] | None = None
+    if settings.monitor_enabled:
+        scheduler_task = asyncio.create_task(monitor.scheduler_loop())
+    try:
+        yield
+    finally:
+        if scheduler_task is not None:
+            scheduler_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await scheduler_task
+
+
 app = FastAPI(
     title="DICE",
     description="Historical token holder extraction via Dune Analytics.",
     version="0.1.0",
+    lifespan=lifespan,
 )
 
 
@@ -69,6 +103,17 @@ async def get_config() -> dict[str, object]:
         "execution_mode": "saved_query" if settings.dune_query_id else "ad_hoc",
         "max_rows": settings.max_rows,
         "preview_rows": PREVIEW_ROWS,
+        "monitor": {
+            "enabled": settings.monitor_enabled,
+            "max_wallets": settings.monitor_max_wallets,
+            # Scheduled (unattended) runs execute server-side, so they only
+            # happen when the server has its own key.
+            "auto_possible": settings.monitor_enabled
+            and bool(settings.dune_api_key),
+            "telegram_configured": bool(
+                settings.telegram_bot_token and settings.telegram_chat_id
+            ),
+        },
     }
 
 
@@ -164,6 +209,268 @@ async def download_export(
 @app.get("/api/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+# ------------------------------------------------------------------ watchlists
+
+
+def _watchlist_out(row: dict) -> WatchlistOut:
+    wallet_count = int(row.get("wallet_count") or 0)
+    return WatchlistOut(
+        id=row["id"],
+        name=row["name"],
+        chain=row["chain"],
+        source_token_address=row.get("source_token_address"),
+        notes=row.get("notes") or "",
+        wallet_count=wallet_count,
+        min_wallets=row["min_wallets"],
+        min_wallets_pct=row["min_wallets_pct"],
+        effective_min_wallets=monitor.effective_min_wallets(
+            int(row["min_wallets"]),
+            float(row["min_wallets_pct"]),
+            min(wallet_count, settings.monitor_max_wallets) or wallet_count,
+        ),
+        buy_window_hours=row["buy_window_hours"],
+        monitor_interval_hours=row["monitor_interval_hours"],
+        min_buy_usd=row["min_buy_usd"],
+        auto_monitor=bool(row["auto_monitor"]),
+        ignore_tokens=json.loads(row.get("ignore_tokens") or "[]"),
+        created_at=row["created_at"],
+        last_run_at=row.get("last_run_at"),
+        last_run_status=row.get("last_run_status"),
+        last_run_error=row.get("last_run_error"),
+        next_run_at=row.get("next_run_at") if row["auto_monitor"] else None,
+        active_signals=int(row.get("active_signals") or 0),
+    )
+
+
+def _overview_or_404(watchlist_id: int) -> dict:
+    row = db.get_watchlist_overview(watchlist_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Watchlist not found.")
+    return row
+
+
+def _enforce_wallet_cap(count: int) -> None:
+    cap = settings.monitor_max_wallets
+    if count > cap:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{count} wallets exceeds the monitoring cap of {cap}. "
+                "Narrow the holder query (dates / min balance), pass top_n to "
+                "keep the largest holders, or raise DICE_MONITOR_MAX_WALLETS."
+            ),
+        )
+
+
+@app.get("/api/watchlists")
+async def list_watchlists() -> list[WatchlistOut]:
+    return [_watchlist_out(row) for row in db.list_watchlists()]
+
+
+@app.post("/api/watchlists", status_code=201)
+async def create_watchlist(req: Annotated[WatchlistCreate, Body()]) -> WatchlistOut:
+    _enforce_wallet_cap(len(req.wallets))
+    ignore_tokens = list(req.ignore_tokens)
+    # The source token is ignored by default: these wallets obviously already
+    # buy it, so it would fire a trivial signal. Removable via PATCH.
+    if req.source_token_address and req.source_token_address not in ignore_tokens:
+        ignore_tokens.insert(0, req.source_token_address)
+    watchlist_id = db.create_watchlist(
+        name=req.name,
+        chain=req.chain.value,
+        wallets=req.wallets,
+        source_token_address=req.source_token_address,
+        notes=req.notes,
+        min_wallets=req.min_wallets,
+        min_wallets_pct=req.min_wallets_pct,
+        buy_window_hours=req.buy_window_hours,
+        monitor_interval_hours=req.monitor_interval_hours,
+        min_buy_usd=req.min_buy_usd,
+        auto_monitor=req.auto_monitor,
+        ignore_tokens=ignore_tokens,
+    )
+    return _watchlist_out(_overview_or_404(watchlist_id))
+
+
+@app.post("/api/watchlists/from-job/{job_id}", status_code=201)
+async def create_watchlist_from_job(
+    job_id: str, req: Annotated[WatchlistFromJob, Body()]
+) -> WatchlistOut:
+    result = store.get(job_id)
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Result expired or unknown job id — run the query again.",
+        )
+    holders_req = result.request
+    # summary is sorted by max balance descending, so top_n keeps the whales.
+    wallets = [s.wallet_address for s in result.summary]
+    if req.top_n is not None:
+        wallets = wallets[: req.top_n]
+    if not wallets:
+        raise HTTPException(status_code=422, detail="The job produced no wallets.")
+    _enforce_wallet_cap(len(wallets))
+
+    name = req.name or (
+        f"{holders_req.chain.value} {holders_req.token_address[:10]}… "
+        f"buyers {holders_req.start_date}→{holders_req.end_date}"
+    )
+    create_req = WatchlistCreate(
+        name=name,
+        chain=holders_req.chain,
+        wallets=wallets,
+        source_token_address=holders_req.token_address,
+        notes=(
+            f"From holders job: {holders_req.chain.value} "
+            f"{holders_req.token_address} {holders_req.start_date}"
+            f"→{holders_req.end_date} ({holders_req.holder_mode.value})"
+        ),
+        min_wallets=req.min_wallets,
+        min_wallets_pct=req.min_wallets_pct,
+        buy_window_hours=req.buy_window_hours,
+        monitor_interval_hours=req.monitor_interval_hours,
+        min_buy_usd=req.min_buy_usd,
+        auto_monitor=req.auto_monitor,
+        ignore_tokens=req.ignore_tokens,
+    )
+    return await create_watchlist(create_req)
+
+
+@app.get("/api/watchlists/{watchlist_id}")
+async def get_watchlist(watchlist_id: int) -> WatchlistOut:
+    return _watchlist_out(_overview_or_404(watchlist_id))
+
+
+@app.get("/api/watchlists/{watchlist_id}/wallets")
+async def get_watchlist_wallets(watchlist_id: int) -> dict[str, object]:
+    _overview_or_404(watchlist_id)
+    wallets = db.get_wallets(watchlist_id)
+    return {"wallet_count": len(wallets), "wallets": wallets}
+
+
+@app.patch("/api/watchlists/{watchlist_id}")
+async def update_watchlist(
+    watchlist_id: int, req: Annotated[WatchlistUpdate, Body()]
+) -> WatchlistOut:
+    row = _overview_or_404(watchlist_id)
+    chain_enum = Chain(row["chain"])
+
+    fields: dict[str, object] = {}
+    for name in (
+        "name",
+        "notes",
+        "min_wallets",
+        "min_wallets_pct",
+        "buy_window_hours",
+        "monitor_interval_hours",
+        "min_buy_usd",
+    ):
+        value = getattr(req, name)
+        if value is not None:
+            fields[name] = value
+    if req.auto_monitor is not None:
+        fields["auto_monitor"] = int(req.auto_monitor)
+    try:
+        if req.ignore_tokens is not None:
+            fields["ignore_tokens"] = json.dumps(
+                normalize_addresses(chain_enum, req.ignore_tokens)
+            )
+        add = (
+            normalize_addresses(chain_enum, req.add_wallets)
+            if req.add_wallets
+            else []
+        )
+        remove = (
+            normalize_addresses(chain_enum, req.remove_wallets)
+            if req.remove_wallets
+            else []
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    if add:
+        current = set(db.get_wallets(watchlist_id))
+        resulting = current | set(add)
+        _enforce_wallet_cap(len(resulting - set(remove)))
+        db.add_wallets(watchlist_id, add)
+    if remove:
+        db.remove_wallets(watchlist_id, remove)
+
+    # Interval or auto changes reshape the schedule from the last run onwards.
+    if req.monitor_interval_hours is not None or req.auto_monitor:
+        interval = float(
+            req.monitor_interval_hours or row["monitor_interval_hours"]
+        )
+        base = row.get("last_run_at") or db.utcnow_iso()
+        fields["next_run_at"] = db.iso_plus_hours(base, interval)
+
+    db.update_watchlist_fields(watchlist_id, fields)
+    return _watchlist_out(_overview_or_404(watchlist_id))
+
+
+@app.delete("/api/watchlists/{watchlist_id}", status_code=204)
+async def delete_watchlist(watchlist_id: int) -> Response:
+    if not db.delete_watchlist(watchlist_id):
+        raise HTTPException(status_code=404, detail="Watchlist not found.")
+    return Response(status_code=204)
+
+
+@app.post("/api/watchlists/{watchlist_id}/monitor")
+async def run_watchlist_monitor(
+    watchlist_id: int, x_dune_api_key: ApiKeyHeader = None
+) -> MonitorResult:
+    key = resolve_api_key(x_dune_api_key)
+    try:
+        return await monitor.run_monitor(watchlist_id, api_key=key, trigger="manual")
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/api/watchlists/{watchlist_id}/runs")
+async def list_watchlist_runs(
+    watchlist_id: int, limit: Annotated[int, Query(ge=1, le=100)] = 20
+) -> list[MonitorRunOut]:
+    _overview_or_404(watchlist_id)
+    return [monitor.run_to_out(row) for row in db.list_runs(watchlist_id, limit)]
+
+
+# --------------------------------------------------------------------- signals
+
+
+@app.get("/api/signals")
+async def list_signals(
+    watchlist_id: Annotated[int | None, Query()] = None,
+    include_dismissed: Annotated[bool, Query()] = False,
+    limit: Annotated[int, Query(ge=1, le=500)] = 200,
+) -> list[SignalOut]:
+    rows = db.list_signals(
+        watchlist_id=watchlist_id,
+        include_dismissed=include_dismissed,
+        limit=limit,
+    )
+    return [monitor.signal_to_out(row) for row in rows]
+
+
+@app.post("/api/signals/{signal_id}/dismiss")
+async def dismiss_signal(signal_id: int) -> SignalOut:
+    if not db.set_signal_status(signal_id, "dismissed"):
+        raise HTTPException(status_code=404, detail="Signal not found.")
+    row = db.get_signal(signal_id)
+    assert row is not None
+    return monitor.signal_to_out(row)
+
+
+@app.post("/api/signals/{signal_id}/restore")
+async def restore_signal(signal_id: int) -> SignalOut:
+    if not db.set_signal_status(signal_id, "active"):
+        raise HTTPException(status_code=404, detail="Signal not found.")
+    row = db.get_signal(signal_id)
+    assert row is not None
+    return monitor.signal_to_out(row)
 
 
 if FRONTEND_DIR.is_dir():

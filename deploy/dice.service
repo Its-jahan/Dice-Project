@@ -9,11 +9,16 @@ User=dice
 Group=dice
 WorkingDirectory=/opt/dice/backend
 EnvironmentFile=-/etc/dice/dice.env
+# Watchlists/signals live in a SQLite DB under /var/lib/dice (StateDirectory
+# below creates it and keeps it writable despite ProtectSystem=strict).
+Environment=DICE_DB_PATH=/var/lib/dice/dice.db
 ExecStart=/opt/dice/backend/.venv/bin/uvicorn app.main:app \
     --host 127.0.0.1 --port 8000 --workers 2 --proxy-headers \
     --forwarded-allow-ips 127.0.0.1
 Restart=on-failure
 RestartSec=3
+StateDirectory=dice
+StateDirectoryMode=0750
 
 # The app only needs to read its own code and talk to api.dune.com.
 NoNewPrivileges=true

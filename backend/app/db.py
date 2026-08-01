@@ -1,0 +1,505 @@
+"""SQLite persistence for watchlists, monitor runs and co-buy signals.
+
+Watchlists are the one part of DICE that must survive a restart: they exist
+precisely so wallets can be re-checked hours and days later. SQLite keeps the
+zero-dependency deployment story (stdlib only, one file, WAL mode), and every
+function here opens a short-lived connection, so it is safe from any thread or
+worker process.
+
+Multi-worker note: uvicorn runs several processes in the deployed setup, each
+with its own scheduler loop. ``claim_next_due`` hands a due watchlist to
+exactly one of them via an atomic conditional UPDATE — the losers simply see
+zero rows changed.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import threading
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Iterator, Iterable
+
+from .config import settings
+
+# Keep this many finished runs per watchlist; older ones are pruned.
+RUN_HISTORY_LIMIT = 50
+# Cap on buyer entries stored per signal, so one absurd token cannot bloat a row.
+SIGNAL_BUYERS_LIMIT = 200
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS watchlists (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    name                   TEXT    NOT NULL,
+    chain                  TEXT    NOT NULL,
+    source_token_address   TEXT,
+    notes                  TEXT    NOT NULL DEFAULT '',
+    min_wallets            INTEGER NOT NULL DEFAULT 5,
+    min_wallets_pct        REAL    NOT NULL DEFAULT 10.0,
+    buy_window_hours       INTEGER NOT NULL DEFAULT 48,
+    monitor_interval_hours REAL    NOT NULL DEFAULT 24.0,
+    min_buy_usd            REAL    NOT NULL DEFAULT 0.0,
+    auto_monitor           INTEGER NOT NULL DEFAULT 1,
+    ignore_tokens          TEXT    NOT NULL DEFAULT '[]',
+    created_at             TEXT    NOT NULL,
+    last_run_at            TEXT,
+    next_run_at            TEXT,
+    claimed_until          TEXT
+);
+
+CREATE TABLE IF NOT EXISTS watchlist_wallets (
+    watchlist_id   INTEGER NOT NULL REFERENCES watchlists(id) ON DELETE CASCADE,
+    wallet_address TEXT    NOT NULL,
+    added_at       TEXT    NOT NULL,
+    PRIMARY KEY (watchlist_id, wallet_address)
+);
+
+CREATE TABLE IF NOT EXISTS monitor_runs (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    watchlist_id      INTEGER NOT NULL REFERENCES watchlists(id) ON DELETE CASCADE,
+    trigger           TEXT    NOT NULL DEFAULT 'manual',
+    started_at        TEXT    NOT NULL,
+    finished_at       TEXT,
+    status            TEXT    NOT NULL DEFAULT 'running',
+    error             TEXT,
+    window_hours      INTEGER NOT NULL,
+    wallets_checked   INTEGER NOT NULL DEFAULT 0,
+    wallets_truncated INTEGER NOT NULL DEFAULT 0,
+    buy_rows          INTEGER NOT NULL DEFAULT 0,
+    tokens_seen       INTEGER NOT NULL DEFAULT 0,
+    signals_fired     INTEGER NOT NULL DEFAULT 0,
+    execution_id      TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_runs_watchlist
+    ON monitor_runs (watchlist_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS signals (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    watchlist_id    INTEGER NOT NULL REFERENCES watchlists(id) ON DELETE CASCADE,
+    chain           TEXT    NOT NULL,
+    token_address   TEXT    NOT NULL,
+    token_symbol    TEXT,
+    wallet_count    INTEGER NOT NULL,
+    watchlist_size  INTEGER NOT NULL,
+    total_usd       REAL,
+    buyers          TEXT    NOT NULL DEFAULT '[]',
+    first_seen_at   TEXT    NOT NULL,
+    last_updated_at TEXT    NOT NULL,
+    status          TEXT    NOT NULL DEFAULT 'active',
+    UNIQUE (watchlist_id, token_address)
+);
+"""
+
+_init_lock = threading.Lock()
+_initialized_paths: set[str] = set()
+
+
+def utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def iso_plus_hours(start_iso: str, hours: float) -> str:
+    start = datetime.fromisoformat(start_iso)
+    return (start + timedelta(hours=hours)).isoformat(timespec="seconds")
+
+
+@contextmanager
+def connect() -> Iterator[sqlite3.Connection]:
+    """Short-lived connection to the configured database; commits and closes.
+
+    ``sqlite3``'s own context manager only wraps a transaction — it never
+    closes the handle — so this wrapper exists to guarantee both.
+    """
+    path = settings.db_path
+    if path not in _initialized_paths:
+        with _init_lock:
+            if path not in _initialized_paths:
+                Path(path).parent.mkdir(parents=True, exist_ok=True)
+                setup = sqlite3.connect(path, timeout=30)
+                try:
+                    setup.execute("PRAGMA journal_mode=WAL")
+                    setup.executescript(_SCHEMA)
+                    setup.commit()
+                finally:
+                    setup.close()
+                _initialized_paths.add(path)
+
+    conn = sqlite3.connect(path, timeout=30)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=30000")
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ------------------------------------------------------------------ watchlists
+
+
+def create_watchlist(
+    *,
+    name: str,
+    chain: str,
+    wallets: Iterable[str],
+    source_token_address: str | None,
+    notes: str,
+    min_wallets: int,
+    min_wallets_pct: float,
+    buy_window_hours: int,
+    monitor_interval_hours: float,
+    min_buy_usd: float,
+    auto_monitor: bool,
+    ignore_tokens: list[str],
+) -> int:
+    now = utcnow_iso()
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO watchlists (
+                name, chain, source_token_address, notes,
+                min_wallets, min_wallets_pct, buy_window_hours,
+                monitor_interval_hours, min_buy_usd, auto_monitor,
+                ignore_tokens, created_at, next_run_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                name,
+                chain,
+                source_token_address,
+                notes,
+                min_wallets,
+                min_wallets_pct,
+                buy_window_hours,
+                monitor_interval_hours,
+                min_buy_usd,
+                int(auto_monitor),
+                json.dumps(ignore_tokens),
+                now,
+                iso_plus_hours(now, monitor_interval_hours),
+            ),
+        )
+        watchlist_id = int(cursor.lastrowid)
+        conn.executemany(
+            "INSERT OR IGNORE INTO watchlist_wallets VALUES (?, ?, ?)",
+            [(watchlist_id, wallet, now) for wallet in wallets],
+        )
+    return watchlist_id
+
+
+def get_watchlist(watchlist_id: int) -> dict[str, Any] | None:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM watchlists WHERE id = ?", (watchlist_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_wallets(watchlist_id: int) -> list[str]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT wallet_address FROM watchlist_wallets "
+            "WHERE watchlist_id = ? ORDER BY added_at, wallet_address",
+            (watchlist_id,),
+        ).fetchall()
+        return [row["wallet_address"] for row in rows]
+
+
+_OVERVIEW_SQL = """
+    SELECT
+        w.*,
+        (SELECT COUNT(*) FROM watchlist_wallets ww
+          WHERE ww.watchlist_id = w.id)                    AS wallet_count,
+        (SELECT COUNT(*) FROM signals s
+          WHERE s.watchlist_id = w.id AND s.status = 'active')
+                                                           AS active_signals,
+        (SELECT r.status FROM monitor_runs r
+          WHERE r.watchlist_id = w.id
+          ORDER BY r.id DESC LIMIT 1)                      AS last_run_status,
+        (SELECT r.error FROM monitor_runs r
+          WHERE r.watchlist_id = w.id
+          ORDER BY r.id DESC LIMIT 1)                      AS last_run_error
+    FROM watchlists w
+"""
+
+
+def list_watchlists() -> list[dict[str, Any]]:
+    """All watchlists plus the derived columns the UI needs in one query."""
+    with connect() as conn:
+        rows = conn.execute(_OVERVIEW_SQL + " ORDER BY w.id DESC").fetchall()
+        return [dict(row) for row in rows]
+
+
+def get_watchlist_overview(watchlist_id: int) -> dict[str, Any] | None:
+    with connect() as conn:
+        row = conn.execute(
+            _OVERVIEW_SQL + " WHERE w.id = ?", (watchlist_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def update_watchlist_fields(watchlist_id: int, fields: dict[str, Any]) -> None:
+    if not fields:
+        return
+    columns = ", ".join(f"{key} = ?" for key in fields)
+    with connect() as conn:
+        conn.execute(
+            f"UPDATE watchlists SET {columns} WHERE id = ?",
+            (*fields.values(), watchlist_id),
+        )
+
+
+def add_wallets(watchlist_id: int, wallets: Iterable[str]) -> None:
+    now = utcnow_iso()
+    with connect() as conn:
+        conn.executemany(
+            "INSERT OR IGNORE INTO watchlist_wallets VALUES (?, ?, ?)",
+            [(watchlist_id, wallet, now) for wallet in wallets],
+        )
+
+
+def remove_wallets(watchlist_id: int, wallets: Iterable[str]) -> None:
+    with connect() as conn:
+        conn.executemany(
+            "DELETE FROM watchlist_wallets "
+            "WHERE watchlist_id = ? AND wallet_address = ?",
+            [(watchlist_id, wallet) for wallet in wallets],
+        )
+
+
+def delete_watchlist(watchlist_id: int) -> bool:
+    with connect() as conn:
+        cursor = conn.execute("DELETE FROM watchlists WHERE id = ?", (watchlist_id,))
+        return cursor.rowcount > 0
+
+
+# ------------------------------------------------------------------- scheduler
+
+
+def claim_next_due(*, now_iso: str, claim_minutes: int = 30) -> int | None:
+    """Atomically claim one due watchlist for this process, or return None.
+
+    A claim is a lease: it expires after ``claim_minutes`` so a worker that
+    dies mid-run does not park the watchlist forever.
+    """
+    claim_until = iso_plus_hours(now_iso, claim_minutes / 60)
+    with connect() as conn:
+        while True:
+            row = conn.execute(
+                """
+                SELECT id FROM watchlists
+                WHERE auto_monitor = 1
+                  AND (next_run_at IS NULL OR next_run_at <= ?)
+                  AND (claimed_until IS NULL OR claimed_until < ?)
+                ORDER BY next_run_at
+                LIMIT 1
+                """,
+                (now_iso, now_iso),
+            ).fetchone()
+            if row is None:
+                return None
+            cursor = conn.execute(
+                """
+                UPDATE watchlists SET claimed_until = ?
+                WHERE id = ? AND (claimed_until IS NULL OR claimed_until < ?)
+                """,
+                (claim_until, row["id"], now_iso),
+            )
+            conn.commit()
+            if cursor.rowcount == 1:
+                return int(row["id"])
+            # Another worker beat us to this one; try the next candidate.
+
+
+def finish_schedule(watchlist_id: int, *, interval_hours: float) -> None:
+    """Record a run happened now and release the scheduler claim."""
+    now = utcnow_iso()
+    update_watchlist_fields(
+        watchlist_id,
+        {
+            "last_run_at": now,
+            "next_run_at": iso_plus_hours(now, interval_hours),
+            "claimed_until": None,
+        },
+    )
+
+
+# ------------------------------------------------------------------------ runs
+
+
+def create_run(
+    *, watchlist_id: int, trigger: str, window_hours: int
+) -> int:
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO monitor_runs (watchlist_id, trigger, started_at, window_hours)
+            VALUES (?, ?, ?, ?)
+            """,
+            (watchlist_id, trigger, utcnow_iso(), window_hours),
+        )
+        return int(cursor.lastrowid)
+
+
+def finish_run(run_id: int, **fields: Any) -> None:
+    fields.setdefault("finished_at", utcnow_iso())
+    columns = ", ".join(f"{key} = ?" for key in fields)
+    with connect() as conn:
+        conn.execute(
+            f"UPDATE monitor_runs SET {columns} WHERE id = ?",
+            (*fields.values(), run_id),
+        )
+
+
+def get_run(run_id: int) -> dict[str, Any] | None:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM monitor_runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def list_runs(watchlist_id: int, limit: int = 20) -> list[dict[str, Any]]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM monitor_runs WHERE watchlist_id = ? "
+            "ORDER BY id DESC LIMIT ?",
+            (watchlist_id, limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def prune_runs(watchlist_id: int, keep: int = RUN_HISTORY_LIMIT) -> None:
+    with connect() as conn:
+        conn.execute(
+            """
+            DELETE FROM monitor_runs
+            WHERE watchlist_id = ? AND id NOT IN (
+                SELECT id FROM monitor_runs
+                WHERE watchlist_id = ? ORDER BY id DESC LIMIT ?
+            )
+            """,
+            (watchlist_id, watchlist_id, keep),
+        )
+
+
+# --------------------------------------------------------------------- signals
+
+
+def upsert_signal(
+    *,
+    watchlist_id: int,
+    chain: str,
+    token_address: str,
+    token_symbol: str | None,
+    wallet_count: int,
+    watchlist_size: int,
+    total_usd: float | None,
+    buyers: list[dict[str, Any]],
+) -> tuple[int, bool, int]:
+    """Insert or refresh a signal; returns (id, created, previous_wallet_count).
+
+    A dismissed signal is refreshed in place but keeps its dismissed status:
+    the user said "stop showing me this token" and a re-trigger should respect
+    that, while still recording the newest numbers for when they look again.
+    """
+    now = utcnow_iso()
+    buyers_json = json.dumps(buyers[:SIGNAL_BUYERS_LIMIT])
+    with connect() as conn:
+        existing = conn.execute(
+            "SELECT id, wallet_count, token_symbol FROM signals "
+            "WHERE watchlist_id = ? AND token_address = ?",
+            (watchlist_id, token_address),
+        ).fetchone()
+        if existing is None:
+            cursor = conn.execute(
+                """
+                INSERT INTO signals (
+                    watchlist_id, chain, token_address, token_symbol,
+                    wallet_count, watchlist_size, total_usd, buyers,
+                    first_seen_at, last_updated_at, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
+                """,
+                (
+                    watchlist_id,
+                    chain,
+                    token_address,
+                    token_symbol,
+                    wallet_count,
+                    watchlist_size,
+                    total_usd,
+                    buyers_json,
+                    now,
+                    now,
+                ),
+            )
+            return int(cursor.lastrowid), True, 0
+
+        conn.execute(
+            """
+            UPDATE signals SET
+                token_symbol = COALESCE(?, token_symbol),
+                wallet_count = ?, watchlist_size = ?, total_usd = ?,
+                buyers = ?, last_updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                token_symbol,
+                wallet_count,
+                watchlist_size,
+                total_usd,
+                buyers_json,
+                now,
+                existing["id"],
+            ),
+        )
+        return int(existing["id"]), False, int(existing["wallet_count"])
+
+
+def list_signals(
+    *,
+    watchlist_id: int | None = None,
+    include_dismissed: bool = False,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    query = (
+        "SELECT s.*, w.name AS watchlist_name FROM signals s "
+        "JOIN watchlists w ON w.id = s.watchlist_id"
+    )
+    conditions: list[str] = []
+    params: list[Any] = []
+    if watchlist_id is not None:
+        conditions.append("s.watchlist_id = ?")
+        params.append(watchlist_id)
+    if not include_dismissed:
+        conditions.append("s.status = 'active'")
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+    query += " ORDER BY s.last_updated_at DESC, s.id DESC LIMIT ?"
+    params.append(limit)
+    with connect() as conn:
+        rows = conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
+
+def get_signal(signal_id: int) -> dict[str, Any] | None:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT s.*, w.name AS watchlist_name FROM signals s "
+            "JOIN watchlists w ON w.id = s.watchlist_id WHERE s.id = ?",
+            (signal_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def set_signal_status(signal_id: int, status: str) -> bool:
+    with connect() as conn:
+        cursor = conn.execute(
+            "UPDATE signals SET status = ?, last_updated_at = ? WHERE id = ?",
+            (status, utcnow_iso(), signal_id),
+        )
+        return cursor.rowcount > 0

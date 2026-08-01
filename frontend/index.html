@@ -144,6 +144,18 @@
         </div>
       </div>
       <p id="resultsMeta" class="hint"></p>
+      <div class="watchlist-save">
+        <div class="field grow">
+          <label for="watchlistName">Save these wallets as a watchlist</label>
+          <input id="watchlistName" placeholder="Watchlist name" maxlength="120">
+        </div>
+        <div class="field shrink hidden" id="topNField">
+          <label for="watchlistTopN">Keep top N holders</label>
+          <input id="watchlistTopN" type="number" min="1" step="1">
+        </div>
+        <button type="button" id="saveWatchlistBtn">Create watchlist</button>
+        <span id="watchlistSaveStatus" class="status" role="status" aria-live="polite"></span>
+      </div>
       <div class="tabs" role="tablist">
         <button type="button" class="tab is-active" data-tab="snapshots" role="tab">Snapshots</button>
         <button type="button" class="tab" data-tab="summary" role="tab">Per-wallet summary</button>
@@ -152,6 +164,51 @@
         <table id="resultsTable"><thead></thead><tbody></tbody></table>
       </div>
       <p id="previewNote" class="hint"></p>
+    </section>
+
+    <!-- ------------------------------------------------ watchlists -->
+    <section class="card" id="watchlistsCard" aria-labelledby="watchlistsHeading">
+      <div class="results-head">
+        <h2 id="watchlistsHeading">Watchlists</h2>
+        <div class="actions">
+          <button type="button" id="refreshWatchlists">Refresh</button>
+        </div>
+      </div>
+      <p class="hint">
+        Wallets that bought a token early, watched for what they buy next.
+        Each monitor run asks Dune what these wallets bought on DEXes inside the
+        buy window; when enough of them bought the same token, it becomes a
+        signal below. <span id="autoMonitorHint"></span>
+      </p>
+      <p id="watchlistsEmpty" class="hint">
+        No watchlists yet — run a holder query over a token's first days, then
+        save its wallets from the results card.
+      </p>
+      <div class="scroll">
+        <table id="watchlistsTable" class="hidden"><thead></thead><tbody></tbody></table>
+      </div>
+      <span id="watchlistsStatus" class="status" role="status" aria-live="polite"></span>
+    </section>
+
+    <!-- ------------------------------------------------ signals -->
+    <section class="card" id="signalsCard" aria-labelledby="signalsHeading">
+      <div class="results-head">
+        <h2 id="signalsHeading">Signals</h2>
+        <div class="actions">
+          <label class="check-inline"><input type="checkbox" id="showDismissed">
+            Show dismissed</label>
+          <button type="button" id="refreshSignals">Refresh</button>
+        </div>
+      </div>
+      <p class="hint">
+        A signal means N of the watched wallets bought the same token inside the
+        buy window. Click a row to see exactly who bought and for how much.
+      </p>
+      <p id="signalsEmpty" class="hint">No signals yet.</p>
+      <div class="scroll">
+        <table id="signalsTable" class="hidden"><thead></thead><tbody></tbody></table>
+      </div>
+      <span id="signalsStatus" class="status" role="status" aria-live="polite"></span>
     </section>
   </main>
 
