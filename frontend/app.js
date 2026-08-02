@@ -120,6 +120,9 @@ const FIELD_HELP = {
     "Also show tokens that merely arrived without the wallet paying anything " +
     "in the same transaction — almost always spam airdrops. They never count " +
     "towards a signal; this is only for inspecting what was filtered out.",
+  liveIncludeUntradeable:
+    "Also show tokens with no liquidity pool on any DEX. Nobody can buy or " +
+    "sell those, so they never signal — this reveals what was filtered and why.",
 
   /* --- Telegram ------------------------------------------------------- */
   tgToken:
@@ -311,8 +314,17 @@ function fmtTime(iso) {
   return Number.isNaN(date.getTime()) ? iso : date.toLocaleString();
 }
 
+/** DexScreener names some chains differently from Dune (bnb -> bsc). */
+const DEXSCREENER_SLUGS = {
+  avalanche_c: "avalanche",
+  bnb: "bsc",
+  gnosis: "gnosischain",
+  sei: "seiv2",
+};
+
 function dexscreenerUrl(chain, token) {
-  return `https://dexscreener.com/${encodeURIComponent(chain)}/${encodeURIComponent(token)}`;
+  const slug = DEXSCREENER_SLUGS[chain] || chain;
+  return `https://dexscreener.com/${encodeURIComponent(slug)}/${encodeURIComponent(token)}`;
 }
 
 function monitorCap() {
@@ -982,8 +994,10 @@ async function deleteWatchlist(wl) {
 async function loadLiveTokens() {
   try {
     const airdrops = $("liveIncludeAirdrops").checked ? "true" : "false";
+    const untradeable = $("liveIncludeUntradeable").checked ? "true" : "false";
     const data = await api(
-      `/api/live/tokens?limit=50&include_airdrops=${airdrops}`,
+      `/api/live/tokens?limit=50&include_airdrops=${airdrops}` +
+        `&include_untradeable=${untradeable}`,
     );
     state.liveTokens = data.tokens || [];
     state.liveIncludesAirdrops = !!data.include_airdrops;
@@ -1005,7 +1019,7 @@ function renderLiveTokens() {
   const head = table.tHead.insertRow();
   const columns = ["Token", "Watchlist", "Buyers", "Progress to signal", "Buys"];
   if (state.liveIncludesAirdrops) columns.push("Paid for");
-  columns.push("Last buy", "");
+  columns.push("Liquidity", "Price", "Last buy", "");
   for (const title of columns) {
     head.appendChild(el("th", "small text-body-secondary", title));
   }
@@ -1019,7 +1033,8 @@ function renderLiveTokens() {
       "link-primary fw-medium text-decoration-none",
       row.token_symbol || shortAddress(row.token_address),
     );
-    link.href = dexscreenerUrl(row.chain, row.token_address);
+    // Prefer the exact pair URL the API gave us; it always resolves.
+    link.href = row.pair_url || dexscreenerUrl(row.chain, row.token_address);
     link.target = "_blank";
     link.rel = "noopener noreferrer";
     link.title = row.token_address;
@@ -1073,6 +1088,26 @@ function renderLiveTokens() {
         : "Nobody paid for these — one-way transfers, almost always an airdrop.";
       paidCell.appendChild(badge);
     }
+
+    // Liquidity is the sanity check: a token nobody can trade out of is not
+    // an opportunity however many wallets touched it.
+    const liquidityCell = tr.insertCell();
+    if (!row.has_pair) {
+      const badge = el("span", "badge text-bg-danger", "no pool");
+      badge.title =
+        "No liquidity pool anywhere — this token cannot be bought or sold, " +
+        "so it never signals.";
+      liquidityCell.appendChild(badge);
+    } else {
+      liquidityCell.textContent = fmtUsd(row.liquidity_usd);
+      liquidityCell.title = `24h volume ${fmtUsd(row.volume_24h)}`;
+    }
+
+    const priceCell = tr.insertCell();
+    priceCell.textContent =
+      row.price_usd === null || row.price_usd === undefined
+        ? "—"
+        : "$" + Number(row.price_usd).toPrecision(4);
 
     tr.insertCell().textContent = fmtTime(row.last_buy_at);
 
@@ -1636,6 +1671,7 @@ function init() {
   $("refreshLive").addEventListener("click", loadLiveTokens);
   $("liveSweep").addEventListener("click", runLiveSweep);
   $("liveIncludeAirdrops").addEventListener("change", loadLiveTokens);
+  $("liveIncludeUntradeable").addEventListener("change", loadLiveTokens);
   $("chain").addEventListener("change", updateRealtimeAvailability);
 
   for (const tab of document.querySelectorAll(".tab")) {

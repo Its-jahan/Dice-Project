@@ -160,6 +160,24 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
 
 CREATE INDEX IF NOT EXISTS idx_deliveries_recent
     ON webhook_deliveries (id DESC);
+
+-- Cached DexScreener answers. has_pair = 0 means the token has no liquidity
+-- pool anywhere, so it cannot have been bought and must not signal.
+CREATE TABLE IF NOT EXISTS token_market (
+    chain           TEXT    NOT NULL,
+    token_address   TEXT    NOT NULL,
+    has_pair        INTEGER NOT NULL DEFAULT 0,
+    price_usd       REAL,
+    liquidity_usd   REAL    NOT NULL DEFAULT 0,
+    volume_24h      REAL    NOT NULL DEFAULT 0,
+    fdv             REAL,
+    symbol          TEXT,
+    name            TEXT,
+    pair_url        TEXT,
+    pair_created_at TEXT,
+    checked_at      TEXT    NOT NULL,
+    PRIMARY KEY (chain, token_address)
+);
 """
 
 #: Deliveries kept for the diagnostics panel; older rows are pruned.
@@ -968,6 +986,79 @@ def live_watchlists(chain: str | None = None) -> list[dict[str, Any]]:
         params.append(chain)
     with connect() as conn:
         return [dict(row) for row in conn.execute(query, params).fetchall()]
+
+
+def get_token_markets(
+    *, chain: str, addresses: Iterable[str], fresh_after: str
+) -> dict[str, dict[str, Any]]:
+    """Cached market data for these tokens, dropping entries older than TTL."""
+    wanted = list(addresses)
+    if not wanted:
+        return {}
+    placeholders = ", ".join("?" for _ in wanted)
+    with connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT * FROM token_market
+            WHERE chain = ? AND checked_at >= ?
+              AND token_address IN ({placeholders})
+            """,
+            (chain, fresh_after, *wanted),
+        ).fetchall()
+    return {
+        row["token_address"]: {
+            "has_pair": bool(row["has_pair"]),
+            "price_usd": row["price_usd"],
+            "liquidity_usd": row["liquidity_usd"],
+            "volume_24h": row["volume_24h"],
+            "fdv": row["fdv"],
+            "symbol": row["symbol"],
+            "name": row["name"],
+            "pair_url": row["pair_url"],
+            "pair_created_at": row["pair_created_at"],
+        }
+        for row in rows
+    }
+
+
+def save_token_market(
+    *, chain: str, token_address: str, summary: dict[str, Any]
+) -> None:
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO token_market (
+                chain, token_address, has_pair, price_usd, liquidity_usd,
+                volume_24h, fdv, symbol, name, pair_url, pair_created_at,
+                checked_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (chain, token_address) DO UPDATE SET
+                has_pair = excluded.has_pair,
+                price_usd = excluded.price_usd,
+                liquidity_usd = excluded.liquidity_usd,
+                volume_24h = excluded.volume_24h,
+                fdv = excluded.fdv,
+                symbol = excluded.symbol,
+                name = excluded.name,
+                pair_url = excluded.pair_url,
+                pair_created_at = excluded.pair_created_at,
+                checked_at = excluded.checked_at
+            """,
+            (
+                chain,
+                token_address,
+                int(bool(summary.get("has_pair"))),
+                summary.get("price_usd"),
+                summary.get("liquidity_usd") or 0.0,
+                summary.get("volume_24h") or 0.0,
+                summary.get("fdv"),
+                summary.get("symbol"),
+                summary.get("name"),
+                summary.get("pair_url"),
+                summary.get("pair_created_at"),
+                utcnow_iso(),
+            ),
+        )
 
 
 def prune_events(older_than_iso: str) -> int:

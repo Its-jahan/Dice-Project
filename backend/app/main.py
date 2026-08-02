@@ -862,19 +862,25 @@ async def live_tokens(
     watchlist_id: Annotated[int | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     include_airdrops: Annotated[bool, Query()] = False,
+    include_untradeable: Annotated[bool, Query()] = False,
 ) -> dict[str, object]:
     """What the watched wallets are buying right now, below threshold included.
 
     A signal only appears once the threshold is crossed. This is the view of
     the build-up before that, so a token halfway there is visible instead of
-    invisible. One-way arrivals are excluded unless ``include_airdrops`` is
-    set — see :func:`app.realtime.parse_activity` for why that matters.
+    invisible. Two classes are excluded by default: one-way arrivals
+    (``include_airdrops``) and tokens with no liquidity pool at all
+    (``include_untradeable``), neither of which anybody actually bought.
     """
     return {
-        "tokens": realtime.accumulation_board(
-            watchlist_id=watchlist_id, limit=limit, only_buys=not include_airdrops
+        "tokens": await realtime.accumulation_board(
+            watchlist_id=watchlist_id,
+            limit=limit,
+            only_buys=not include_airdrops,
+            only_tradeable=not include_untradeable,
         ),
         "include_airdrops": include_airdrops,
+        "include_untradeable": include_untradeable,
     }
 
 

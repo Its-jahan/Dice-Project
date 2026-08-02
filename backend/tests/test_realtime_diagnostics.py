@@ -9,6 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import db, main
+from app import dexscreener
 from app.cache import DiskCache
 from app.config import settings
 from app.jobs import JobStore
@@ -18,9 +19,32 @@ WEBHOOK_ID = "wh_diag"
 WALLETS = [f"0x{i:040x}" for i in range(1, 6)]
 
 
+def _fake_market(**_kwargs):
+    """Stub DexScreener: every token in a test is tradeable unless said otherwise."""
+
+    async def market_data(chain, addresses, refresh=False):
+        return {
+            str(address).lower(): {
+                "has_pair": True,
+                "price_usd": 0.01,
+                "liquidity_usd": 50_000.0,
+                "volume_24h": 10_000.0,
+                "fdv": None,
+                "symbol": None,
+                "name": None,
+                "pair_url": None,
+                "pair_created_at": None,
+            }
+            for address in addresses
+        }
+
+    return market_data
+
+
 @pytest.fixture
 def client(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "db_path", str(tmp_path / "dice.db"))
+    monkeypatch.setattr(dexscreener, "market_data", _fake_market())
     monkeypatch.setattr(settings, "monitor_enabled", False)
     monkeypatch.setattr(settings, "dune_api_key", None, raising=False)
     monkeypatch.setattr(settings, "telegram_bot_token", None, raising=False)

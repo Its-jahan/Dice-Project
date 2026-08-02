@@ -106,6 +106,12 @@ class Settings:
     live_sweep_seconds: int = field(
         default_factory=lambda: _env_int("DICE_LIVE_SWEEP_SECONDS", 300)
     )
+    # A token needs at least this much pooled liquidity before it can signal.
+    # 0 still requires a pool to exist — which is what excludes spam that was
+    # never tradeable at all.
+    min_liquidity_usd: float = field(
+        default_factory=lambda: float(os.getenv("DICE_MIN_LIQUIDITY_USD", "1000"))
+    )
 
 
 settings = Settings()

@@ -8,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import db, main, realtime
+from app import dexscreener
 from app.cache import DiskCache
 from app.config import settings
 from app.jobs import JobStore
@@ -20,9 +21,32 @@ OTHER = "0x" + "7" * 40
 USDC = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
 
 
+def _fake_market(**_kwargs):
+    """Stub DexScreener: every token in a test is tradeable unless said otherwise."""
+
+    async def market_data(chain, addresses, refresh=False):
+        return {
+            str(address).lower(): {
+                "has_pair": True,
+                "price_usd": 0.01,
+                "liquidity_usd": 50_000.0,
+                "volume_24h": 10_000.0,
+                "fdv": None,
+                "symbol": None,
+                "name": None,
+                "pair_url": None,
+                "pair_created_at": None,
+            }
+            for address in addresses
+        }
+
+    return market_data
+
+
 @pytest.fixture
 def client(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "db_path", str(tmp_path / "dice.db"))
+    monkeypatch.setattr(dexscreener, "market_data", _fake_market())
     monkeypatch.setattr(settings, "monitor_enabled", False)
     monkeypatch.setattr(settings, "live_sweep_seconds", 3600)  # no background run
     monkeypatch.setattr(settings, "dune_api_key", None, raising=False)
@@ -232,6 +256,79 @@ def test_a_paid_buy_survives_alongside_airdrops(client):
     assert [row["token_address"] for row in board] == [GEM]
     assert board[0]["wallet_count"] == 3
     assert len(client.get("/api/signals").json()) == 1
+
+
+def _market_without(*poolless, liquidity=50_000.0):
+    """DexScreener stub where the named tokens have no liquidity pool."""
+    missing = {t.lower() for t in poolless}
+
+    async def market_data(chain, addresses, refresh=False):
+        return {
+            str(a).lower(): {
+                "has_pair": str(a).lower() not in missing,
+                "price_usd": 0.01,
+                "liquidity_usd": 0.0 if str(a).lower() in missing else liquidity,
+                "volume_24h": 10_000.0,
+                "fdv": None,
+                "symbol": "REAL",
+                "name": None,
+                "pair_url": None,
+                "pair_created_at": None,
+            }
+            for a in addresses
+        }
+
+    return market_data
+
+
+def test_a_token_with_no_liquidity_pool_never_signals(client, monkeypatch):
+    """The tokens that were 'not found' on DexScreener.
+
+    A token without a pool has never been bought by anyone — it cannot be.
+    Even a perfectly-formed paid transfer must not turn it into a signal.
+    """
+    monkeypatch.setattr(dexscreener, "market_data", _market_without(GEM))
+    _live_watchlist(client, min_wallets=3)
+
+    for wallet in WALLETS[:5]:
+        _buy(client, wallet, token=GEM)
+
+    assert client.get("/api/signals").json() == []
+    assert client.get("/api/live/tokens").json()["tokens"] == []
+    assert client.post("/api/live/sweep").json()["signals"] == 0
+
+    # It is still inspectable, so "why is this missing" has an answer.
+    shown = client.get("/api/live/tokens?include_untradeable=true").json()["tokens"]
+    assert [row["token_address"] for row in shown] == [GEM]
+    assert shown[0]["has_pair"] is False
+
+
+def test_thin_liquidity_is_below_the_bar(client, monkeypatch):
+    monkeypatch.setattr(
+        dexscreener, "market_data", _market_without(liquidity=50.0)
+    )
+    monkeypatch.setattr(settings, "min_liquidity_usd", 1000.0)
+    _live_watchlist(client, min_wallets=3)
+
+    for wallet in WALLETS[:4]:
+        _buy(client, wallet)
+
+    # A pool exists, so the board shows it — but it is too thin to signal on.
+    assert client.get("/api/live/tokens").json()["tokens"]
+    assert client.get("/api/signals").json() == []
+
+
+def test_market_data_enriches_the_board(client):
+    _live_watchlist(client, min_wallets=3)
+    for wallet in WALLETS[:3]:
+        _buy(client, wallet)
+
+    row = client.get("/api/live/tokens").json()["tokens"][0]
+
+    assert row["has_pair"] is True
+    assert row["price_usd"] == 0.01
+    assert row["liquidity_usd"] == 50_000.0
+    assert row["volume_24h"] == 10_000.0
 
 
 def test_board_only_covers_live_watchlists(client):

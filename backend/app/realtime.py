@@ -31,7 +31,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
-from . import db
+from . import db, dexscreener
 from .config import settings
 from .models import Chain, SignalOut
 from .monitor import effective_min_wallets, send_signal_notification, signal_to_out
@@ -160,7 +160,10 @@ def _to_int(value: Any) -> int | None:
 
 
 def evaluate_token(
-    watchlist: dict[str, Any], token_address: str
+    watchlist: dict[str, Any],
+    token_address: str,
+    *,
+    market: dict[str, Any] | None = None,
 ) -> tuple[SignalOut, bool, int] | None:
     """Re-check one token for one watchlist against the live event store.
 
@@ -192,13 +195,17 @@ def evaluate_token(
     if len(rows) < required:
         return None
 
-    symbol = next((row["token_symbol"] for row in rows if row["token_symbol"]), None)
+    market = market or {}
+    # DexScreener's symbol is authoritative; the transfer feed often has none.
+    symbol = market.get("symbol") or next(
+        (row["token_symbol"] for row in rows if row["token_symbol"]), None
+    )
     buyers = [
         {
             "wallet_address": row["wallet_address"],
             "buy_count": int(row["buy_count"] or 1),
-            # Alchemy's transfer feed carries no USD price; enrichment would
-            # need a separate price lookup, so this stays honest about that.
+            # The transfer feed has no per-wallet USD value; the token's price
+            # is reported on the signal instead of guessed at per buyer.
             "amount_usd": None,
             "first_buy_at": row["first_buy_at"],
             "last_buy_at": row["last_buy_at"],
@@ -229,8 +236,39 @@ def ignored_for(watchlist: dict[str, Any], chain: Chain) -> set[str]:
     )
 
 
+async def tradeable(chain: Chain, tokens: Iterable[str]) -> dict[str, dict[str, Any]]:
+    """Market data for tokens that actually have a pool; others are dropped.
+
+    A token with no liquidity pool has never been bought by anyone — it was
+    minted and distributed. Gating on this is what keeps spam out of signals,
+    and it is ground truth rather than a heuristic.
+
+    A lookup that fails leaves the token absent from the result, so an API
+    outage suppresses signals for a while rather than declaring real tokens
+    fake.
+    """
+    tokens = list(tokens)
+    if not tokens:
+        return {}
+    try:
+        markets = await dexscreener.market_data(chain, tokens)
+    except Exception:  # pragma: no cover - defensive
+        log.exception("market lookup failed for %s", chain.value)
+        return {}
+    return {
+        address: market
+        for address, market in markets.items()
+        if market.get("has_pair")
+        and (market.get("liquidity_usd") or 0.0) >= settings.min_liquidity_usd
+    }
+
+
 def check_token(
-    watchlist: dict[str, Any], token: str, chain: Chain
+    watchlist: dict[str, Any],
+    token: str,
+    chain: Chain,
+    *,
+    market: dict[str, Any] | None = None,
 ) -> tuple[SignalOut, bool] | None:
     """Evaluate one token and say whether it is worth announcing.
 
@@ -241,7 +279,7 @@ def check_token(
     if token in ignored_for(watchlist, chain):
         return None
     try:
-        result = evaluate_token(watchlist, token)
+        result = evaluate_token(watchlist, token, market=market)
     except Exception:  # pragma: no cover - defensive
         log.exception("live evaluation failed for watchlist %s", watchlist["id"])
         return None
@@ -285,16 +323,23 @@ async def ingest(payload: dict[str, Any], *, chain: Chain) -> dict[str, Any]:
     # Only the (wallet, token) pairs this delivery actually touched need
     # re-checking — everything else's count is unchanged.
     pairs = {(event["wallet_address"], event["token_address"]) for event in events}
+
+    # One batched market lookup for the whole delivery, before any evaluation:
+    # a token with no pool cannot have been bought and must not signal.
+    markets = await tradeable(chain, {token for _, token in pairs})
+
     fired: list[tuple[SignalOut, bool]] = []
     checked: set[tuple[int, str]] = set()
 
     for wallet, token in pairs:
+        if token not in markets:
+            continue
         for watchlist in db.realtime_watchlists_for_wallet(chain.value, wallet):
             key = (int(watchlist["id"]), token)
             if key in checked:
                 continue
             checked.add(key)
-            outcome = check_token(watchlist, token, chain)
+            outcome = check_token(watchlist, token, chain, market=markets[token])
             if outcome:
                 fired.append(outcome)
 
@@ -334,15 +379,21 @@ async def sweep() -> dict[str, Any]:
                 float(watchlist["min_wallets_pct"]),
                 len(wallets),
             )
-            for row in db.token_activity(
-                chain=chain_value, wallets=wallets, since_iso=since
-            ):
-                if row["wallet_count"] < required:
-                    # token_activity is sorted by wallet_count, so nothing
-                    # further down can qualify either.
-                    break
+            candidates = [
+                row["token_address"]
+                for row in db.token_activity(
+                    chain=chain_value, wallets=wallets, since_iso=since
+                )
+                # token_activity is sorted by wallet_count, so once one falls
+                # short nothing below it can qualify either.
+                if row["wallet_count"] >= required
+            ]
+            markets = await tradeable(chain, candidates)
+            for token in candidates:
+                if token not in markets:
+                    continue
                 checked_total += 1
-                outcome = check_token(watchlist, row["token_address"], chain)
+                outcome = check_token(watchlist, token, chain, market=markets[token])
                 if outcome:
                     fired.append(outcome)
         await announce(fired, chain=chain)
@@ -374,8 +425,12 @@ async def sweep_loop() -> None:
 # ------------------------------------------------------------------- the board
 
 
-def accumulation_board(
-    *, watchlist_id: int | None = None, limit: int = 50, only_buys: bool = True
+async def accumulation_board(
+    *,
+    watchlist_id: int | None = None,
+    limit: int = 50,
+    only_buys: bool = True,
+    only_tradeable: bool = True,
 ) -> list[dict[str, Any]]:
     """What the watched wallets are buying right now, threshold or not.
 
@@ -442,13 +497,41 @@ def accumulation_board(
                 }
             )
 
-    rows.sort(
+    # Annotate with real market data, and by default drop what cannot be
+    # traded at all — a token with no pool is spam, not an opportunity.
+    by_chain: dict[str, set[str]] = {}
+    for row in rows:
+        by_chain.setdefault(row["chain"], set()).add(row["token_address"])
+    markets: dict[tuple[str, str], dict[str, Any]] = {}
+    for chain_value, tokens in by_chain.items():
+        try:
+            found = await dexscreener.market_data(Chain(chain_value), tokens)
+        except Exception:  # pragma: no cover - defensive
+            log.exception("market lookup failed for %s", chain_value)
+            found = {}
+        for address, market in found.items():
+            markets[(chain_value, address)] = market
+
+    annotated: list[dict[str, Any]] = []
+    for row in rows:
+        market = markets.get((row["chain"], row["token_address"])) or {}
+        row["has_pair"] = bool(market.get("has_pair"))
+        row["price_usd"] = market.get("price_usd")
+        row["liquidity_usd"] = market.get("liquidity_usd")
+        row["volume_24h"] = market.get("volume_24h")
+        row["token_symbol"] = market.get("symbol") or row["token_symbol"]
+        row["pair_url"] = market.get("pair_url")
+        if only_tradeable and not row["has_pair"]:
+            continue
+        annotated.append(row)
+
+    annotated.sort(
         key=lambda row: (
             -(row["wallet_count"] / max(row["required"], 1)),
             row["last_buy_at"] or "",
         )
     )
-    return rows[:limit]
+    return annotated[:limit]
 
 
 def _json_list(raw: Any) -> Iterable[str]:

@@ -233,6 +233,19 @@ Two more arrivals are dropped: transfers *from* another wallet in the same
 watchlist (a token passed around the group is one position, not N buyers), and
 the usual stablecoin/wrapped-native stoplist.
 
+**And it must be tradeable.** A transfer proves a token moved, not that it can
+be bought. Spam tokens are minted and blasted at thousands of addresses without
+ever having a liquidity pool — the DexScreener link on such a token answers
+"Token or Pair Not Found", because there is nothing there. Every candidate is
+checked against DexScreener before it can signal: no pool, or less than
+`DICE_MIN_LIQUIDITY_USD` (default $1,000) of it, and it is out. This is ground
+truth rather than a heuristic, and it is what keeps the board honest — in
+testing, a poolless spam token had *more* buyers than the real one next to it.
+
+The same lookup fills the gap the transfer feed leaves: price, liquidity and
+24h volume now appear on the live board, and token links point at the actual
+pair URL so they always resolve. Answers are cached for 30 minutes.
+
 The trade-off is that a genuine CEX withdrawal or OTC purchase is also
 one-way and therefore not counted. **Include airdrops** on the live board shows
 everything that was filtered, with a `Paid for` column — `0 of 20` and a single

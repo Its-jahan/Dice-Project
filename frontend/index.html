@@ -327,6 +327,12 @@
               Include airdrops
             </label>
           </div>
+          <div class="form-check form-switch mb-0">
+            <input class="form-check-input" type="checkbox" id="liveIncludeUntradeable">
+            <label class="form-check-label small" for="liveIncludeUntradeable">
+              Include untradeable
+            </label>
+          </div>
           <button type="button" id="liveSweep" class="btn btn-outline-secondary btn-sm">
             Re-check now
           </button>
@@ -339,9 +345,11 @@
         <p class="small text-body-secondary">
           Every token the watched wallets are buying right now — including the ones
           <em>below</em> the signal threshold. A signal only appears once the threshold
-          is crossed; this is where you see it building. Only tokens the wallets
-          actually <strong>paid for</strong> are counted: an airdrop reaches thousands
-          of addresses at once and would otherwise look like coordinated buying.
+          is crossed; this is where you see it building. Two things are excluded:
+          arrivals the wallets did not <strong>pay for</strong> (an airdrop reaches
+          thousands of addresses at once and would otherwise look like coordinated
+          buying), and tokens with <strong>no liquidity pool</strong>, which cannot
+          be bought or sold at all.
         </p>
         <p id="liveEmpty" class="small text-body-secondary mb-0">
           Nothing bought yet by any live watchlist's wallets.
