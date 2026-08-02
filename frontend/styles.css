@@ -5,6 +5,41 @@
   font-size: 0.8rem;
 }
 
+/* Small circled "i" that explains the field it sits next to. Rendered as a
+   button so it is keyboard reachable, but styled to read as an annotation
+   rather than an action. */
+.info-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 0.95rem;
+  height: 0.95rem;
+  margin-left: 0.35rem;
+  padding: 0;
+  border: 1px solid currentColor;
+  border-radius: 50%;
+  background: none;
+  color: var(--bs-secondary-color);
+  font-size: 0.62rem;
+  font-style: italic;
+  font-weight: 700;
+  line-height: 1;
+  cursor: help;
+  vertical-align: middle;
+  flex: none;
+}
+
+.info-icon:hover,
+.info-icon:focus-visible {
+  color: var(--bs-primary);
+}
+
+/* Tooltips carry whole sentences, so give them room to breathe. */
+.tooltip-inner {
+  max-width: 320px;
+  text-align: left;
+}
+
 .signal-row {
   cursor: pointer;
 }

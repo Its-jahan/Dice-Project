@@ -28,6 +28,180 @@ const state = {
   realtime: null,     // /api/settings/realtime payload
 };
 
+/* --------------------------------------------------------------- field help
+ *
+ * One entry per form control, keyed by element id. Keeping the copy here
+ * rather than in markup means every field is guaranteed to have an
+ * explanation (missing ones are reported to the console at startup) and the
+ * wording can be reviewed in one place. Each line says something the label
+ * does not — a unit, a trade-off, or the consequence of the setting.
+ */
+
+const FIELD_HELP = {
+  /* --- Dune key ------------------------------------------------------- */
+  apiKey:
+    "Your Dune API key, from dune.com → Settings → API. Saved on this server " +
+    "and used both for the queries you run here and for scheduled monitoring.",
+
+  /* --- holder query --------------------------------------------------- */
+  chain:
+    "Which blockchain to read balances from. The values are Dune's own schema " +
+    "names, so Avalanche appears as avalanche_c rather than avalanche.",
+  tokenAddress:
+    "The token you want the holders of: its contract address on EVM chains, " +
+    "or its mint address on Solana.",
+  minBalance:
+    "Wallets holding less than this are dropped. Useful for filtering dust; " +
+    "0 keeps every positive balance.",
+  startDate:
+    "First day to include, in UTC. To find early buyers, set this to the " +
+    "token's launch day.",
+  endDate:
+    "Last day to include, in UTC. A date after today is clamped to today — no " +
+    "balance data exists for days that have not happened.",
+  holderMode:
+    "Daily gives one row per wallet per day. Held at any time gives wallets " +
+    "that appeared at least once. Continuous keeps only wallets that held on " +
+    "every single day of the range.",
+  includeContracts:
+    "Keep smart-contract addresses in the result. Turn this off to exclude " +
+    "pools, staking contracts and bridges, which hold tokens on behalf of " +
+    "users rather than owning them.",
+  excludeBurn:
+    "Drop the zero address and known burn sinks — they hold tokens nobody can " +
+    "ever spend.",
+  format:
+    "Format for the download. Excel carries both tables plus a record of the " +
+    "request; CSV carries only the tab you are looking at.",
+
+  /* --- save as watchlist ---------------------------------------------- */
+  watchlistName:
+    "A label for this watchlist. Defaults to the chain, token and date range " +
+    "you just queried.",
+  watchlistInterval:
+    "How often the scheduled Dune check runs. Every run costs credits, so a " +
+    "2-hour interval spends about 12× what a daily one does.",
+  watchlistDetection:
+    "DEX swaps only counts confirmed purchases. Any new position counts a " +
+    "balance going from zero to positive, which also catches OTC deals, CEX " +
+    "withdrawals and transfers. Both runs the two queries and labels every " +
+    "buyer, at roughly double the credits.",
+  watchlistRealtime:
+    "Also stream these wallets through Alchemy webhooks, so a signal fires " +
+    "seconds after a buy instead of waiting for the next scheduled check.",
+  watchlistTopN:
+    "Keep only this many wallets, largest holders first. Offered when the " +
+    "result is bigger than the monitoring cap.",
+
+  /* --- live monitoring ------------------------------------------------ */
+  rtToken:
+    "The auth token from the top of your Alchemy webhooks dashboard — not " +
+    "your app's API key. It lets DICE create and update webhooks for you.",
+  rtUrl:
+    "The public HTTPS address of this server. Alchemy delivers events to " +
+    "<address>/api/webhooks/alchemy, so it has to be reachable from the " +
+    "internet.",
+  rtSimWatchlist:
+    "Which live watchlist the test buy is injected into. The test uses " +
+    "exactly that list's threshold number of wallets, so a signal always fires.",
+
+  /* --- signals -------------------------------------------------------- */
+  showDismissed:
+    "Also list signals you dismissed. A dismissed signal stays muted even " +
+    "when the same token triggers again.",
+
+  /* --- Telegram ------------------------------------------------------- */
+  tgToken:
+    "The token @BotFather gives you when you create the bot. Paste a new one " +
+    "to replace what is stored.",
+  tgChat:
+    "Where alerts go: @channelusername for a public channel, the -100… id for " +
+    "a private one, or your own numeric id for a direct message. A channel " +
+    "also needs the bot added as an administrator.",
+
+  /* --- watchlist edit modal ------------------------------------------- */
+  wlMinWallets:
+    "The absolute floor of distinct buyers a token needs before it becomes a " +
+    "signal. Stops a small watchlist firing on two wallets.",
+  wlPct:
+    "Buyers needed as a share of the watchlist size. Whichever is higher — " +
+    "this or the absolute floor — is used; set 0 to disable it.",
+  wlMinUsd:
+    "Ignore a wallet's buy when its USD value is known and below this. Buys " +
+    "with no price yet, often the newest tokens, always count.",
+  wlWindow:
+    "How far back each check looks. A token qualifies if enough wallets " +
+    "bought it within this many hours.",
+  wlInterval:
+    "Gap between scheduled Dune checks. Each one is a paid query, so shorter " +
+    "intervals cost proportionally more.",
+  wlAuto:
+    "Let the scheduler run this list on its own. The Run now button works " +
+    "either way.",
+  wlRealtime:
+    "Stream these wallets through Alchemy so signals fire in seconds. Needs " +
+    "the Live monitoring card set up first.",
+  wlDetection:
+    "DEX swaps only counts confirmed purchases. Any new position also catches " +
+    "OTC deals, CEX withdrawals and transfers. Both runs the two queries and " +
+    "labels every buyer, at roughly double the credits.",
+  wlIgnore:
+    "Token addresses to never signal on, one per line. Stablecoins, wrapped " +
+    "native tokens and this watchlist's own source token are already ignored.",
+  wlAddWallets:
+    "Wallet addresses to start watching, one per line. Wallets already on the " +
+    "list are unaffected.",
+};
+
+function makeInfoIcon(text) {
+  const icon = document.createElement("button");
+  icon.type = "button";
+  icon.className = "info-icon";
+  icon.textContent = "i";
+  icon.setAttribute("aria-label", text);
+  icon.dataset.bsToggle = "tooltip";
+  icon.dataset.bsTitle = text;
+  // The icon often sits inside a <label>, where any click would activate the
+  // control the label points at — toggling a checkbox the user only meant to
+  // read about.
+  icon.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+  });
+  return icon;
+}
+
+/** Put an info icon on every form control, once. */
+function attachFieldHelp() {
+  const controls = document.querySelectorAll("input[id], select[id], textarea[id]");
+  for (const control of controls) {
+    const text = FIELD_HELP[control.id];
+    if (!text) {
+      console.warn(`No help text defined for field "${control.id}"`);
+      continue;
+    }
+    const label = document.querySelector(`label[for="${CSS.escape(control.id)}"]`);
+    if (label) {
+      if (label.querySelector(".info-icon")) continue;
+      label.appendChild(makeInfoIcon(text));
+    } else if (!control.dataset.bsToggle) {
+      // No label to hang an icon on (inputs that rely on their placeholder):
+      // put the tooltip on the control itself.
+      control.dataset.bsToggle = "tooltip";
+      control.dataset.bsTitle = text;
+    }
+  }
+
+  for (const node of document.querySelectorAll('[data-bs-toggle="tooltip"]')) {
+    // container:body keeps tooltips above the modal backdrop instead of being
+    // clipped inside it.
+    bootstrap.Tooltip.getOrCreateInstance(node, {
+      container: "body",
+      placement: "top",
+    });
+  }
+}
+
 /* -------------------------------------------------------------------- utils */
 
 function setStatus(id, message, kind) {
@@ -478,16 +652,13 @@ function updateRealtimeAvailability() {
   const toggle = $("watchlistRealtime");
   toggle.disabled = !(ready && supported);
   if (toggle.disabled) toggle.checked = false;
+  // The wording carries the reason it is unavailable; the info icon next to it
+  // explains what the feature does, and is left untouched here.
   $("watchlistRealtimeLabel").textContent = !supported
-    ? "n/a here"
+    ? "n/a on this chain"
     : ready
       ? "Alchemy"
       : "set up below";
-  $("watchlistRealtimeLabel").title = !supported
-    ? `Alchemy webhooks are not wired up for ${chain}.`
-    : ready
-      ? "Signals fire seconds after a buy instead of at the next scheduled check."
-      : "Add your Alchemy auth token and public URL in the Live monitoring card.";
 }
 
 function prepareWatchlistSave() {
@@ -1259,6 +1430,7 @@ function initDates() {
 
 function init() {
   initDates();
+  attachFieldHelp();
 
   $("saveKey").addEventListener("click", saveKey);
   $("clearKey").addEventListener("click", clearKey);

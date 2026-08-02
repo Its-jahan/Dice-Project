@@ -221,7 +221,6 @@
               <div class="col-md-3">
                 <label class="form-label small" for="watchlistDetection">
                   Count a buy as
-                  <span class="text-body-secondary" title="Both runs two Dune queries per check, so it costs about twice the credits.">&#9432;</span>
                 </label>
                 <select id="watchlistDetection" class="form-select form-select-sm">
                   <option value="both" selected>Both, labelled (recommended)</option>
@@ -233,8 +232,11 @@
                 <label class="form-label small d-block">Live</label>
                 <div class="form-check form-switch">
                   <input class="form-check-input" type="checkbox" id="watchlistRealtime">
-                  <label class="form-check-label small" for="watchlistRealtime"
-                         id="watchlistRealtimeLabel">Alchemy</label>
+                  <label class="form-check-label small" for="watchlistRealtime">
+                    <!-- Only this span is rewritten as availability changes, so
+                         the injected info icon beside it survives. -->
+                    <span id="watchlistRealtimeLabel">Alchemy</span>
+                  </label>
                 </div>
               </div>
               <div class="col-md-2 d-none" id="topNField">
