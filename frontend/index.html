@@ -311,7 +311,13 @@
           Live accumulation
           <span class="badge text-bg-danger ms-1" id="liveBadge">●</span>
         </h2>
-        <div class="d-flex align-items-center gap-2">
+        <div class="d-flex align-items-center gap-3">
+          <div class="form-check form-switch mb-0">
+            <input class="form-check-input" type="checkbox" id="liveIncludeAirdrops">
+            <label class="form-check-label small" for="liveIncludeAirdrops">
+              Include airdrops
+            </label>
+          </div>
           <button type="button" id="liveSweep" class="btn btn-outline-secondary btn-sm">
             Re-check now
           </button>
@@ -324,7 +330,9 @@
         <p class="small text-body-secondary">
           Every token the watched wallets are buying right now — including the ones
           <em>below</em> the signal threshold. A signal only appears once the threshold
-          is crossed; this is where you see it building.
+          is crossed; this is where you see it building. Only tokens the wallets
+          actually <strong>paid for</strong> are counted: an airdrop reaches thousands
+          of addresses at once and would otherwise look like coordinated buying.
         </p>
         <p id="liveEmpty" class="small text-body-secondary mb-0">
           Nothing bought yet by any live watchlist's wallets.

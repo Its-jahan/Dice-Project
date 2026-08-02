@@ -197,12 +197,26 @@ two very different causes — a broken webhook, or simply nobody buying:
 | **Send test signal** | Injects a fake `DICETEST` buy by the threshold number of wallets through the *real* ingest path — event store, threshold, signal row, Telegram push. If it works, everything downstream of Alchemy works. Dismiss the signal afterwards. |
 | **Recent deliveries** | Every real delivery and its outcome: `delivered`, `bad signature`, `unknown webhook`. A webhook that arrives and fails looks nothing like one that never arrives. |
 
-What live mode counts as a buy: a token **arriving** at a watched wallet.
-Transfers *from* another wallet in the same watchlist are skipped (a token
-passed around the group is one position, not N buyers), as is the usual
-stablecoin/wrapped-native stoplist. Without a swap decode this matches the
-"new position" semantics, so these buyers are labelled `live` — and because
-the transfer feed carries no price, live signals have no USD total.
+What live mode counts as a buy: a token arriving at a watched wallet **that
+the wallet paid for in the same transaction**. That last part is not a detail —
+it is what separates a purchase from an airdrop. Spam tokens are blasted at
+thousands of addresses at a time, so without the check a single spammer paying
+gas produces "20 of your 20 wallets bought this", which is both the strongest
+possible signal and completely meaningless. A swap costs the wallet ETH or a
+stablecoin in the same tx; an airdrop is one-way and the recipient is passive.
+
+Two more arrivals are dropped: transfers *from* another wallet in the same
+watchlist (a token passed around the group is one position, not N buyers), and
+the usual stablecoin/wrapped-native stoplist.
+
+The trade-off is that a genuine CEX withdrawal or OTC purchase is also
+one-way and therefore not counted. **Include airdrops** on the live board shows
+everything that was filtered, with a `Paid for` column — `0 of 20` and a single
+sender is an airdrop wearing a signal's clothes. Those rows never fire a
+signal.
+
+Because the transfer feed carries no price, live buyers are labelled `live` and
+live signals have no USD total.
 
 Live and scheduled monitoring write to the same signals table and the same
 Telegram alerts, so a watchlist can run either or both. Chains covered are

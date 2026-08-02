@@ -27,6 +27,7 @@ const state = {
   expandedSignals: new Set(),
   realtime: null,     // /api/settings/realtime payload
   liveTokens: [],     // accumulation board rows
+  liveIncludesAirdrops: false,
 };
 
 /* --------------------------------------------------------------- field help
@@ -110,6 +111,10 @@ const FIELD_HELP = {
   showDismissed:
     "Also list signals you dismissed. A dismissed signal stays muted even " +
     "when the same token triggers again.",
+  liveIncludeAirdrops:
+    "Also show tokens that merely arrived without the wallet paying anything " +
+    "in the same transaction — almost always spam airdrops. They never count " +
+    "towards a signal; this is only for inspecting what was filtered out.",
 
   /* --- Telegram ------------------------------------------------------- */
   tgToken:
@@ -952,8 +957,12 @@ async function deleteWatchlist(wl) {
 
 async function loadLiveTokens() {
   try {
-    const data = await api("/api/live/tokens?limit=50");
+    const airdrops = $("liveIncludeAirdrops").checked ? "true" : "false";
+    const data = await api(
+      `/api/live/tokens?limit=50&include_airdrops=${airdrops}`,
+    );
     state.liveTokens = data.tokens || [];
+    state.liveIncludesAirdrops = !!data.include_airdrops;
     renderLiveTokens();
   } catch (error) {
     setStatus("liveStatus", error.message, "error");
@@ -970,9 +979,10 @@ function renderLiveTokens() {
   if (!rows.length) return;
 
   const head = table.tHead.insertRow();
-  for (const title of [
-    "Token", "Watchlist", "Buyers", "Progress to signal", "Buys", "Last buy", "",
-  ]) {
+  const columns = ["Token", "Watchlist", "Buyers", "Progress to signal", "Buys"];
+  if (state.liveIncludesAirdrops) columns.push("Paid for");
+  columns.push("Last buy", "");
+  for (const title of columns) {
     head.appendChild(el("th", "small text-body-secondary", title));
   }
 
@@ -997,25 +1007,49 @@ function renderLiveTokens() {
     tr.insertCell().textContent =
       `${row.wallet_count} of ${row.watchlist_size}`;
 
-    // The bar is the point of this table: how close is it to firing?
+    // The bar is the point of this table: how close is it to firing? The
+    // count sits beside the bar rather than inside it — a low percentage
+    // makes the fill too narrow to hold the text, which clipped "40/200"
+    // into a misleading "40/2".
     const progressCell = tr.insertCell();
+    const wrap = el("div", "d-flex align-items-center gap-2");
     const pct = Math.min(100, Math.round((row.wallet_count / row.required) * 100));
-    const bar = el("div", "progress");
-    bar.style.minWidth = "120px";
-    bar.style.height = "1.1rem";
+    const bar = el("div", "progress flex-grow-1");
+    bar.style.minWidth = "90px";
+    bar.style.height = ".6rem";
     const fill = el(
       "div",
       "progress-bar" + (pct >= 100 ? " bg-danger" : pct >= 60 ? " bg-warning" : ""),
-      `${row.wallet_count}/${row.required}`,
     );
-    fill.style.width = `${Math.max(pct, 12)}%`;
-    bar.title =
+    fill.style.width = `${pct}%`;
+    bar.appendChild(fill);
+    wrap.appendChild(bar);
+    wrap.appendChild(
+      el("span", "small text-nowrap", `${row.wallet_count}/${row.required}`),
+    );
+    wrap.title =
       `${row.wallet_count} of the ${row.required} distinct buyers needed, ` +
       `within the last ${row.window_hours}h.`;
-    bar.appendChild(fill);
-    progressCell.appendChild(bar);
+    progressCell.appendChild(wrap);
 
     tr.insertCell().textContent = row.buy_count;
+
+    if (state.liveIncludesAirdrops) {
+      // In the unfiltered view this column is the tell: 0 paid out of many
+      // arrivals is an airdrop, not accumulation.
+      const paidCell = tr.insertCell();
+      const paid = row.paid_count;
+      const badge = el(
+        "span",
+        "badge " + (paid ? "text-bg-success" : "text-bg-secondary"),
+        paid ? `${paid} of ${row.buy_count}` : "airdrop",
+      );
+      badge.title = paid
+        ? `${paid} arrivals were paid for in the same transaction.`
+        : "Nobody paid for these — one-way transfers, almost always an airdrop.";
+      paidCell.appendChild(badge);
+    }
+
     tr.insertCell().textContent = fmtTime(row.last_buy_at);
 
     const statusCell = tr.insertCell();
@@ -1023,6 +1057,13 @@ function renderLiveTokens() {
       statusCell.appendChild(el("span", "badge text-bg-success", "signalled"));
     } else if (row.signal_status === "dismissed") {
       statusCell.appendChild(el("span", "badge text-bg-secondary", "dismissed"));
+    } else if (row.wallet_count >= row.required) {
+      // Only reachable in the airdrop view: past the threshold on arrivals
+      // nobody paid for, which is precisely why it never signalled.
+      const badge = el("span", "badge text-bg-secondary", "not counted");
+      badge.title =
+        "Over the threshold on unpaid arrivals only, so it does not signal.";
+      statusCell.appendChild(badge);
     } else {
       statusCell.appendChild(
         el("span", "small text-body-secondary", `${row.required - row.wallet_count} to go`),
@@ -1570,6 +1611,7 @@ function init() {
   $("rtRefreshDeliveries").addEventListener("click", loadDeliveries);
   $("refreshLive").addEventListener("click", loadLiveTokens);
   $("liveSweep").addEventListener("click", runLiveSweep);
+  $("liveIncludeAirdrops").addEventListener("change", loadLiveTokens);
   $("chain").addEventListener("change", updateRealtimeAvailability);
 
   for (const tab of document.querySelectorAll(".tab")) {

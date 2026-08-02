@@ -852,14 +852,21 @@ async def receive_alchemy_webhook(request: Request) -> dict[str, object]:
 async def live_tokens(
     watchlist_id: Annotated[int | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    include_airdrops: Annotated[bool, Query()] = False,
 ) -> dict[str, object]:
     """What the watched wallets are buying right now, below threshold included.
 
     A signal only appears once the threshold is crossed. This is the view of
     the build-up before that, so a token halfway there is visible instead of
-    invisible.
+    invisible. One-way arrivals are excluded unless ``include_airdrops`` is
+    set — see :func:`app.realtime.parse_activity` for why that matters.
     """
-    return {"tokens": realtime.accumulation_board(watchlist_id=watchlist_id, limit=limit)}
+    return {
+        "tokens": realtime.accumulation_board(
+            watchlist_id=watchlist_id, limit=limit, only_buys=not include_airdrops
+        ),
+        "include_airdrops": include_airdrops,
+    }
 
 
 @app.post("/api/live/sweep")
@@ -958,22 +965,39 @@ async def simulate_signal(body: Annotated[dict, Body()]) -> dict[str, object]:
         "type": "ADDRESS_ACTIVITY",
         "event": {
             "network": alchemy.network_for(chain) or chain.value,
+            # Both legs of a swap, as Alchemy delivers them: the token
+            # arriving, and the wallet paying for it in the same transaction.
+            # Without the payment leg this would look like an airdrop and be
+            # filtered out — which is exactly what a test should not do.
             "activity": [
-                {
-                    "fromAddress": "0x" + "1" * 40,
-                    "toAddress": wallet,
-                    "blockNum": "0x0",
-                    "hash": f"0x{run}{index:02x}",
-                    "value": 1234.5,
-                    "asset": SIMULATED_SYMBOL,
-                    "category": "erc20",
-                    "rawContract": {
-                        "address": SIMULATED_TOKEN,
-                        "decimals": 18,
-                        "rawValue": "0x1",
-                    },
-                }
+                leg
                 for index, wallet in enumerate(wallets[:needed])
+                for leg in (
+                    {
+                        "fromAddress": "0x" + "1" * 40,
+                        "toAddress": wallet,
+                        "blockNum": "0x0",
+                        "hash": f"0x{run}{index:02x}",
+                        "value": 1234.5,
+                        "asset": SIMULATED_SYMBOL,
+                        "category": "erc20",
+                        "rawContract": {
+                            "address": SIMULATED_TOKEN,
+                            "decimals": 18,
+                            "rawValue": "0x1",
+                        },
+                    },
+                    {
+                        "fromAddress": wallet,
+                        "toAddress": "0x" + "1" * 40,
+                        "blockNum": "0x0",
+                        "hash": f"0x{run}{index:02x}",
+                        "value": 0.5,
+                        "asset": "ETH",
+                        "category": "external",
+                        "rawContract": {"address": None},
+                    },
+                )
             ],
         },
     }

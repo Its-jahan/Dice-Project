@@ -132,6 +132,10 @@ CREATE TABLE IF NOT EXISTS wallet_events (
     amount         REAL,
     block_num      INTEGER,
     seen_at        TEXT    NOT NULL,
+    from_address   TEXT,
+    -- 1 when the wallet also sent value out in the same transaction, i.e. it
+    -- paid for the token. 0 for a one-way arrival: an airdrop.
+    is_buy         INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (chain, wallet_address, token_address, tx_hash)
 );
 
@@ -170,6 +174,10 @@ _initialized_paths: set[str] = set()
 _MIGRATIONS = (
     "ALTER TABLE watchlists ADD COLUMN buy_detection TEXT NOT NULL DEFAULT 'both'",
     "ALTER TABLE watchlists ADD COLUMN realtime INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE wallet_events ADD COLUMN from_address TEXT",
+    # Existing rows predate the airdrop check, so they default to "not a buy":
+    # they are exactly the one-way arrivals that made the board unusable.
+    "ALTER TABLE wallet_events ADD COLUMN is_buy INTEGER NOT NULL DEFAULT 0",
 )
 
 
@@ -814,6 +822,8 @@ def record_events(events: Iterable[dict[str, Any]]) -> int:
             event.get("amount"),
             event.get("block_num"),
             event.get("seen_at") or utcnow_iso(),
+            event.get("from_address"),
+            int(bool(event.get("is_buy"))),
         )
         for event in events
     ]
@@ -822,20 +832,32 @@ def record_events(events: Iterable[dict[str, Any]]) -> int:
     with connect() as conn:
         before = conn.total_changes
         conn.executemany(
-            "INSERT OR IGNORE INTO wallet_events VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO wallet_events "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             rows,
         )
         return conn.total_changes - before
 
 
 def events_in_window(
-    *, chain: str, token_address: str, since_iso: str, wallets: Iterable[str]
+    *,
+    chain: str,
+    token_address: str,
+    since_iso: str,
+    wallets: Iterable[str],
+    only_buys: bool = True,
 ) -> list[dict[str, Any]]:
-    """Per-wallet aggregate of one token's arrivals inside the window."""
+    """Per-wallet aggregate of one token's arrivals inside the window.
+
+    ``only_buys`` keeps arrivals the wallet actually paid for. Leave it on for
+    anything that fires a signal: an airdrop reaches thousands of addresses at
+    once and would otherwise look exactly like coordinated buying.
+    """
     wallet_list = list(wallets)
     if not wallet_list:
         return []
     placeholders = ", ".join("?" for _ in wallet_list)
+    buys_only = "AND is_buy = 1" if only_buys else ""
     with connect() as conn:
         rows = conn.execute(
             f"""
@@ -848,6 +870,7 @@ def events_in_window(
             FROM wallet_events
             WHERE chain = ? AND token_address = ? AND seen_at >= ?
               AND wallet_address IN ({placeholders})
+              {buys_only}
             GROUP BY wallet_address
             ORDER BY first_buy_at
             """,
@@ -894,7 +917,12 @@ def list_deliveries(limit: int = 20) -> list[dict[str, Any]]:
 
 
 def token_activity(
-    *, chain: str, wallets: Iterable[str], since_iso: str, limit: int = 300
+    *,
+    chain: str,
+    wallets: Iterable[str],
+    since_iso: str,
+    limit: int = 300,
+    only_buys: bool = True,
 ) -> list[dict[str, Any]]:
     """Every token these wallets touched in the window, busiest first.
 
@@ -906,6 +934,7 @@ def token_activity(
     if not wallet_list:
         return []
     placeholders = ", ".join("?" for _ in wallet_list)
+    buys_only = "AND is_buy = 1" if only_buys else ""
     with connect() as conn:
         rows = conn.execute(
             f"""
@@ -915,10 +944,13 @@ def token_activity(
                 COUNT(*)                       AS buy_count,
                 MAX(token_symbol)              AS token_symbol,
                 MIN(seen_at)                   AS first_buy_at,
-                MAX(seen_at)                   AS last_buy_at
+                MAX(seen_at)                   AS last_buy_at,
+                SUM(is_buy)                    AS paid_count,
+                COUNT(DISTINCT from_address)   AS sender_count
             FROM wallet_events
             WHERE chain = ? AND seen_at >= ?
               AND wallet_address IN ({placeholders})
+              {buys_only}
             GROUP BY token_address
             ORDER BY wallet_count DESC, last_buy_at DESC
             LIMIT ?

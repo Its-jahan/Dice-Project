@@ -68,15 +68,34 @@ def parse_activity(
     Alchemy sends one delivery per block containing an ``activity`` array of
     transfers touching *any* registered address, in either direction — so a
     watched wallet **sending** a token shows up here too and must be skipped.
+
+    Each arrival is marked ``is_buy`` when the same wallet also sent value out
+    in the same transaction. That is what separates a purchase from an
+    airdrop: a swap costs the wallet ETH or a stablecoin in the same tx, while
+    an airdrop is one-way and the recipient is entirely passive. Without this
+    check a spam token blasted at thousands of addresses is indistinguishable
+    from a hundred wallets independently buying the same thing.
     """
     event = payload.get("event") or {}
-    activities = event.get("activity") or []
+    activities = [
+        item for item in (event.get("activity") or []) if isinstance(item, dict)
+    ]
     seen_at = _iso(_utcnow())
-    events: list[dict[str, Any]] = []
 
+    # First pass: which (transaction, wallet) pairs paid something out? Every
+    # category counts here — a swap may be paid in native ETH ("external"),
+    # in WETH or in a stablecoin ("erc20").
+    paid: set[tuple[str, str]] = set()
     for item in activities:
-        if not isinstance(item, dict):
+        if item.get("removed"):
             continue
+        sender = str(item.get("fromAddress") or "").strip().lower()
+        sender_tx = str(item.get("hash") or "").strip().lower()
+        if sender and sender_tx and sender in watched:
+            paid.add((sender_tx, sender))
+
+    events: list[dict[str, Any]] = []
+    for item in activities:
         # A reorg'd transfer never happened; do not let it count as a buy.
         if item.get("removed"):
             continue
@@ -113,6 +132,8 @@ def parse_activity(
                 "amount": _to_float(item.get("value")),
                 "block_num": _to_int(item.get("blockNum")),
                 "seen_at": seen_at,
+                "from_address": from_address or None,
+                "is_buy": (tx_hash, to_address) in paid,
             }
         )
     return events
@@ -354,7 +375,7 @@ async def sweep_loop() -> None:
 
 
 def accumulation_board(
-    *, watchlist_id: int | None = None, limit: int = 50
+    *, watchlist_id: int | None = None, limit: int = 50, only_buys: bool = True
 ) -> list[dict[str, Any]]:
     """What the watched wallets are buying right now, threshold or not.
 
@@ -390,7 +411,10 @@ def accumulation_board(
         }
 
         for row in db.token_activity(
-            chain=chain.value, wallets=wallets, since_iso=since
+            chain=chain.value,
+            wallets=wallets,
+            since_iso=since,
+            only_buys=only_buys,
         ):
             token = row["token_address"]
             if token in ignores:
@@ -404,6 +428,11 @@ def accumulation_board(
                     "token_symbol": row["token_symbol"],
                     "wallet_count": row["wallet_count"],
                     "buy_count": row["buy_count"],
+                    # How many of those arrivals the wallet actually paid for.
+                    # Equal to buy_count in the default view; lower in the
+                    # unfiltered one, which is how an airdrop shows itself.
+                    "paid_count": int(row.get("paid_count") or 0),
+                    "sender_count": int(row.get("sender_count") or 0),
                     "watchlist_size": len(wallets),
                     "required": required,
                     "window_hours": window_hours,

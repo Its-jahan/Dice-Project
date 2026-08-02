@@ -60,6 +60,8 @@ def _live_watchlist(client, *, min_wallets=5, wallets=None):
 
 
 def _buy(client, wallet, token=GEM, tx=None):
+    """Deliver a genuine purchase: the token in, and payment out, one tx."""
+    tx = tx or f"0x{wallet[-6:]}{token[-4:]}"
     payload = {
         "webhookId": WEBHOOK_ID,
         "type": "ADDRESS_ACTIVITY",
@@ -69,13 +71,23 @@ def _buy(client, wallet, token=GEM, tx=None):
                 {
                     "fromAddress": "0x" + "1" * 40,
                     "toAddress": wallet,
-                    "hash": tx or f"0x{wallet[-6:]}{token[-4:]}",
+                    "hash": tx,
                     "blockNum": "0x1",
                     "value": 100.0,
                     "asset": "GEM" if token == GEM else "OTHER",
                     "category": "erc20",
                     "rawContract": {"address": token},
-                }
+                },
+                {
+                    "fromAddress": wallet,
+                    "toAddress": "0x" + "d" * 40,
+                    "hash": tx,
+                    "blockNum": "0x1",
+                    "value": 0.4,
+                    "asset": "ETH",
+                    "category": "external",
+                    "rawContract": {"address": None},
+                },
             ],
         },
     }
@@ -152,6 +164,76 @@ def test_board_hides_ignored_tokens(client):
     assert board == []
 
 
+def _airdrop(client, wallet, token=GEM, tx=None):
+    """A one-way arrival: the wallet receives and pays nothing."""
+    payload = {
+        "webhookId": WEBHOOK_ID,
+        "type": "ADDRESS_ACTIVITY",
+        "event": {
+            "network": "ETH_MAINNET",
+            "activity": [
+                {
+                    "fromAddress": "0x" + "5" * 40,   # one spammer, many wallets
+                    "toAddress": wallet,
+                    "hash": tx or f"0xdrop{wallet[-6:]}",
+                    "blockNum": "0x1",
+                    "value": 1000000.0,
+                    "asset": None,
+                    "category": "erc20",
+                    "rawContract": {"address": token},
+                }
+            ],
+        },
+    }
+    body = json.dumps(payload).encode()
+    signature = hmac.new(SIGNING_KEY.encode(), body, hashlib.sha256).hexdigest()
+    return client.post(
+        "/api/webhooks/alchemy",
+        content=body,
+        headers={
+            "X-Alchemy-Signature": signature,
+            "Content-Type": "application/json",
+        },
+    )
+
+
+def test_an_airdrop_to_many_wallets_never_reaches_the_board_or_a_signal(client):
+    """The failure that made the board unusable: spam blasted at every wallet.
+
+    Ten of ten watched wallets "receiving" the same token looks like maximal
+    conviction and is in fact one spammer paying gas.
+    """
+    _live_watchlist(client, min_wallets=3)
+
+    for wallet in WALLETS:
+        _airdrop(client, wallet)
+
+    assert client.get("/api/live/tokens").json()["tokens"] == []
+    assert client.get("/api/signals").json() == []
+    assert client.post("/api/live/sweep").json()["signals"] == 0
+
+    # The events are still stored, so the filtered view can explain itself.
+    shown = client.get("/api/live/tokens?include_airdrops=true").json()["tokens"]
+    assert len(shown) == 1
+    assert shown[0]["wallet_count"] == 10
+    assert shown[0]["paid_count"] == 0
+    assert shown[0]["sender_count"] == 1   # one spammer behind all of them
+
+
+def test_a_paid_buy_survives_alongside_airdrops(client):
+    _live_watchlist(client, min_wallets=3)
+    for wallet in WALLETS:
+        _airdrop(client, wallet, token=OTHER)
+    for wallet in WALLETS[:3]:
+        _buy(client, wallet, token=GEM)
+
+    board = client.get("/api/live/tokens").json()["tokens"]
+
+    assert [row["token_address"] for row in board] == [GEM]
+    assert board[0]["wallet_count"] == 3
+    assert len(client.get("/api/signals").json()) == 1
+
+
 def test_board_only_covers_live_watchlists(client):
     watchlist_id = _live_watchlist(client, min_wallets=5)
     for wallet in WALLETS[:3]:
@@ -205,6 +287,7 @@ def test_sweep_fires_when_wallets_are_added_to_the_list_later(client):
                 "tx_hash": "0xlate",
                 "token_symbol": "GEM",
                 "amount": 5.0,
+                "is_buy": True,
             }
         ]
     )
@@ -244,6 +327,7 @@ def test_sweep_reports_a_strengthened_signal_once(client):
                 "token_address": GEM,
                 "tx_hash": "0xextra",
                 "token_symbol": "GEM",
+                "is_buy": True,
             }
         ]
     )

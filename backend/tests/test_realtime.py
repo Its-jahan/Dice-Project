@@ -36,6 +36,25 @@ def _activity(to_address, token=GEM, tx="0xabc", **overrides):
     return item
 
 
+def _payment(from_address, tx, asset="ETH", category="external"):
+    """The outgoing leg of a swap: the wallet paying for what it received."""
+    return {
+        "fromAddress": from_address,
+        "toAddress": "0x" + "d" * 40,   # a router
+        "blockNum": "0x1312d00",
+        "hash": tx,
+        "value": 0.5,
+        "asset": asset,
+        "category": category,
+        "rawContract": {"address": None},
+    }
+
+
+def _buy_activity(wallet, token=GEM, tx="0xabc"):
+    """A paid-for arrival: both legs of the swap, as Alchemy delivers them."""
+    return [_activity(wallet, token=token, tx=tx), _payment(wallet, tx)]
+
+
 def _payload(*activities):
     return {
         "webhookId": WEBHOOK_ID,
@@ -164,6 +183,52 @@ def test_parse_activity_keeps_only_incoming_third_party_token_transfers():
     assert event["block_num"] == 0x1312D00
 
 
+def test_parse_activity_separates_a_paid_buy_from_an_airdrop():
+    watched = {w.lower() for w in WALLETS}
+    payload = _payload(
+        # A swap: the token arrives and the wallet pays ETH in the same tx.
+        *_buy_activity(WALLETS[0], tx="0xswap"),
+        # An airdrop: the token just shows up, the wallet spends nothing.
+        _activity(WALLETS[1], tx="0xdrop"),
+    )
+
+    events = {
+        event["wallet_address"]: event
+        for event in realtime.parse_activity(
+            payload, chain=Chain.ethereum, watched=watched
+        )
+    }
+
+    assert events[WALLETS[0]]["is_buy"] is True
+    assert events[WALLETS[1]]["is_buy"] is False
+    assert events[WALLETS[0]]["from_address"] == OUTSIDER
+
+
+def test_paying_with_a_token_also_counts_as_a_buy():
+    """Not every swap pays in native ETH — a USDC leg is just as much a buy."""
+    watched = {w.lower() for w in WALLETS}
+    payload = _payload(
+        _activity(WALLETS[0], tx="0xswap"),
+        _payment(WALLETS[0], "0xswap", asset="USDC", category="erc20"),
+    )
+
+    events = realtime.parse_activity(payload, chain=Chain.ethereum, watched=watched)
+
+    assert [event["is_buy"] for event in events] == [True]
+
+
+def test_payment_in_a_different_transaction_does_not_launder_an_airdrop():
+    watched = {w.lower() for w in WALLETS}
+    payload = _payload(
+        _activity(WALLETS[0], tx="0xdrop"),
+        _payment(WALLETS[0], "0xunrelated"),   # spending elsewhere in the block
+    )
+
+    events = realtime.parse_activity(payload, chain=Chain.ethereum, watched=watched)
+
+    assert [event["is_buy"] for event in events] == [False]
+
+
 # ------------------------------------------------------------ end to end
 
 
@@ -173,14 +238,14 @@ def test_third_buyer_fires_a_signal_immediately(client):
     # Two buyers: below the threshold of 3, so nothing yet.
     for index in range(2):
         response = _deliver(
-            client, _payload(_activity(WALLETS[index], tx=f"0x{index}"))
+            client, _payload(*_buy_activity(WALLETS[index], tx=f"0x{index}"))
         )
         assert response.status_code == 200
         assert response.json()["signals"] == 0
     assert client.get("/api/signals").json() == []
 
     # The third buyer crosses it — the signal exists the moment the event lands.
-    response = _deliver(client, _payload(_activity(WALLETS[2], tx="0x2c")))
+    response = _deliver(client, _payload(*_buy_activity(WALLETS[2], tx="0x2c")))
 
     assert response.json()["signals"] == 1
     signals = client.get("/api/signals").json()
@@ -197,9 +262,9 @@ def test_third_buyer_fires_a_signal_immediately(client):
 def test_redelivery_does_not_double_count_a_buyer(client):
     _live_watchlist(client)
     payload = _payload(
-        _activity(WALLETS[0], tx="0xa"),
-        _activity(WALLETS[1], tx="0xb"),
-        _activity(WALLETS[2], tx="0xc"),
+        *_buy_activity(WALLETS[0], tx="0xa"),
+        *_buy_activity(WALLETS[1], tx="0xb"),
+        *_buy_activity(WALLETS[2], tx="0xc"),
     )
 
     first = _deliver(client, payload).json()
@@ -226,7 +291,7 @@ def test_stoplisted_token_never_fires(client):
 def test_events_only_count_inside_the_buy_window(client):
     watchlist_id = _live_watchlist(client)
     for index in range(3):
-        _deliver(client, _payload(_activity(WALLETS[index], tx=f"0x{index}")))
+        _deliver(client, _payload(*_buy_activity(WALLETS[index], tx=f"0x{index}")))
     assert len(client.get("/api/signals").json()) == 1
 
     # Shrink the window so the stored events fall outside it; a re-evaluation
