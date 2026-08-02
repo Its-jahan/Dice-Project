@@ -101,6 +101,11 @@ class Settings:
     public_base_url: str | None = field(
         default_factory=lambda: os.getenv("DICE_PUBLIC_URL") or None
     )
+    # How often the live sweep re-checks stored events against each live
+    # watchlist's threshold. Reads only local SQLite, so this is cheap.
+    live_sweep_seconds: int = field(
+        default_factory=lambda: _env_int("DICE_LIVE_SWEEP_SECONDS", 300)
+    )
 
 
 settings = Settings()

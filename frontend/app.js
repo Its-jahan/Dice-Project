@@ -26,6 +26,7 @@ const state = {
   editingWatchlist: null,   // watchlist object open in the edit modal
   expandedSignals: new Set(),
   realtime: null,     // /api/settings/realtime payload
+  liveTokens: [],     // accumulation board rows
 };
 
 /* --------------------------------------------------------------- field help
@@ -947,6 +948,107 @@ async function deleteWatchlist(wl) {
   }
 }
 
+/* ------------------------------------------------------- live accumulation */
+
+async function loadLiveTokens() {
+  try {
+    const data = await api("/api/live/tokens?limit=50");
+    state.liveTokens = data.tokens || [];
+    renderLiveTokens();
+  } catch (error) {
+    setStatus("liveStatus", error.message, "error");
+  }
+}
+
+function renderLiveTokens() {
+  const rows = state.liveTokens;
+  const table = $("liveTable");
+  $("liveEmpty").classList.toggle("d-none", !!rows.length);
+  table.classList.toggle("d-none", !rows.length);
+  table.tHead.innerHTML = "";
+  table.tBodies[0].innerHTML = "";
+  if (!rows.length) return;
+
+  const head = table.tHead.insertRow();
+  for (const title of [
+    "Token", "Watchlist", "Buyers", "Progress to signal", "Buys", "Last buy", "",
+  ]) {
+    head.appendChild(el("th", "small text-body-secondary", title));
+  }
+
+  for (const row of rows) {
+    const tr = table.tBodies[0].insertRow();
+
+    const tokenCell = tr.insertCell();
+    const link = el(
+      "a",
+      "link-primary fw-medium text-decoration-none",
+      row.token_symbol || shortAddress(row.token_address),
+    );
+    link.href = dexscreenerUrl(row.chain, row.token_address);
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.title = row.token_address;
+    tokenCell.appendChild(link);
+    tokenCell.appendChild(el("span", "mono ms-2", shortAddress(row.token_address)));
+
+    tr.insertCell().textContent = row.watchlist_name;
+
+    tr.insertCell().textContent =
+      `${row.wallet_count} of ${row.watchlist_size}`;
+
+    // The bar is the point of this table: how close is it to firing?
+    const progressCell = tr.insertCell();
+    const pct = Math.min(100, Math.round((row.wallet_count / row.required) * 100));
+    const bar = el("div", "progress");
+    bar.style.minWidth = "120px";
+    bar.style.height = "1.1rem";
+    const fill = el(
+      "div",
+      "progress-bar" + (pct >= 100 ? " bg-danger" : pct >= 60 ? " bg-warning" : ""),
+      `${row.wallet_count}/${row.required}`,
+    );
+    fill.style.width = `${Math.max(pct, 12)}%`;
+    bar.title =
+      `${row.wallet_count} of the ${row.required} distinct buyers needed, ` +
+      `within the last ${row.window_hours}h.`;
+    bar.appendChild(fill);
+    progressCell.appendChild(bar);
+
+    tr.insertCell().textContent = row.buy_count;
+    tr.insertCell().textContent = fmtTime(row.last_buy_at);
+
+    const statusCell = tr.insertCell();
+    if (row.signal_status === "active") {
+      statusCell.appendChild(el("span", "badge text-bg-success", "signalled"));
+    } else if (row.signal_status === "dismissed") {
+      statusCell.appendChild(el("span", "badge text-bg-secondary", "dismissed"));
+    } else {
+      statusCell.appendChild(
+        el("span", "small text-body-secondary", `${row.required - row.wallet_count} to go`),
+      );
+    }
+  }
+}
+
+async function runLiveSweep() {
+  await withBusy($("liveSweep"), async () => {
+    setStatus("liveStatus", "Re-checking stored buys against every threshold…", "");
+    try {
+      const result = await api("/api/live/sweep", { method: "POST" });
+      setStatus(
+        "liveStatus",
+        `Checked ${result.checked} token(s) at or above threshold · ` +
+          `${result.signals} signal(s) fired.`,
+        result.signals ? "ok" : "",
+      );
+      await Promise.all([loadLiveTokens(), loadSignals()]);
+    } catch (error) {
+      setStatus("liveStatus", error.message, "error");
+    }
+  });
+}
+
 /* ---------------------------------------------------------------- signals */
 
 async function loadSignals() {
@@ -1410,6 +1512,10 @@ async function testNotification() {
 /* ---------------------------------------------------------------- polling */
 
 function startPolling() {
+  // The live board moves fastest, so it refreshes on its own shorter beat.
+  window.setInterval(() => {
+    if (document.visibilityState === "visible") loadLiveTokens();
+  }, 20_000);
   window.setInterval(() => {
     if (document.visibilityState === "visible") {
       loadWatchlists();
@@ -1462,6 +1568,8 @@ function init() {
   $("rtCheckUrl").addEventListener("click", checkWebhookUrl);
   $("rtSimulate").addEventListener("click", simulateSignal);
   $("rtRefreshDeliveries").addEventListener("click", loadDeliveries);
+  $("refreshLive").addEventListener("click", loadLiveTokens);
+  $("liveSweep").addEventListener("click", runLiveSweep);
   $("chain").addEventListener("change", updateRealtimeAvailability);
 
   for (const tab of document.querySelectorAll(".tab")) {
@@ -1477,6 +1585,7 @@ function init() {
   refreshConfig().then(() => {
     loadWatchlists();
     loadSignals();
+    loadLiveTokens();
     updateRealtimeAvailability();
   });
   loadNotificationSettings();

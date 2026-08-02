@@ -78,17 +78,21 @@ SIMULATED_SYMBOL = "DICETEST"
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    """Run the watchlist scheduler for the lifetime of the process."""
-    scheduler_task: asyncio.Task[None] | None = None
+    """Run the background loops for the lifetime of the process."""
+    tasks: list[asyncio.Task[None]] = []
     if settings.monitor_enabled:
-        scheduler_task = asyncio.create_task(monitor.scheduler_loop())
+        tasks.append(asyncio.create_task(monitor.scheduler_loop()))
+    # The live sweep re-checks stored events so a signal is not missed just
+    # because no new delivery happened to touch that token.
+    tasks.append(asyncio.create_task(realtime.sweep_loop()))
     try:
         yield
     finally:
-        if scheduler_task is not None:
-            scheduler_task.cancel()
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
             with suppress(asyncio.CancelledError):
-                await scheduler_task
+                await task
 
 
 app = FastAPI(
@@ -842,6 +846,26 @@ async def receive_alchemy_webhook(request: Request) -> dict[str, object]:
             summary["signals"],
         )
     return summary
+
+
+@app.get("/api/live/tokens")
+async def live_tokens(
+    watchlist_id: Annotated[int | None, Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> dict[str, object]:
+    """What the watched wallets are buying right now, below threshold included.
+
+    A signal only appears once the threshold is crossed. This is the view of
+    the build-up before that, so a token halfway there is visible instead of
+    invisible.
+    """
+    return {"tokens": realtime.accumulation_board(watchlist_id=watchlist_id, limit=limit)}
+
+
+@app.post("/api/live/sweep")
+async def run_live_sweep() -> dict[str, object]:
+    """Re-check stored events against every live threshold, now."""
+    return await realtime.sweep()
 
 
 @app.get("/api/settings/realtime/deliveries")

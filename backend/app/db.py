@@ -893,6 +893,51 @@ def list_deliveries(limit: int = 20) -> list[dict[str, Any]]:
         return [dict(row) for row in rows]
 
 
+def token_activity(
+    *, chain: str, wallets: Iterable[str], since_iso: str, limit: int = 300
+) -> list[dict[str, Any]]:
+    """Every token these wallets touched in the window, busiest first.
+
+    This is the accumulation view: it includes tokens *below* the signal
+    threshold, which is the whole point — a token four wallets into a
+    ten-wallet threshold is invisible everywhere else.
+    """
+    wallet_list = list(wallets)
+    if not wallet_list:
+        return []
+    placeholders = ", ".join("?" for _ in wallet_list)
+    with connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT
+                token_address,
+                COUNT(DISTINCT wallet_address) AS wallet_count,
+                COUNT(*)                       AS buy_count,
+                MAX(token_symbol)              AS token_symbol,
+                MIN(seen_at)                   AS first_buy_at,
+                MAX(seen_at)                   AS last_buy_at
+            FROM wallet_events
+            WHERE chain = ? AND seen_at >= ?
+              AND wallet_address IN ({placeholders})
+            GROUP BY token_address
+            ORDER BY wallet_count DESC, last_buy_at DESC
+            LIMIT ?
+            """,
+            (chain, since_iso, *wallet_list, limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def live_watchlists(chain: str | None = None) -> list[dict[str, Any]]:
+    query = "SELECT * FROM watchlists WHERE realtime = 1"
+    params: list[Any] = []
+    if chain is not None:
+        query += " AND chain = ?"
+        params.append(chain)
+    with connect() as conn:
+        return [dict(row) for row in conn.execute(query, params).fetchall()]
+
+
 def prune_events(older_than_iso: str) -> int:
     with connect() as conn:
         cursor = conn.execute(

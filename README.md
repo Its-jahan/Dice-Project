@@ -170,6 +170,24 @@ body with the webhook's signing key — so the endpoint is safe to expose. An
 unknown webhook id or a bad signature is rejected before anything is stored,
 and redeliveries are idempotent.
 
+**Seeing accumulation before it fires.** A signal only exists once the
+threshold is crossed, which makes the run-up invisible — a token four wallets
+into a ten-wallet threshold looks identical to one nobody has touched. The
+**Live accumulation** panel lists every token the watched wallets are buying,
+threshold or not, with a progress bar (`4/6`) and how many buyers are still
+needed. It refreshes every 20 seconds.
+
+The window is each watchlist's own **buy window**, so if you want "10 wallets
+across 3 days" rather than 48 hours, set that list's buy window to 72.
+
+**Nothing gets missed.** Deliveries only re-check the tokens they touch, which
+leaves a gap: a token can become qualified for a reason no new buy will
+announce — the threshold was lowered, or wallets were added to the list after
+they bought. A sweep re-checks every live watchlist's stored events against its
+current threshold every few minutes (`DICE_LIVE_SWEEP_SECONDS`, default 300),
+and **Re-check now** runs it on demand. It reads only local SQLite, so it costs
+nothing.
+
 **Checking it works.** The card has three tools, because "no signals yet" has
 two very different causes — a broken webhook, or simply nobody buying:
 
@@ -219,6 +237,7 @@ holder side via `DUNE_QUERY_ID` but not scheduled monitoring.
 | `GET` / `PUT /api/settings/notifications` · `POST …/test` | Telegram bot token + chat id, and a test send. |
 | `GET` / `PUT /api/settings/realtime` · `POST …/sync` | Alchemy auth token + public URL; reconcile watched wallets. |
 | `POST …/check-url` · `POST …/simulate` · `GET …/deliveries` | Reachability probe, synthetic signal, delivery log. |
+| `GET /api/live/tokens` · `POST /api/live/sweep` | Accumulation board (below-threshold included) and an on-demand re-check. |
 | `POST /api/webhooks/alchemy` | Alchemy delivery endpoint (signature-verified). |
 | `POST /api/dune/archive-queries` | Archive every `DICE …` query in the Dune account (frees private-query slots). |
 | `POST /api/sql` | Preview the generated DuneSQL. Needs a key, since the table is resolved from the catalogue. |
