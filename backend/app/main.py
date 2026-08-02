@@ -32,7 +32,13 @@ from .cache import cache
 from .config import settings
 from .dune import DuneClient, DuneError, ensure_query
 from .exporters import DATASETS, MEDIA_TYPES, export, filename_for
-from .holders import apply_holder_mode, build_summary, parse_rows
+from .holders import (
+    apply_holder_mode,
+    apply_wallet_filter,
+    build_summary,
+    classify_wallets,
+    parse_rows,
+)
 from .jobs import store
 from .models import (
     Chain,
@@ -566,8 +572,11 @@ async def get_holders(
 
         rows, truncated = await client.fetch_results(execution_id)
 
-    snapshots = apply_holder_mode(parse_rows(rows, req), req)
-    summary = build_summary(snapshots)
+    # classify_wallets also strips the baseline day it needed, so nothing
+    # downstream sees a snapshot from before the requested range.
+    in_range, facts = classify_wallets(parse_rows(rows, req), req)
+    snapshots = apply_holder_mode(apply_wallet_filter(in_range, facts, req), req)
+    summary = build_summary(snapshots, facts)
     result = HoldersResponse(
         request=req,
         execution_id=execution_id,

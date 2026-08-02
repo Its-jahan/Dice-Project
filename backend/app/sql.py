@@ -127,12 +127,17 @@ def build_snapshot_sql(
 
 
 def _calendar_cte(req: HoldersRequest) -> str:
-    """One row per day in the requested range, in UTC."""
+    """One row per day in the range, in UTC, plus the baseline day before it.
+
+    The extra day is what lets a buyer be told from a long-time holder: a
+    balance of 100 on the first day means nothing without knowing whether the
+    day before was 0 or 100. :mod:`app.holders` strips it from the output.
+    """
     return f"""WITH calendar AS (
     SELECT day
     FROM UNNEST(
         sequence(
-            date {_quote(req.start_date.isoformat())},
+            date {_quote(req.baseline_date.isoformat())},
             date {_quote(req.effective_end_date.isoformat())},
             interval '1' day
         )
@@ -177,7 +182,9 @@ def _interval_sql(
     req: HoldersRequest, src: Source, contracts: ContractSource | None
 ) -> str:
     """Sparse table: expand each ``[valid_from, valid_to)`` over the calendar."""
-    start = f"date {_quote(req.start_date.isoformat())}"
+    # Bounded by the baseline day, not the range start, so the calendar's
+    # extra day actually has intervals to match against.
+    start = f"date {_quote(req.baseline_date.isoformat())}"
     end = f"date {_quote(req.effective_end_date.isoformat())}"
 
     # A holder "on day D" means: holding at the *end* of day D, which is the
@@ -239,7 +246,7 @@ def _daily_sql(
     """
     filters = [
         f"b.{src.token} = {_address_literal(req.chain, req.token_address)}",
-        f"b.{src.day} >= date {_quote(req.start_date.isoformat())}",
+        f"b.{src.day} >= date {_quote(req.baseline_date.isoformat())}",
         f"b.{src.day} <= date {_quote(req.effective_end_date.isoformat())}",
     ]
     if req.exclude_burn_addresses:

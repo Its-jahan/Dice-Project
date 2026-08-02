@@ -13,6 +13,9 @@ from .models import ExportFormat, HolderMode, HoldersResponse
 SNAPSHOT_HEADERS = ["wallet_address", "token_address", "snapshot_date", "balance"]
 SUMMARY_HEADERS = [
     "wallet_address",
+    "wallet_type",
+    "opening_balance",
+    "bought_amount",
     "first_date",
     "last_date",
     "days_held",
@@ -67,6 +70,9 @@ def _summary_rows(result: HoldersResponse) -> list[list[object]]:
     return [
         [
             s.wallet_address,
+            s.wallet_type.value,
+            s.opening_balance,
+            round(s.bought_amount, 8),
             s.first_date.isoformat(),
             s.last_date.isoformat(),
             s.days_held,

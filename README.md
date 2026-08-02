@@ -66,6 +66,30 @@ request header, so plain HTTP puts it on the wire in the clear. Without a
 domain you can still get a **publicly-trusted** certificate via sslip.io — see
 [deploy/README.md](deploy/README.md).
 
+## Buyers versus holders
+
+On a token that has existed for years, "who held it between 1 and 5 July" is
+mostly people who bought in 2019. The **Buyers or holders** filter separates
+the two:
+
+- **Buyer** — the balance went *up* on some day of the range. That covers both
+  cases: a wallet that held none and bought in, and one that already held some
+  and added more.
+- **Holder** — the balance only stayed flat or fell.
+
+A wallet that sold and then bought back counts as a buyer, because an increase
+did happen.
+
+Making this work needs the balance on the day *before* the range, so the query
+reads one extra day: a balance of 5,000 on 1 July says nothing by itself, but
+5,000 the day before makes it a holder while 0 the day before makes it a buyer.
+That day is used for classification only and never appears in the output.
+
+Every export carries three extra columns — `wallet_type`, `opening_balance`
+(what the wallet held going in, so a first-time buyer is `0`) and
+`bought_amount` (how much the position grew) — which is usually more useful
+than the filter itself: sort by `bought_amount` to find who accumulated most.
+
 ## Holder modes
 
 | Mode | Meaning | Export shape |
@@ -279,6 +303,7 @@ Request body:
   "end_date": "2026-07-31",
   "min_balance": 0,
   "holder_mode": "daily",
+  "wallet_filter": "all",
   "include_contracts": true,
   "exclude_burn_addresses": true
 }

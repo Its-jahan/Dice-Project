@@ -109,7 +109,9 @@ def test_download_follows_the_requested_dataset_not_just_the_mode():
     summary_csv = export(result, ExportFormat.csv, "summary").decode("utf-8-sig")
     snapshot_csv = export(result, ExportFormat.csv, "snapshots").decode("utf-8-sig")
 
-    assert summary_csv.splitlines()[0].startswith("wallet_address,first_date")
+    assert summary_csv.splitlines()[0].startswith(
+        "wallet_address,wallet_type,opening_balance,bought_amount,first_date"
+    )
     assert snapshot_csv.splitlines()[0].startswith("wallet_address,token_address")
 
 

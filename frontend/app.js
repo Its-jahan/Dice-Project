@@ -65,6 +65,11 @@ const FIELD_HELP = {
     "Daily gives one row per wallet per day. Held at any time gives wallets " +
     "that appeared at least once. Continuous keeps only wallets that held on " +
     "every single day of the range.",
+  walletFilter:
+    "A buyer's balance went up during the range — either it held none and " +
+    "bought, or it already held some and bought more. A holder's balance only " +
+    "stayed flat or fell. Telling them apart reads one extra day before the " +
+    "range, so a wallet already holding on day one is not mistaken for a buyer.",
   includeContracts:
     "Keep smart-contract addresses in the result. Turn this off to exclude " +
     "pools, staking contracts and bridges, which hold tokens on behalf of " +
@@ -455,6 +460,7 @@ function readRequest() {
     end_date: $("endDate").value,
     min_balance: Number($("minBalance").value || 0),
     holder_mode: $("holderMode").value,
+    wallet_filter: $("walletFilter").value,
     include_contracts: $("includeContracts").checked,
     exclude_burn_addresses: $("excludeBurn").checked,
   };
@@ -600,7 +606,7 @@ function renderTable() {
     for (const row of visible) {
       const tr = body.insertRow();
       for (const column of columns) {
-        tr.insertCell().textContent = formatCell(row[column]);
+        renderCell(tr.insertCell(), column, row[column]);
       }
     }
   }
@@ -628,6 +634,24 @@ function formatCell(value) {
     return value.toLocaleString(undefined, { maximumFractionDigits: 8 });
   }
   return String(value);
+}
+
+/** Badge the buyer/holder column so the two are separable at a glance. */
+function renderCell(cell, column, value) {
+  if (column !== "wallet_type") {
+    cell.textContent = formatCell(value);
+    return;
+  }
+  const buyer = value === "buyer";
+  const badge = el(
+    "span",
+    "badge " + (buyer ? "text-bg-primary" : "text-bg-secondary"),
+    String(value),
+  );
+  badge.title = buyer
+    ? "Balance went up during the range — bought in, or added to an existing position."
+    : "Balance stayed flat or only fell during the range.";
+  cell.appendChild(badge);
 }
 
 function download() {

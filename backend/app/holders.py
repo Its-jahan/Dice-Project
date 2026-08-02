@@ -6,7 +6,15 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable
 
-from .models import HolderMode, HoldersRequest, Snapshot, WalletSummary, utc_today
+from .models import (
+    HolderMode,
+    HoldersRequest,
+    Snapshot,
+    WalletFilter,
+    WalletSummary,
+    WalletType,
+    utc_today,
+)
 
 
 def parse_rows(rows: Iterable[dict[str, Any]], req: HoldersRequest) -> list[Snapshot]:
@@ -32,7 +40,9 @@ def parse_rows(rows: Iterable[dict[str, Any]], req: HoldersRequest) -> list[Snap
         # means more than 100, and 0 means any positive balance.
         if balance <= 0 or balance <= req.min_balance:
             continue
-        if not (req.start_date <= snapshot_date <= req.effective_end_date):
+        # The baseline day is fetched deliberately (see HoldersRequest) and is
+        # separated out by classify_wallets before anything is exported.
+        if not (req.baseline_date <= snapshot_date <= req.effective_end_date):
             continue
 
         token = _first(row, "token_address", "token_mint_address") or req.token_address
@@ -47,6 +57,76 @@ def parse_rows(rows: Iterable[dict[str, Any]], req: HoldersRequest) -> list[Snap
 
     snapshots.sort(key=lambda s: (s.snapshot_date, -s.balance, s.wallet_address))
     return snapshots
+
+
+def classify_wallets(
+    snapshots: list[Snapshot], req: HoldersRequest
+) -> tuple[list[Snapshot], dict[str, dict[str, Any]]]:
+    """Split buyers from holders, and drop the baseline day from the output.
+
+    A **buyer** added to its position inside the range: its balance is higher
+    on some day than it was the day before. That covers both cases that count
+    as buying — starting from nothing, and topping up an existing bag — while
+    a flat or shrinking balance is a **holder**.
+
+    Days a wallet is absent from mean a balance at or below the minimum, which
+    is treated as the floor rather than as missing data: going from absent to
+    present is exactly the "bought in from zero" case.
+
+    Returns the in-range snapshots plus, per wallet, its type, opening balance
+    and how much it accumulated.
+    """
+    by_wallet: dict[str, dict[date, float]] = defaultdict(dict)
+    for snapshot in snapshots:
+        # One row per wallet-day is the norm; keep the largest if a source
+        # ever emits more than one.
+        current = by_wallet[snapshot.wallet_address].get(snapshot.snapshot_date)
+        if current is None or snapshot.balance > current:
+            by_wallet[snapshot.wallet_address][snapshot.snapshot_date] = snapshot.balance
+
+    days = [
+        req.start_date + timedelta(days=offset)
+        for offset in range((req.effective_end_date - req.start_date).days + 1)
+    ]
+
+    facts: dict[str, dict[str, Any]] = {}
+    for wallet, balances in by_wallet.items():
+        opening = balances.get(req.baseline_date, 0.0)
+        previous = opening
+        bought = 0.0
+        for day in days:
+            balance = balances.get(day, 0.0)
+            if balance > previous:
+                bought += balance - previous
+            previous = balance
+        facts[wallet] = {
+            "wallet_type": WalletType.buyer if bought > 0 else WalletType.holder,
+            "opening_balance": opening,
+            "bought_amount": bought,
+        }
+
+    in_range = [s for s in snapshots if s.snapshot_date >= req.start_date]
+    return in_range, facts
+
+
+def apply_wallet_filter(
+    snapshots: list[Snapshot],
+    facts: dict[str, dict[str, Any]],
+    req: HoldersRequest,
+) -> list[Snapshot]:
+    """Keep only buyers, only holders, or everything."""
+    if req.wallet_filter is WalletFilter.all:
+        return snapshots
+    wanted = (
+        WalletType.buyer
+        if req.wallet_filter is WalletFilter.buyers
+        else WalletType.holder
+    )
+    return [
+        s
+        for s in snapshots
+        if facts.get(s.wallet_address, {}).get("wallet_type") == wanted
+    ]
 
 
 def apply_holder_mode(
@@ -81,16 +161,21 @@ def apply_holder_mode(
     return [s for s in snapshots if s.wallet_address in continuous]
 
 
-def build_summary(snapshots: Iterable[Snapshot]) -> list[WalletSummary]:
+def build_summary(
+    snapshots: Iterable[Snapshot],
+    facts: dict[str, dict[str, Any]] | None = None,
+) -> list[WalletSummary]:
     """One row per wallet: window held, day count and balance envelope."""
     grouped: dict[str, list[Snapshot]] = defaultdict(list)
     for snapshot in snapshots:
         grouped[snapshot.wallet_address].append(snapshot)
 
+    facts = facts or {}
     summaries: list[WalletSummary] = []
     for wallet, items in grouped.items():
         balances = [i.balance for i in items]
         days = {i.snapshot_date for i in items}
+        wallet_facts = facts.get(wallet, {})
         summaries.append(
             WalletSummary(
                 wallet_address=wallet,
@@ -100,6 +185,9 @@ def build_summary(snapshots: Iterable[Snapshot]) -> list[WalletSummary]:
                 min_balance=min(balances),
                 max_balance=max(balances),
                 avg_balance=sum(balances) / len(balances),
+                wallet_type=wallet_facts.get("wallet_type", WalletType.holder),
+                opening_balance=wallet_facts.get("opening_balance", 0.0),
+                bought_amount=wallet_facts.get("bought_amount", 0.0),
             )
         )
 

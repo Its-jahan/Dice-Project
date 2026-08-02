@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from typing import Literal
 
@@ -74,6 +74,28 @@ class ExportFormat(str, Enum):
     html = "html"
 
 
+class WalletFilter(str, Enum):
+    """Buyers versus holders, within the requested range.
+
+    A wallet is a **buyer** when its balance goes *up* on any day of the range:
+    either it held nothing and acquired some, or it already held some and
+    added more. Anything else — flat, or only decreasing — is a **holder**.
+
+    Telling the two apart needs the balance on the day *before* the range, so
+    the query reads one extra day (see ``HoldersRequest.baseline_date``). That
+    day never appears in the output.
+    """
+
+    all = "all"
+    buyers = "buyers"
+    holders = "holders"
+
+
+class WalletType(str, Enum):
+    buyer = "buyer"
+    holder = "holder"
+
+
 class HoldersRequest(BaseModel):
     chain: Chain
     token_address: str
@@ -85,6 +107,9 @@ class HoldersRequest(BaseModel):
     include_contracts: bool = True
     #: drop the zero address and common burn sinks
     exclude_burn_addresses: bool = True
+    #: keep only wallets that added to their position in the range, only those
+    #: that did not, or both
+    wallet_filter: WalletFilter = WalletFilter.all
 
     @field_validator("token_address")
     @classmethod
@@ -114,6 +139,16 @@ class HoldersRequest(BaseModel):
         elif not SOLANA_MINT_RE.match(self.token_address):
             raise ValueError("token_address must be a base58 Solana mint address")
         return self
+
+    @property
+    def baseline_date(self) -> date:
+        """The day before the range, read so buyers can be told from holders.
+
+        Without it a wallet holding 100 on the first day is ambiguous: it may
+        have bought that day or been holding for years. These rows are used
+        for classification only and never exported.
+        """
+        return self.start_date - timedelta(days=1)
 
     @property
     def effective_end_date(self) -> date:
@@ -157,6 +192,13 @@ class WalletSummary(BaseModel):
     min_balance: float
     max_balance: float
     avg_balance: float
+    #: buyer = added to the position inside the range; holder = did not
+    wallet_type: WalletType = WalletType.holder
+    #: balance on the day before the range — 0 means the wallet started empty,
+    #: which is what makes a buyer a *first-time* buyer
+    opening_balance: float = 0.0
+    #: how much the position grew across the range, summed over every increase
+    bought_amount: float = 0.0
 
 
 class HoldersResponse(BaseModel):

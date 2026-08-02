@@ -119,14 +119,16 @@ def test_interval_sql_prunes_before_the_calendar_join():
     sql = build_snapshot_sql(make(), INTERVAL_SOURCE)
 
     assert "b.valid_from < date '2026-07-31' + interval '1' day" in sql
-    assert "(b.valid_to IS NULL OR b.valid_to > date '2026-07-20')" in sql
+    # Bounded by the baseline day (start - 1), which is read so a buyer can be
+    # told from a wallet that was already holding on day one.
+    assert "(b.valid_to IS NULL OR b.valid_to > date '2026-07-19')" in sql
 
 
 def test_dense_sql_uses_the_day_column_and_needs_no_calendar():
     sql = build_snapshot_sql(make(min_balance=5), DENSE_SOURCE)
 
     assert "FROM balances_polygon.erc20_day b" in sql
-    assert "b.day >= date '2026-07-20'" in sql
+    assert "b.day >= date '2026-07-19'" in sql   # the baseline day
     assert "SUM(b.amount) AS balance" in sql
     assert "b.wallet_address AS wallet_address" in sql
     assert "valid_from" not in sql
