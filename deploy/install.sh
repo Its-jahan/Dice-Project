@@ -28,13 +28,22 @@ for arg in "${@:2}"; do
     esac
 done
 
+WITH_GRAPH=false
+for arg in "$@"; do
+    [[ "$arg" == "--with-graph" ]] && WITH_GRAPH=true
+done
+
 if [[ -z "$SERVER_NAME" ]]; then
-    echo "usage: bash deploy/install.sh <domain-or-ip> [--self-signed]" >&2
+    echo "usage: bash deploy/install.sh <domain-or-ip> [--self-signed] [--with-graph]" >&2
     exit 2
 fi
 
 APP_DIR=/opt/dice
 APP_USER=dice
+# Kept outside APP_DIR: the rsync below runs --delete, so a graph built into
+# the app directory would be destroyed by the next deploy.
+GRAPH_DIR=/opt/graph-site
+GRAPH_VENV=/opt/graphify-venv
 TLS_DIR=/etc/dice/tls
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -92,6 +101,33 @@ install -m 644 "$APP_DIR/deploy/dice.service" /etc/systemd/system/dice.service
 systemctl daemon-reload
 systemctl enable --now dice
 systemctl restart dice
+
+# --------------------------------------------------------------- code graph
+#
+# Graphify turns the codebase into a queryable knowledge graph and a browsable
+# HTML map, served at /graph. Rebuilt on every deploy so it never describes
+# code that is no longer running. Installed on first use with --with-graph;
+# after that it refreshes itself because the venv is present.
+
+if [[ "$WITH_GRAPH" == true || -x "$GRAPH_VENV/bin/graphify" ]]; then
+    if [[ ! -x "$GRAPH_VENV/bin/graphify" ]]; then
+        log "Installing Graphify (isolated from the app venv)"
+        python3 -m venv "$GRAPH_VENV"
+        "$GRAPH_VENV/bin/pip" install --quiet --upgrade pip
+        "$GRAPH_VENV/bin/pip" install --quiet graphifyy
+    fi
+    log "Rebuilding the code graph"
+    # Build inside APP_DIR because that is where the source is, then move the
+    # output out of the way of the next deploy.
+    if "$GRAPH_VENV/bin/graphify" update "$APP_DIR" >/dev/null 2>&1; then
+        mkdir -p "$GRAPH_DIR"
+        rsync -a --delete "$APP_DIR/graphify-out/" "$GRAPH_DIR/"
+        rm -rf "$APP_DIR/graphify-out"
+    else
+        # A failed graph must never fail a deploy: the app does not need it.
+        log "Graph rebuild failed; leaving the previous one in place"
+    fi
+fi
 
 # --------------------------------------------------------------------- nginx
 

@@ -125,3 +125,23 @@ Health check: `curl http://127.0.0.1:8000/api/health`.
   `/etc/ssh/sshd_config`, then `systemctl restart ssh`.
 - Enable the firewall: `ufw allow OpenSSH && ufw allow 'Nginx Full' && ufw enable`.
 - Rotate the root password if it has ever been sent over an untrusted channel.
+
+
+## Code map at /graph
+
+`deploy/install.sh <host> --with-graph` installs [Graphify](https://graphify.net)
+into its own venv and builds a browsable knowledge graph of the codebase,
+served at `https://<host>/graph/`.
+
+Two placement details matter:
+
+- The graph lives in **`/opt/graph-site`**, not in `/opt/dice`. The deploy
+  rsyncs `--delete` into the app directory, so anything kept there is destroyed
+  by the next deploy.
+- The nginx `location /graph/` lives in **`deploy/nginx-proxy.conf`**, the
+  snippet both vhosts include, rather than being added to the generated site
+  file — which install.sh rewrites from a template every run.
+
+After the first `--with-graph`, every later deploy refreshes the graph
+automatically, because the venv is already there. A failed rebuild logs and
+leaves the previous graph in place; it never fails the deploy.
