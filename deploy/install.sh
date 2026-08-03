@@ -219,13 +219,13 @@ if [[ -f "$HTPASSWD" ]]; then
     # `# auth_basic_user_file`, and requiring a space there left it commented
     # while the first line was live — which nginx accepted and served without
     # asking for anything. A gate that fails open is worse than no gate.
-    sed -i 's|^    # auth_basic|    auth_basic|' /etc/nginx/snippets/dice-proxy.conf
+    sed -i 's|^# auth_basic|auth_basic|' /etc/nginx/snippets/dice-proxy.conf
     # Assert on what must be true rather than on a line count: the webhook
     # block carries its own `auth_basic off`, so counting every auth_basic
     # line says 3 and means nothing. What matters is that no commented one
     # survived and the user file is actually named.
     if grep -q '# auth_basic' /etc/nginx/snippets/dice-proxy.conf \
-       || ! grep -q "^    auth_basic_user_file $HTPASSWD;" \
+       || ! grep -q "^auth_basic_user_file $HTPASSWD;" \
               /etc/nginx/snippets/dice-proxy.conf; then
         echo "Could not enable the password gate — the snippet did not match." >&2
         exit 1
@@ -275,14 +275,20 @@ if [[ -f "$HTPASSWD" ]]; then
     log "Checking that the password gate holds"
     scheme=http
     [[ -n "${ssl_cert:-}" ]] && scheme=https
-    locked="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 \
-        --resolve "$SERVER_NAME:443:127.0.0.1" --resolve "$SERVER_NAME:80:127.0.0.1" \
-        "$scheme://$SERVER_NAME/api/watchlists" || echo 000)"
-    if [[ "$locked" != "401" ]]; then
-        echo "The site answered $locked without a password — expected 401." >&2
-        echo "Refusing to finish a deploy that leaves the API open." >&2
-        exit 1
-    fi
+    # Every public path, not just the API. /graph/ is a full map of the
+    # codebase and it is served by its own location, which inherits nothing
+    # from `location /` — checking only the API missed it entirely.
+    for path in /api/watchlists / /graph/; do
+        locked="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 \
+            --resolve "$SERVER_NAME:443:127.0.0.1" \
+            --resolve "$SERVER_NAME:80:127.0.0.1" \
+            "$scheme://$SERVER_NAME$path" || echo 000)"
+        if [[ "$locked" != "401" ]]; then
+            echo "$path answered $locked without a password — expected 401." >&2
+            echo "Refusing to finish a deploy that leaves it open." >&2
+            exit 1
+        fi
+    done
     # ...and that the exemption survived, or signals stop with no clue why.
     open="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 \
         --resolve "$SERVER_NAME:443:127.0.0.1" --resolve "$SERVER_NAME:80:127.0.0.1" \
@@ -293,7 +299,7 @@ if [[ -f "$HTPASSWD" ]]; then
         echo "authenticate, so no signal would ever arrive." >&2
         exit 1
     fi
-    echo "   locked (401 without a password), webhook still reachable ($open)"
+    echo "   locked: app, API and /graph/ all 401; webhook reachable ($open)"
 fi
 
 if [[ -n "$LE_NAME" ]] && ! $SELF_SIGNED; then
