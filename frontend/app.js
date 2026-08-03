@@ -1642,6 +1642,142 @@ function renderPerformance() {
   }
 }
 
+/* -------------------------------------------------------- wallet quality */
+
+async function loadWalletQuality() {
+  const select = $("wqChain");
+  if (!select.options.length) {
+    // One list of chains, defined once in the markup, cloned rather than
+    // duplicated — a second hand-written list would drift.
+    select.innerHTML = $("chain").innerHTML;
+    select.value = $("chain").value;
+  }
+  try {
+    const data = await api(
+      `/api/wallets/leaderboard?chain=${select.value}&limit=100`,
+    );
+    renderWalletQuality(data);
+  } catch (error) {
+    setStatus("wqStatus", error.message, "error");
+  }
+}
+
+function renderWalletQuality(data) {
+  const summary = $("wqSummary");
+  summary.innerHTML = "";
+  const tiles = [
+    ["Watched wallets", data.wallets, "Every wallet in a cohort on this chain."],
+    [
+      "Scored",
+      data.scored,
+      "Wallets that have bought into at least one signal, so there is something to measure.",
+    ],
+    [
+      "Proven",
+      data.proven,
+      "Three or more signals — enough that the number is a record rather than an anecdote.",
+    ],
+    [
+      "Sprayers",
+      data.sprayers,
+      "Buy a great many tokens and hit almost nothing. They pad your pool and dilute the threshold.",
+    ],
+    [
+      "Followers",
+      data.followers,
+      "Consistently buy in the last half hour before a signal fires. They may show a fine return — they bought the same token — but they never give you time to act.",
+    ],
+  ];
+  for (const [label, value, help] of tiles) {
+    const col = el("div", "col-6 col-lg");
+    const box = el("div", "border rounded p-2 h-100");
+    box.appendChild(el("div", "small text-body-secondary", label));
+    box.appendChild(el("div", "h5 mb-0", String(value ?? 0)));
+    box.title = help;
+    col.appendChild(box);
+    summary.appendChild(col);
+  }
+
+  const rows = data.rows || [];
+  const table = $("wqTable");
+  $("wqEmpty").classList.toggle("d-none", !!rows.length);
+  table.classList.toggle("d-none", !rows.length);
+  table.tHead.innerHTML = "";
+  table.tBodies[0].innerHTML = "";
+  if (!rows.length) return;
+
+  const head = table.tHead.insertRow();
+  for (const [title, help] of [
+    ["Wallet", "The watched address."],
+    ["Score", "Median return, discounted by how thin the evidence is: one lucky signal counts for a quarter, five count almost in full."],
+    ["Signals", "Signals this wallet bought into before they fired."],
+    ["Median return", "What those signals did 24 hours later."],
+    ["Lead", "How many hours ahead of the signal this wallet bought. A wallet consistently hours early is a leading indicator; one that buys minutes before is part of the crowd."],
+    ["Hit rate", "Of the tokens it paid for in the last two weeks, the share that became signals."],
+    ["Cohorts", "How many independent early-buyer sets it appears in."],
+    ["", ""],
+  ]) {
+    const th = el("th", "small text-body-secondary", title);
+    if (help) th.title = help;
+    head.appendChild(th);
+  }
+
+  for (const row of rows) {
+    const tr = table.tBodies[0].insertRow();
+
+    const walletCell = tr.insertCell();
+    const link = el("a", "mono link-primary text-decoration-none", shortAddress(row.wallet_address));
+    link.href = `https://etherscan.io/address/${row.wallet_address}`;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.title = row.wallet_address;
+    walletCell.appendChild(link);
+
+    const scoreCell = tr.insertCell();
+    if (row.score === null || row.score === undefined) {
+      const dash = el("span", "small text-body-secondary", "—");
+      dash.title = "Nothing measured yet. Unscored is not the same as scoring zero.";
+      scoreCell.appendChild(dash);
+    } else {
+      scoreCell.appendChild(
+        el(
+          "span",
+          "fw-medium " + (row.score > 0 ? "text-success" : row.score < 0 ? "text-danger" : ""),
+          `${row.score > 0 ? "+" : ""}${row.score}`,
+        ),
+      );
+    }
+
+    tr.insertCell().textContent = row.signals;
+    tr.insertCell().textContent =
+      row.median_return === null ? "—" : `${row.median_return > 0 ? "+" : ""}${row.median_return}%`;
+    tr.insertCell().textContent =
+      row.median_lead_hours === null ? "—" : `${row.median_lead_hours}h`;
+    tr.insertCell().textContent = row.hit_rate === null ? "—" : `${row.hit_rate}%`;
+    tr.insertCell().textContent = row.cohorts;
+
+    const flagCell = tr.insertCell();
+    if (row.sprayer) {
+      const badge = el("span", "badge text-bg-warning", "sprayer");
+      badge.title =
+        "Buys a great many tokens and hits almost none of them. Counting it " +
+        "towards a threshold is close to counting noise.";
+      flagCell.appendChild(badge);
+    } else if (row.follower) {
+      const badge = el("span", "badge text-bg-secondary", "follower");
+      badge.title =
+        "Arrives with the crowd rather than ahead of it — its median buy lands " +
+        "under half an hour before the signal. The return may look fine, but " +
+        "you would have had no time to act on it.";
+      flagCell.appendChild(badge);
+    } else if (row.proven) {
+      const badge = el("span", "badge text-bg-success", "proven");
+      badge.title = "Three or more signals behind the number.";
+      flagCell.appendChild(badge);
+    }
+  }
+}
+
 async function runLiveSweep() {
   await withBusy($("liveSweep"), async () => {
     setStatus("liveStatus", "Re-checking stored buys against every threshold…", "");
@@ -2281,6 +2417,8 @@ function init() {
   $("rtRefreshDeliveries").addEventListener("click", loadDeliveries);
   $("refreshLive").addEventListener("click", loadLiveTokens);
   $("perfRefresh").addEventListener("click", loadPerformance);
+  $("wqRefresh").addEventListener("click", loadWalletQuality);
+  $("wqChain").addEventListener("change", loadWalletQuality);
   $("perfCheck").addEventListener("click", checkPerformanceNow);
   $("liveMaxPoolAge").addEventListener("change", loadLiveTokens);
   $("refreshCohorts").addEventListener("click", loadCohortOverlap);
@@ -2308,6 +2446,7 @@ function init() {
     loadPoolSettings();
     loadCohortOverlap();
     loadPerformance();
+    loadWalletQuality();
     updateRealtimeAvailability();
   });
   loadNotificationSettings();

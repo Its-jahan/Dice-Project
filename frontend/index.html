@@ -520,6 +520,39 @@
       </div>
     </section>
 
+    <!-- ================================================== wallet quality -->
+    <section class="card shadow-sm" aria-labelledby="wqHeading">
+      <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
+        <h2 id="wqHeading" class="h6 mb-0">Wallet quality</h2>
+        <div class="d-flex align-items-center gap-2">
+          <select id="wqChain" class="form-select form-select-sm" style="width:auto"></select>
+          <button type="button" id="wqRefresh" class="btn btn-outline-secondary btn-sm">
+            Refresh
+          </button>
+        </div>
+      </div>
+      <div class="card-body">
+        <p class="small text-body-secondary">
+          The pooled signal counts heads — ten wallets bought, so it fires. That
+          treats a fund that was four hours early to three tokens that tripled
+          exactly like a bot that buys four hundred things a month and is
+          occasionally right by accident. This is where you find out which of your
+          wallets are which, so you can drop the noise and build cohorts out of the
+          rest.
+        </p>
+        <div id="wqSummary" class="row g-2 mb-3"></div>
+        <p id="wqEmpty" class="small text-body-secondary mb-0">
+          No watched wallets on this chain yet.
+        </p>
+        <div class="table-responsive">
+          <table id="wqTable" class="table table-sm table-hover align-middle d-none mb-0">
+            <thead></thead><tbody></tbody>
+          </table>
+        </div>
+        <div id="wqStatus" class="small mt-2" role="status" aria-live="polite"></div>
+      </div>
+    </section>
+
     <!-- ================================================== arkham -->
     <section class="card shadow-sm" aria-labelledby="akHeading">
       <div class="card-header d-flex justify-content-between align-items-center">

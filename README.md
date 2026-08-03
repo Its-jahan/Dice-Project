@@ -361,6 +361,43 @@ evidence of an old pool.
 Give it a couple of weeks of signals before drawing conclusions. Three
 outcomes is an anecdote; thirty is a basis for moving the threshold.
 
+## Which wallets are worth counting
+
+The pooled signal counts heads: ten wallets bought, therefore fire. That
+treats a fund that was four hours early to three tokens that tripled exactly
+like a bot that buys four hundred things a month and is right by accident.
+The **Wallet quality** card is the correction. Three measurements, all from
+data DICE already holds:
+
+* **Hit rate** — of the tokens the wallet paid for, the share that became
+  signals. This is the noise filter: a sprayer's hit rate collapses towards
+  zero as its buying volume rises.
+* **Median return** — what the signals it bought into did 24 hours later. The
+  direct question of whether this wallet's buying predicts price.
+* **Lead time** — how many hours before the signal fired it bought. A wallet
+  consistently hours ahead is a leading indicator; one that buys twelve
+  minutes before the threshold is part of the crowd.
+
+The **score** is the median return discounted by how thin the evidence is:
+with one signal most of it is discounted, by five it counts almost in full.
+Without that, one lucky 4x would top the table forever — the difference
+between ranking skill and ranking luck. A wallet with nothing measured scores
+*nothing*, not zero, because zero would rank a brand-new wallet above one with
+a real loss.
+
+Two flags, deliberately advisory rather than automatic removal (dropping
+wallets silently would make the pool size lie):
+
+| Flag | Meaning |
+| --- | --- |
+| **sprayer** | 25+ tokens bought, under 5% of them signalled. Counting it towards a threshold is close to counting noise. |
+| **follower** | Three or more signals, median lead under half an hour. The return may look fine — it bought the same token — but it never gives you time to act. |
+
+Lead time is deliberately *not* folded into the score. A threshold signal
+guarantees somebody crosses it last, so one low lead means nothing; only a
+habit across several signals is a verdict, which is exactly what the flag
+requires.
+
 ## API
 
 | Endpoint | Purpose |
@@ -388,6 +425,7 @@ outcomes is an anecdote; thirty is a basis for moving the threshold.
 | `POST /api/watchlists/{id}/monitor` | Run the monitor now. Header: `X-Dune-Api-Key`. |
 | `GET /api/watchlists/{id}/runs` | Monitor run history. |
 | `GET /api/signals` | Active signals (`?include_dismissed=true` for all). |
+| `GET /api/wallets/leaderboard?chain=` | Wallet quality: score, hit rate, median return, lead time, cohort count. |
 | `GET /api/signals/performance` · `POST …/refresh` | Scoreboard: win rate and median return per horizon; the POST looks up any prices now due. |
 | `POST /api/signals/{id}/dismiss` · `/restore` | Mute / unmute a signal. |
 | `GET /api/health` | Liveness. |

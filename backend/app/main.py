@@ -27,7 +27,7 @@ from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import alchemy, arkham, cohorts, db, monitor, performance, realtime
+from . import alchemy, arkham, cohorts, db, monitor, performance, realtime, wallets
 from .cache import cache
 from .config import settings
 from .dune import DuneClient, DuneError, ensure_query
@@ -1150,6 +1150,20 @@ async def live_tokens(
         "include_untradeable": include_untradeable,
         "max_pool_age_hours": max_pool_age_hours,
     }
+
+
+@app.get("/api/wallets/leaderboard")
+def wallet_leaderboard(
+    chain: Annotated[Chain, Query()] = Chain.ethereum,
+    limit: Annotated[int, Query(ge=1, le=500)] = 100,
+) -> dict[str, object]:
+    """Rank the watched wallets by what they have actually done.
+
+    The pooled signal counts heads. This is where you find out which of those
+    heads are worth counting — hit rate, median return of the signals a wallet
+    bought into, and how many hours ahead of the signal it moved.
+    """
+    return wallets.leaderboard(chain.value, limit=limit)
 
 
 @app.get("/api/signals/performance")

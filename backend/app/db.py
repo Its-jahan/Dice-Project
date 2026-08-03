@@ -1464,3 +1464,76 @@ def list_outcomes(limit: int = 200) -> list[dict[str, Any]]:
             (limit,),
         ).fetchall()
         return [dict(row) for row in rows]
+
+# ------------------------------------------------------------ wallet quality
+#
+# Everything above treats every watched wallet as equal — one wallet, one vote.
+# These queries are the raw material for not doing that: what each wallet
+# actually bought, which of those became signals, and how far ahead of the
+# signal it moved.
+
+
+def wallet_buy_counts(chain: str) -> dict[str, int]:
+    """Distinct tokens each wallet paid for, within the retained event window.
+
+    The denominator of a wallet's hit rate. A wallet that buys two hundred
+    tokens a fortnight hits a few signals by volume alone; one that buys five
+    and hits three is telling you something.
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT wallet_address, COUNT(DISTINCT token_address) AS tokens
+            FROM wallet_events
+            WHERE chain = ? AND is_buy = 1
+            GROUP BY wallet_address
+            """,
+            (chain,),
+        ).fetchall()
+    return {row["wallet_address"]: int(row["tokens"]) for row in rows}
+
+
+def wallet_signal_participation(chain: str) -> list[dict[str, Any]]:
+    """One row per (wallet, signal) the wallet bought into before it fired.
+
+    Joined on the token rather than on the signal's stored buyer list, because
+    the buyer list is a snapshot of who had bought at fire time while the
+    events are the record of who bought at all — including the wallets that
+    were early enough to be forgotten by the window.
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT e.wallet_address,
+                   o.signal_id,
+                   o.token_symbol,
+                   o.entry_price,
+                   o.price_24h,
+                   o.pool_age_hours,
+                   o.fired_at,
+                   MIN(e.seen_at) AS first_buy_at
+            FROM wallet_events e
+            JOIN signal_outcomes o
+              ON o.chain = e.chain AND o.token_address = e.token_address
+            WHERE e.chain = ? AND e.is_buy = 1 AND e.seen_at <= o.fired_at
+            GROUP BY e.wallet_address, o.signal_id
+            """,
+            (chain,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def wallet_cohort_counts(chain: str) -> dict[str, int]:
+    """How many real (non-derived) cohorts each wallet belongs to."""
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT ww.wallet_address, COUNT(DISTINCT w.id) AS cohorts
+            FROM watchlist_wallets ww
+            JOIN watchlists w ON w.id = ww.watchlist_id
+            WHERE w.chain = ? AND w.derived = 0
+            GROUP BY ww.wallet_address
+            """,
+            (chain,),
+        ).fetchall()
+    return {row["wallet_address"]: int(row["cohorts"]) for row in rows}
