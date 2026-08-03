@@ -546,6 +546,58 @@ async function diagnose() {
   });
 }
 
+/** Ask Dune how far its data reaches — for the table, and for this token. */
+async function checkCoverage() {
+  if (!requireKey("runStatus")) return;
+  const token = $("tokenAddress").value.trim();
+  if (!token) {
+    setStatus("runStatus", "Enter a token address first.", "error");
+    return;
+  }
+  await withBusy($("coverageBtn"), async () => {
+    startElapsed("runStatus", "Asking Dune what history it holds…");
+    try {
+      const data = await api(
+        `/api/coverage?chain=${encodeURIComponent($("chain").value)}` +
+          `&token_address=${encodeURIComponent(token)}`,
+      );
+      const day = (value) => (value ? String(value).slice(0, 10) : "—");
+      const lines = [
+        `Table:        ${data.table}  (${data.shape})`,
+        "",
+        `Table covers: ${day(data.table_first_day)} → ${day(data.table_last_day)}`,
+        `This token:   ${day(data.token_first_day)} → ${day(data.token_last_day)}`,
+        `Rows for it:  ${(data.token_rows ?? 0).toLocaleString()}`,
+      ];
+      if (!data.token_rows) {
+        lines.push(
+          "",
+          "Dune has no balance rows for this token at all — the holder query",
+          "cannot return anything for any date. See the README for where to",
+          "get older history.",
+        );
+      } else {
+        const start = $("startDate").value;
+        const first = day(data.token_first_day);
+        if (first !== "—" && start < first) {
+          lines.push(
+            "",
+            `Your start date (${start}) is before Dune's first row for this`,
+            `token (${first}). Nothing exists to return before that day.`,
+          );
+        }
+      }
+      $("sqlOut").textContent = lines.join("\n");
+      $("sqlCard").classList.remove("d-none");
+      stopElapsed();
+      setStatus("runStatus", "", "");
+    } catch (error) {
+      stopElapsed();
+      setStatus("runStatus", error.message, "error");
+    }
+  });
+}
+
 async function runQuery(event) {
   event.preventDefault();
   if (!requireKey("runStatus")) return;
@@ -1692,6 +1744,7 @@ function init() {
   $("queryForm").addEventListener("submit", runQuery);
   $("showSql").addEventListener("click", showSql);
   $("diagnoseBtn").addEventListener("click", diagnose);
+  $("coverageBtn").addEventListener("click", checkCoverage);
   $("downloadBtn").addEventListener("click", download);
   $("showMoreBtn").addEventListener("click", showMore);
 

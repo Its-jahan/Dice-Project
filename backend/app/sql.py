@@ -329,6 +329,34 @@ LIMIT {DISCOVERY_LIMIT}
 """.strip()
 
 
+def build_coverage_sql(chain: Chain, token_address: str, source: Source) -> str:
+    """Ask Dune what history it actually holds — for the table and the token.
+
+    An empty holder result has two very different explanations: the token had
+    no holders then, or Dune's balance table does not reach back that far.
+    Guessing between them wastes executions, so this asks directly. It is a
+    pure aggregate over indexed columns, so it is cheap.
+    """
+    token = _address_literal(chain, token_address)
+    if source.shape == "interval":
+        time_column = source.valid_from
+    else:
+        time_column = source.day
+
+    return f"""
+-- DICE: how far back does this table go, and when does this token appear?
+SELECT
+    (SELECT MIN({time_column}) FROM {source.qualified})        AS table_first_day,
+    (SELECT MAX({time_column}) FROM {source.qualified})        AS table_last_day,
+    (SELECT MIN({time_column}) FROM {source.qualified}
+      WHERE {source.token} = {token})                          AS token_first_day,
+    (SELECT MAX({time_column}) FROM {source.qualified}
+      WHERE {source.token} = {token})                          AS token_last_day,
+    (SELECT COUNT(*) FROM {source.qualified}
+      WHERE {source.token} = {token})                          AS token_rows
+""".strip()
+
+
 def build_query_parameters(req: HoldersRequest) -> dict[str, str | float]:
     """Parameter map for the *saved query* execution path.
 

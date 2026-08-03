@@ -139,6 +139,35 @@ def test_holder_mode_emptying_the_result_is_distinguishable(client):
     assert stages["after_holder_mode"] == 0   # continuous needs every day
 
 
+def test_coverage_reports_what_dune_holds(client):
+    FakeDuneClient.rows = [
+        {
+            "table_first_day": "2019-01-01 00:00:00.000 UTC",
+            "table_last_day": "2026-08-02 00:00:00.000 UTC",
+            "token_first_day": "2024-05-10 00:00:00.000 UTC",
+            "token_last_day": "2026-08-02 00:00:00.000 UTC",
+            "token_rows": 4210,
+        }
+    ]
+
+    body = client.get(
+        f"/api/coverage?chain=ethereum&token_address={TOKEN}", headers=HEADERS
+    ).json()
+
+    # This is what settles "no holders" versus "no data": the token's first
+    # row is well after the range the user asked about.
+    assert body["token_rows"] == 4210
+    assert body["token_first_day"].startswith("2024-05-10")
+    assert body["table_first_day"].startswith("2019-01-01")
+    assert body["table"].endswith("daily_updates")
+
+
+def test_coverage_needs_a_token(client):
+    assert (
+        client.get("/api/coverage?chain=ethereum", headers=HEADERS).status_code == 422
+    )
+
+
 def test_a_successful_run_reports_consistent_stages(client):
     FakeDuneClient.rows = [
         _row(WALLETS[0], "2023-01-06", 500),

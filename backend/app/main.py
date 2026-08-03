@@ -65,6 +65,7 @@ from .source import (
 from .sql import (
     DISCOVERY_LIMIT,
     build_catalog_sql,
+    build_coverage_sql,
     build_contracts_catalog_sql,
     build_discovery_sql,
     build_query_parameters,
@@ -479,6 +480,54 @@ async def contracts_if_needed(
     except SourceNotFound as exc:
         # Failing loudly beats returning the contracts they asked to exclude.
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/api/coverage")
+async def token_coverage(
+    chain: Chain = Chain.ethereum,
+    token_address: str = "",
+    x_dune_api_key: ApiKeyHeader = None,
+) -> dict[str, object]:
+    """What history does Dune actually hold for this table and this token?
+
+    Answers the question an empty result raises but cannot settle: did the
+    token have no holders in that range, or does the balance table simply not
+    reach that far back?
+    """
+    key = resolve_api_key(x_dune_api_key)
+    token = token_address.strip()
+    if not token:
+        raise HTTPException(status_code=422, detail="Provide a token_address.")
+    try:
+        token = normalize_addresses(chain, [token])[0]
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    async with DuneClient(key) as client:
+        try:
+            source, _ = await resolve_for(client, chain)
+        except SourceNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        rows = await _run_sql(
+            client,
+            name=f"DICE coverage {chain.value} {token[:10]}",
+            sql=build_coverage_sql(chain, token, source),
+            max_rows=10,
+            purpose="coverage",
+        )
+
+    row = rows[0] if rows else {}
+    return {
+        "chain": chain.value,
+        "token_address": token,
+        "table": source.qualified,
+        "shape": source.shape,
+        "table_first_day": row.get("table_first_day"),
+        "table_last_day": row.get("table_last_day"),
+        "token_first_day": row.get("token_first_day"),
+        "token_last_day": row.get("token_last_day"),
+        "token_rows": row.get("token_rows"),
+    }
 
 
 @app.get("/api/source")
