@@ -152,6 +152,21 @@ const FIELD_HELP = {
     "Everything after that (threshold, liquidity gate, contract screening, " +
     "outcome tracking) is shared, so a Solana signal means exactly what an " +
     "Ethereum one does. Leave empty if you do not watch Solana.",
+  aiKey:
+    "An Anthropic API key, saved on this server like the Dune one. It powers " +
+    "two things and nothing else: a three-line brief on what a signalled " +
+    "token actually is (researched with web search — the question your own " +
+    "numbers cannot answer), and an on-demand review of your measured " +
+    "results that proposes threshold changes with the evidence behind them. " +
+    "The model never decides to buy, never sets a threshold, and never " +
+    "replaces the contract screen. Leave it empty and everything else works " +
+    "exactly as before.",
+  aiEnrichment:
+    "Research each new signal before the Telegram goes out. The brief sits in " +
+    "the webhook path, so it is time-boxed: if the model is slow or down, the " +
+    "signal fires on time without it rather than late with it. Only the first " +
+    "fire of a signal is briefed — a signal that gains buyers is the same " +
+    "opportunity, already answered.",
   signalAirdrops:
     "Count wallets that were handed a token, not just those that paid for " +
     "it. Safe to leave on because a token with no liquidity pool is dropped " +
@@ -1910,6 +1925,148 @@ function renderExits(rows) {
   }
 }
 
+/* ------------------------------------------------------------------ ai */
+
+async function loadAiSettings() {
+  try {
+    const data = await api("/api/settings/ai");
+    state.ai = data;
+    $("aiKey").placeholder = data.key_hint
+      ? `Key saved (${data.key_hint}) — paste to replace`
+      : "Anthropic API key";
+    $("aiEnrichment").checked = !!data.enrichment;
+    const badge = $("aiBadge");
+    badge.className =
+      "badge rounded-pill " + (data.enrichment ? "text-bg-success" : "text-bg-secondary");
+    badge.textContent = data.enrichment ? "On" : "Off";
+    renderThemes(data.themes || []);
+  } catch {
+    /* non-fatal */
+  }
+}
+
+async function saveAiSettings() {
+  await withBusy($("aiSave"), async () => {
+    const body = { enrichment: $("aiEnrichment").checked };
+    const key = $("aiKey").value.trim();
+    if (key) body.anthropic_api_key = key;
+    try {
+      await api("/api/settings/ai", { method: "PUT", body });
+      $("aiKey").value = "";
+      await loadAiSettings();
+      setStatus("aiStatus", "Saved on the server.", "ok");
+    } catch (error) {
+      setStatus("aiStatus", error.message, "error");
+    }
+  });
+}
+
+/** Where the cohorts actually have an edge, by theme. */
+function renderThemes(themes) {
+  const host = $("aiThemes");
+  host.innerHTML = "";
+  if (!themes.length) return;
+  host.appendChild(
+    el(
+      "div",
+      "small text-body-secondary mb-1",
+      "Signalled tokens by theme — where your wallets are early, and where they are not:",
+    ),
+  );
+  const row = el("div", "d-flex flex-wrap gap-2");
+  for (const theme of themes) {
+    const pill = el("span", "badge text-bg-light border text-body-secondary");
+    const ret =
+      theme.avg_return_24h === null
+        ? "not scored yet"
+        : `${theme.avg_return_24h > 0 ? "+" : ""}${theme.avg_return_24h}% avg 24h`;
+    pill.textContent = `${theme.theme}: ${theme.signals} · ${ret}`;
+    pill.title =
+      `${theme.signals} signalled token(s) tagged "${theme.theme}". ` +
+      "The average is across the ones that have been scored — treat a handful as an anecdote.";
+    row.appendChild(pill);
+  }
+  host.appendChild(row);
+}
+
+async function runAiReview() {
+  await withBusy($("aiReview"), async () => {
+    setStatus("aiStatus", "Reading the scoreboard and the wallet scores…", "");
+    try {
+      const review = await api("/api/ai/review", { method: "POST" });
+      renderReview(review);
+      setStatus("aiStatus", "Review complete.", "ok");
+    } catch (error) {
+      setStatus("aiStatus", error.message, "error");
+    }
+  });
+}
+
+async function loadLastReview() {
+  try {
+    const data = await api("/api/ai/review");
+    if (data.review) renderReview(data.review, data.review.at);
+  } catch {
+    /* non-fatal */
+  }
+}
+
+function renderReview(review, at) {
+  const host = $("aiReviewOut");
+  host.innerHTML = "";
+  const box = el("div", "border rounded p-3");
+
+  const head = el("div", "d-flex justify-content-between align-items-start gap-2 mb-2");
+  const tone =
+    { none: "text-bg-secondary", low: "text-bg-secondary",
+      medium: "text-bg-warning", high: "text-bg-success" }[review.confidence] ||
+    "text-bg-secondary";
+  const badge = el("span", `badge ${tone}`, `confidence: ${review.confidence}`);
+  badge.title =
+    "How far the measured data actually supports a conclusion. " +
+    "\"none\" means too few scored signals to change anything yet.";
+  head.appendChild(el("div", "fw-medium", review.verdict));
+  head.appendChild(badge);
+  box.appendChild(head);
+
+  if (at) {
+    box.appendChild(
+      el("div", "small text-body-secondary mb-2", `Last run ${fmtTime(at)}`),
+    );
+  }
+
+  if (review.recommendations?.length) {
+    const table = el("table", "table table-sm align-middle mb-2");
+    const head2 = table.createTHead().insertRow();
+    for (const title of ["Change", "To", "Because"]) {
+      head2.appendChild(el("th", "small text-body-secondary", title));
+    }
+    const body = table.createTBody();
+    for (const rec of review.recommendations) {
+      const tr = body.insertRow();
+      tr.insertCell().textContent = rec.setting;
+      tr.insertCell().textContent = rec.change;
+      tr.insertCell().appendChild(el("span", "small", rec.evidence));
+    }
+    box.appendChild(table);
+  } else {
+    box.appendChild(
+      el(
+        "div",
+        "small text-body-secondary mb-2",
+        "No changes proposed — the data does not yet justify one.",
+      ),
+    );
+  }
+
+  if (review.watch_next) {
+    box.appendChild(
+      el("div", "small text-body-secondary", `Next: ${review.watch_next}`),
+    );
+  }
+  host.appendChild(box);
+}
+
 async function runLiveSweep() {
   await withBusy($("liveSweep"), async () => {
     setStatus("liveStatus", "Re-checking stored buys against every threshold…", "");
@@ -2558,6 +2715,9 @@ function init() {
   $("refreshLive").addEventListener("click", loadLiveTokens);
   $("perfRefresh").addEventListener("click", loadPerformance);
   $("wqRefresh").addEventListener("click", loadWalletQuality);
+  $("aiSave").addEventListener("click", saveAiSettings);
+  $("aiReview").addEventListener("click", runAiReview);
+  $("aiEnrichment").addEventListener("change", saveAiSettings);
   $("refreshExits").addEventListener("click", loadExits);
   $("wqChain").addEventListener("change", loadWalletQuality);
   $("perfCheck").addEventListener("click", checkPerformanceNow);
@@ -2594,6 +2754,8 @@ function init() {
   loadNotificationSettings();
   loadArkhamSettings();
   loadRealtimeSettings();
+  loadAiSettings();
+  loadLastReview();
   loadDeliveries();
   startPolling();
 }

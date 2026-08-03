@@ -154,6 +154,19 @@ CREATE INDEX IF NOT EXISTS idx_deliveries_recent
 
 -- Cached DexScreener answers. has_pair = 0 means the token has no liquidity
 -- pool anywhere, so it cannot have been bought and must not signal.
+CREATE TABLE IF NOT EXISTS signal_briefs (
+    signal_id     INTEGER PRIMARY KEY REFERENCES signals(id) ON DELETE CASCADE,
+    chain         TEXT    NOT NULL,
+    token_address TEXT    NOT NULL,
+    theme         TEXT,
+    what          TEXT,
+    read_note     TEXT,
+    risk_note     TEXT,
+    body          TEXT    NOT NULL,
+    model         TEXT,
+    created_at    TEXT    NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS token_risk (
     chain           TEXT    NOT NULL,
     token_address   TEXT    NOT NULL,
@@ -1741,3 +1754,68 @@ def distribution_board(
         ).fetchall()
     return [dict(row) for row in rows]
 
+
+def save_brief(
+    *, signal_id: int, chain: str, token_address: str, brief: dict[str, Any], model: str
+) -> None:
+    """Store a signal's brief. First one wins, like the outcome stamp.
+
+    A signal that later gains buyers is the same opportunity, and re-briefing
+    it would spend money to answer a question already answered.
+    """
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO signal_briefs (
+                signal_id, chain, token_address, theme, what, read_note,
+                risk_note, body, model, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                signal_id, chain, token_address.lower(), brief.get("theme"),
+                brief.get("what"), brief.get("read"), brief.get("risk"),
+                brief.get("text") or "", model, utcnow_iso(),
+            ),
+        )
+
+
+def get_brief(signal_id: int) -> dict[str, Any] | None:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM signal_briefs WHERE signal_id = ?", (signal_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def theme_counts() -> list[dict[str, Any]]:
+    """How the signalled tokens break down by theme.
+
+    Answers the question a single brief cannot: where the cohorts actually
+    have an edge, and where they are arriving late to someone else's trade.
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT b.theme,
+                   COUNT(*) AS signals,
+                   AVG(CASE WHEN o.entry_price > 0 AND o.price_24h IS NOT NULL
+                            THEN (o.price_24h - o.entry_price) / o.entry_price * 100
+                       END) AS avg_return_24h
+            FROM signal_briefs b
+            LEFT JOIN signal_outcomes o ON o.signal_id = b.signal_id
+            WHERE b.theme IS NOT NULL AND b.theme != ''
+            GROUP BY b.theme
+            ORDER BY signals DESC
+            """
+        ).fetchall()
+    return [
+        {
+            "theme": row["theme"],
+            "signals": int(row["signals"]),
+            "avg_return_24h": (
+                round(row["avg_return_24h"], 1)
+                if row["avg_return_24h"] is not None else None
+            ),
+        }
+        for row in rows
+    ]

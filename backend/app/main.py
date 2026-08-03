@@ -28,6 +28,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from . import (
+    ai,
     alchemy,
     arkham,
     cohorts,
@@ -1334,6 +1335,78 @@ async def token_risk(
     return {"chain": chain.value, "token_address": address.lower(), **verdict}
 
 
+@app.get("/api/settings/ai")
+def get_ai_settings() -> dict[str, object]:
+    return {
+        "configured": bool(ai.api_key()),
+        "key_hint": _key_hint(db.get_setting("anthropic_api_key")),
+        "enrichment": ai.enabled(),
+        "model": ai.MODEL,
+        "themes": db.theme_counts(),
+    }
+
+
+@app.put("/api/settings/ai")
+def save_ai_settings(body: Annotated[dict, Body()]) -> dict[str, object]:
+    if "anthropic_api_key" in body:
+        key = str(body.get("anthropic_api_key") or "").strip()
+        if key:
+            db.set_setting("anthropic_api_key", key)
+        else:
+            db.delete_setting("anthropic_api_key")
+    if "enrichment" in body:
+        db.set_setting("ai_enrichment", "true" if body["enrichment"] else "false")
+    return get_ai_settings()
+
+
+@app.post("/api/ai/review")
+async def run_ai_review() -> dict[str, object]:
+    """Read the measured outcomes and propose parameter changes.
+
+    Deliberately on demand rather than scheduled: it costs money per run, and
+    it has nothing new to say until more signals have been scored.
+    """
+    scoreboard = performance.summarise()
+    leaderboard = wallets.leaderboard(Chain.ethereum.value, limit=25)
+    payload = {
+        "scoreboard": {
+            key: value for key, value in scoreboard.items() if key != "recent"
+        },
+        "signals": scoreboard["recent"],
+        "current_settings": {
+            "pool_pct": realtime.pool_pct(),
+            "pool_min_wallets": realtime.pool_min_wallets(),
+            "window_hours": realtime.pool_window_hours(),
+            "signal_airdrops": realtime.signal_airdrops(),
+            "risk_screening": realtime.risk_screening(),
+            "min_liquidity_usd": settings.min_liquidity_usd,
+        },
+        "wallets": {
+            key: value for key, value in leaderboard.items() if key != "rows"
+        },
+        "top_wallets": leaderboard["rows"][:15],
+        "themes": db.theme_counts(),
+    }
+    try:
+        result = await ai.review(payload)
+    except ai.AIUnavailable as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    # Kept so the UI can show the last review without paying for a new one.
+    db.set_setting("ai_last_review", json.dumps({**result, "at": db.utcnow_iso()}))
+    return result
+
+
+@app.get("/api/ai/review")
+def last_ai_review() -> dict[str, object]:
+    stored = db.get_setting("ai_last_review")
+    if not stored:
+        return {"review": None}
+    try:
+        return {"review": json.loads(stored)}
+    except ValueError:  # pragma: no cover - corrupt setting
+        return {"review": None}
+
+
 @app.get("/api/wallets/leaderboard")
 def wallet_leaderboard(
     chain: Annotated[Chain, Query()] = Chain.ethereum,
@@ -1812,6 +1885,17 @@ async def list_signals(
         limit=limit,
     )
     return [monitor.signal_to_out(row) for row in rows]
+
+
+@app.get("/api/signals/{signal_id}/brief")
+def signal_brief(signal_id: int) -> dict[str, object]:
+    """The researched brief for one signal, if one was written."""
+    brief = db.get_brief(signal_id)
+    if brief is None:
+        raise HTTPException(
+            status_code=404, detail="No brief was written for this signal."
+        )
+    return brief
 
 
 @app.post("/api/signals/{signal_id}/dismiss")

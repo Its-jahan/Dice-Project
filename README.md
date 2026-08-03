@@ -444,6 +444,44 @@ The accumulation board gained a **Sold** column from the same data: a token six
 wallets bought and three have since sold is being distributed, not
 accumulated, and the buy count alone cannot tell those apart.
 
+## Where a model earns its keep — and where it does not
+
+**Not detection.** Which wallets bought what, how many, inside which window,
+and whether that crosses a threshold is set arithmetic and SQL. Handing it to
+a model would make it slower, more expensive, occasionally wrong, and — worst
+— **untestable**: the tests that currently pin signal behaviour would all
+become approximately true. Contract safety is likewise a dedicated service's
+job, not a model's opinion about bytecode.
+
+Two things arithmetic genuinely cannot do:
+
+**Triage.** A signal says "GEM, 19 of 180 wallets". Finding out what GEM
+actually *is* costs five minutes, which on a six-hour-old pool is most of the
+edge. When a signal fires, Claude searches the web and writes four lines —
+theme, what it is, what the combination suggests, and the single biggest risk
+— which ride along in the Telegram message. If search finds nothing about a
+token days after launch, it says so: that absence is itself the finding, and
+inventing a plausible project is the one failure that would make this worse
+than useless.
+
+**Review.** Once the scoreboard has outcomes and the wallets have scores,
+someone has to read them and say "under six hours won, over 48 lost, move the
+filter". *Review my results* does exactly that, grounded in the numbers and
+told to answer "not enough data yet" rather than manufacture confidence from
+four data points. On demand rather than scheduled: it costs money per run and
+has nothing new to say until more signals are scored.
+
+The **theme** from each brief accumulates into a breakdown — which kinds of
+token your cohorts are early to, and which they arrive late to. That is the
+question a single brief cannot answer.
+
+**The model never decides to buy, never sets a threshold, and never replaces
+the liquidity or contract gates.** Every call is best-effort and time-boxed:
+enrichment sits in the webhook request path, so if the API is slow, absent, or
+declines, the signal fires on time *without* a brief rather than late with
+one. Only the first fire of a signal is briefed — a signal that gains buyers
+is the same opportunity, already answered.
+
 ## Which wallets are worth counting
 
 The pooled signal counts heads: ten wallets bought, therefore fire. That
@@ -511,6 +549,9 @@ requires.
 | `POST /api/webhooks/helius` | Helius delivery endpoint for Solana (Authorization-header verified). |
 | `GET /api/live/exits` | What the watched wallets are selling. |
 | `GET /api/tokens/risk?chain=&address=` | Screen one contract (honeypot, taxes, owner powers, LP lock). |
+| `GET` / `PUT /api/settings/ai` | Anthropic key (server-side), enrichment toggle, theme breakdown. |
+| `POST` / `GET /api/ai/review` | Run a review of the measured results / read the last one. |
+| `GET /api/signals/{id}/brief` | The researched brief for one signal. |
 | `GET /api/wallets/leaderboard?chain=` | Wallet quality: score, hit rate, median return, lead time, cohort count. |
 | `GET /api/signals/performance` · `POST …/refresh` | Scoreboard: win rate and median return per horizon; the POST looks up any prices now due. |
 | `POST /api/signals/{id}/dismiss` · `/restore` | Mute / unmute a signal. |

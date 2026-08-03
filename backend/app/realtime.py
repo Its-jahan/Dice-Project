@@ -32,7 +32,7 @@ import math
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
-from . import db, dexscreener, helius, performance, security
+from . import ai, db, dexscreener, helius, performance, security
 from .config import settings
 from .models import Chain, SignalOut
 from .monitor import effective_min_wallets, send_signal_notification, signal_to_out
@@ -546,14 +546,72 @@ def check_token(
     return None
 
 
-async def announce(fired: list[tuple[SignalOut, bool]], *, chain: Chain) -> None:
+async def announce(
+    fired: list[tuple[SignalOut, bool]],
+    *,
+    chain: Chain,
+    markets: dict[str, dict[str, Any]] | None = None,
+) -> None:
     for signal, is_new in fired:
+        if is_new:
+            # Only new signals are briefed, and only before the notification
+            # goes out: the brief is most of the value of the message, and a
+            # second Telegram arriving later would be noise. Time-boxed, so a
+            # slow or missing model costs the signal nothing.
+            await enrich(signal, chain=chain, market=(markets or {}).get(
+                signal.token_address
+            ))
         await send_signal_notification(
             watchlist_name=signal.watchlist_name or f"#{signal.watchlist_id}",
             chain=chain,
             window_hours=0,
             signals=[(signal, is_new)],
         )
+
+
+async def enrich(
+    signal: SignalOut, *, chain: Chain, market: dict[str, Any] | None
+) -> None:
+    """Research what a freshly-signalled token actually is, best-effort.
+
+    Everything handed to the model is a fact DICE already established. Its
+    job is the part DICE cannot answer — whether there is a real project
+    behind the address — and the answer is stored, never acted on.
+    """
+    market = market or {}
+    risk = market.get("risk") or {}
+    brief = await ai.brief_with_timeout(
+        chain=chain.value,
+        token_address=signal.token_address,
+        symbol=signal.token_symbol,
+        facts={
+            "Wallets that bought it": (
+                f"{signal.wallet_count} of {signal.watchlist_size} tracked"
+            ),
+            "Pool age (hours)": performance.pool_age_hours(
+                market.get("pair_created_at")
+            ),
+            "Liquidity (USD)": market.get("liquidity_usd"),
+            "24h volume (USD)": market.get("volume_24h"),
+            "Price (USD)": market.get("price_usd"),
+            "Contract warnings": "; ".join(risk.get("warnings") or []),
+            "Holders": risk.get("holder_count"),
+            "Largest holder (%)": risk.get("top_holder_pct"),
+            "Source verified": risk.get("open_source"),
+        },
+    )
+    if brief is None:
+        return
+    try:
+        db.save_brief(
+            signal_id=signal.id,
+            chain=chain.value,
+            token_address=signal.token_address,
+            brief=brief,
+            model=ai.MODEL,
+        )
+    except Exception:  # pragma: no cover - a brief must never break a signal
+        log.exception("storing the brief failed")
 
 
 async def ingest(payload: dict[str, Any], *, chain: Chain) -> dict[str, Any]:
@@ -616,7 +674,7 @@ async def store_and_evaluate(
         if outcome:
             fired.append(outcome)
 
-    await announce(fired, chain=chain)
+    await announce(fired, chain=chain, markets=markets)
     db.prune_events(_iso(_utcnow() - timedelta(days=EVENT_RETENTION_DAYS)))
     return {"events": len(events), "stored": stored, "signals": len(fired)}
 
@@ -667,7 +725,7 @@ async def sweep() -> dict[str, Any]:
             outcome = check_pool_token(chain, token, market=markets[token])
             if outcome:
                 fired.append(outcome)
-        await announce(fired, chain=chain)
+        await announce(fired, chain=chain, markets=markets)
         fired_total += len(fired)
 
     return {"checked": checked_total, "signals": fired_total}

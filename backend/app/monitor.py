@@ -655,6 +655,23 @@ async def send_telegram_message(text: str) -> str | None:
     return _describe_telegram_error(status, payload, chat_id)
 
 
+def _brief_notes(signal_id: int) -> list[str]:
+    """The researched brief for a signal, when one was written in time."""
+    try:
+        brief = db.get_brief(signal_id)
+    except Exception:  # pragma: no cover - notification must never fail
+        return []
+    if not brief:
+        return []
+    notes = []
+    if brief.get("theme"):
+        notes.append(f"[{brief['theme']}]")
+    for key in ("what", "read_note", "risk_note"):
+        if brief.get(key):
+            notes.append(str(brief[key]))
+    return notes
+
+
 def _risk_notes(chain: Chain, token_address: str, limit: int = 3) -> list[str]:
     """Cached contract warnings for a token, or nothing when unscreened."""
     try:
@@ -709,6 +726,10 @@ async def send_signal_notification(
         # acted on without them.
         for warning in _risk_notes(chain, signal.token_address):
             lines.append(f"  ! {warning}")
+        # The brief is the reason to read the message rather than the address:
+        # it answers "what is this" while the entry is still open.
+        for note in _brief_notes(signal.id):
+            lines.append(f"  {note}")
         lines.append(signal.token_address)
         lines.append(f"https://dexscreener.com/{chain.value}/{signal.token_address}")
     text = "\n".join(lines)

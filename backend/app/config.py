@@ -133,6 +133,15 @@ class Settings:
     risk_screening: bool = field(
         default_factory=lambda: _env_bool("DICE_RISK_SCREENING", True)
     )
+    # An LLM brief attached to each new signal: what the token actually is,
+    # researched with web search. Off unless a key is saved — it costs money
+    # per signal and the system works without it.
+    anthropic_api_key: str | None = field(
+        default_factory=lambda: os.getenv("ANTHROPIC_API_KEY") or None
+    )
+    ai_enrichment: bool = field(
+        default_factory=lambda: _env_bool("DICE_AI_ENRICHMENT", True)
+    )
 
 
 settings = Settings()

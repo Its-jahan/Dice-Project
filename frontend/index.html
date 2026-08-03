@@ -557,6 +557,51 @@
       </div>
     </section>
 
+    <!-- ================================================== ai -->
+    <section class="card shadow-sm" aria-labelledby="aiHeading">
+      <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
+        <h2 id="aiHeading" class="h6 mb-0">Research &amp; review (Claude)</h2>
+        <span id="aiBadge" class="badge rounded-pill text-bg-secondary">Off</span>
+      </div>
+      <div class="card-body">
+        <p class="small text-body-secondary">
+          Detection stays arithmetic — who bought what, how many, in which window.
+          A model is used for the two things arithmetic cannot do. <strong>When a
+          signal fires</strong>, it searches the web and writes three lines on what
+          the token actually is, which is the question that otherwise costs you five
+          minutes while the entry is still open. <strong>On demand</strong>, it reads
+          the scoreboard and the wallet scores and proposes threshold changes with
+          the numbers behind them. It never decides to buy, never sets a threshold,
+          and never replaces the contract screen.
+        </p>
+        <div class="row g-2 align-items-center">
+          <div class="col-lg-5">
+            <input id="aiKey" type="password" class="form-control" autocomplete="off"
+                   spellcheck="false" placeholder="Anthropic API key">
+          </div>
+          <div class="col-auto">
+            <button type="button" id="aiSave" class="btn btn-primary">Save</button>
+          </div>
+          <div class="col-auto">
+            <div class="form-check form-switch mb-0">
+              <input class="form-check-input" type="checkbox" id="aiEnrichment">
+              <label class="form-check-label small" for="aiEnrichment">
+                Brief each new signal
+              </label>
+            </div>
+          </div>
+          <div class="col-auto">
+            <button type="button" id="aiReview" class="btn btn-outline-secondary">
+              Review my results
+            </button>
+          </div>
+        </div>
+        <div id="aiStatus" class="small mt-2" role="status" aria-live="polite"></div>
+        <div id="aiThemes" class="mt-3"></div>
+        <div id="aiReviewOut" class="mt-3"></div>
+      </div>
+    </section>
+
     <!-- ================================================== wallet quality -->
     <section class="card shadow-sm" aria-labelledby="wqHeading">
       <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
