@@ -34,7 +34,7 @@ import httpx
 
 from . import db
 from .config import settings
-from .dune import DuneClient, ensure_query
+from .dune import DuneClient, DuneError, ensure_query
 from .holders import _to_float
 from .models import (
     Chain,
@@ -326,6 +326,60 @@ async def resolve_balance_source(client: DuneClient, chain: Chain):
     return source
 
 
+def _forget_source(chain: Chain) -> None:
+    from .cache import cache
+    from .main import _contract_key, _source_key
+
+    cache.drop(_source_key(chain))
+    cache.drop(_contract_key(chain))
+
+
+async def run_positions_query(
+    client: DuneClient,
+    *,
+    chain: Chain,
+    watchlist_id: int,
+    label: str,
+    wallets: list[str],
+    window_hours: int,
+    extra_ignores: list[str],
+) -> tuple[list[dict[str, Any]], str]:
+    """Run the new-positions query, re-resolving once if the source went stale.
+
+    Dune publishes its balance models into rotating
+    ``__spellbook_sqlmesh_NNN`` build schemas, so a table resolved minutes ago
+    can stop existing when Dune rebuilds. The holder query already recovers
+    from that; without the same handling here every scheduled run kept failing
+    with "Schema ... does not exist" until something else happened to refresh
+    the cache.
+    """
+    for attempt in (1, 2):
+        source = await resolve_balance_source(client, chain)
+        try:
+            return await _execute(
+                client,
+                purpose=f"positions:{watchlist_id}",
+                name=f"DICE positions: {label}",
+                sql=build_new_positions_sql(
+                    chain,
+                    source,
+                    wallets,
+                    window_hours=window_hours,
+                    extra_ignore_tokens=extra_ignores,
+                ),
+            )
+        except DuneError as exc:
+            if attempt == 1 and "does not exist" in str(exc):
+                log.warning(
+                    "balance source for %s went stale mid-run; re-resolving",
+                    chain.value,
+                )
+                _forget_source(chain)
+                continue
+            raise
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
 async def run_monitor(
     watchlist_id: int, *, api_key: str, trigger: str = "manual"
 ) -> MonitorResult:
@@ -377,18 +431,14 @@ async def run_monitor(
                 )
 
             if detection in ("balance", "both"):
-                source = await resolve_balance_source(client, chain)
-                rows, position_execution = await _execute(
+                rows, position_execution = await run_positions_query(
                     client,
-                    purpose=f"positions:{watchlist_id}",
-                    name=f"DICE positions: {label}",
-                    sql=build_new_positions_sql(
-                        chain,
-                        source,
-                        wallets,
-                        window_hours=window_hours,
-                        extra_ignore_tokens=extra_ignores,
-                    ),
+                    chain=chain,
+                    watchlist_id=watchlist_id,
+                    label=label,
+                    wallets=wallets,
+                    window_hours=window_hours,
+                    extra_ignores=extra_ignores,
                 )
                 position_buys = parse_position_rows(
                     rows, chain=chain, wallets=wallets, ignored_tokens=ignored

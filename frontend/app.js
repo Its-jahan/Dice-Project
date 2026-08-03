@@ -978,11 +978,19 @@ function renderWatchlistRow(tbody, wl) {
       "badge " + (ok ? "text-bg-success" : "text-bg-danger"),
       wl.last_run_status,
     );
-    badge.title = (ok ? "" : (wl.last_run_error || "") + " — ") + fmtTime(wl.last_run_at);
+    badge.title = fmtTime(wl.last_run_at);
     lastRunCell.appendChild(badge);
     lastRunCell.appendChild(
       el("span", "small text-body-secondary ms-1", fmtTime(wl.last_run_at)),
     );
+    // A failure is only actionable if the reason is readable. It used to live
+    // in a title attribute, which meant "error" and nothing else.
+    if (!ok && wl.last_run_error) {
+      const reason = el("div", "small text-danger mt-1", wl.last_run_error);
+      reason.style.maxWidth = "28rem";
+      reason.style.whiteSpace = "normal";
+      lastRunCell.appendChild(reason);
+    }
   } else {
     lastRunCell.appendChild(el("span", "small text-body-secondary", "never"));
   }

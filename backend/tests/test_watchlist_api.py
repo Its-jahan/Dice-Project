@@ -456,3 +456,39 @@ def test_config_reports_monitor_block(client):
 
     assert config["monitor"]["max_wallets"] == 2000
     assert config["monitor"]["auto_possible"] is False  # no server key in tests
+
+
+def test_a_rotated_spellbook_schema_is_re_resolved_not_fatal(client, monkeypatch):
+    """The failure seen in production: Dune rebuilt and the schema vanished.
+
+    Dune publishes balance models into rotating __spellbook_sqlmesh_NNN
+    schemas, so a cached source stops existing when it rebuilds. Every
+    scheduled run then failed with "Schema ... does not exist"; the holder
+    query already recovered from this, and now the monitor does too.
+    """
+    # The positions query is the one that reads the rotating schema.
+    watchlist_id = _create_watchlist(client, buy_detection="both")["id"]
+    attempts = {"n": 0}
+    real_wait = FakeDuneClient.wait_for_execution
+
+    async def stale_once(self, execution_id):
+        sql = FakeDuneClient.calls.get("query_sql", "")
+        if "new positions" in sql:       # the query that reads the schema
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise DuneError(
+                    "Dune execution X ended in state QUERY_STATE_FAILED: Schema "
+                    "'balances_ethereum__spellbook_sqlmesh_493' does not exist"
+                )
+        return await real_wait(self, execution_id)
+
+    monkeypatch.setattr(FakeDuneClient, "wait_for_execution", stale_once)
+
+    response = client.post(
+        f"/api/watchlists/{watchlist_id}/monitor", headers=HEADERS
+    )
+
+    assert response.status_code == 200
+    assert attempts["n"] == 2            # failed once, re-resolved, succeeded
+    runs = client.get(f"/api/watchlists/{watchlist_id}/runs").json()
+    assert runs[0]["status"] == "ok"
