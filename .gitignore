@@ -7,3 +7,4 @@ venv/
 .DS_Store
 exports/
 backend/data/
+graphify-out/
