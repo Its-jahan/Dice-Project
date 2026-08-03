@@ -6,6 +6,7 @@
 # Run as root, on the server:
 #
 #     bash deploy/install.sh <domain-or-ip> [--self-signed] [--with-graph]
+#                                           [--password <username>]
 #
 #     bash deploy/install.sh dice.example.com     # domain: add certbot after
 #     bash deploy/install.sh 203.0.113.10 --self-signed
@@ -13,6 +14,13 @@
 #     bash deploy/install.sh 203.0.113.10         # bare IP, plain HTTP
 #     bash deploy/install.sh dice.example.com --with-graph
 #                                                 # also build the /graph code map
+#     bash deploy/install.sh 203.0.113.10 --self-signed --password jahan
+#                                                 # put the site behind a password
+#
+# DICE has no login of its own, so without --password the whole API is open to
+# anyone who finds the address: they can delete watchlists, change thresholds,
+# or trigger monitor runs that spend your Dune credits. The password is stored
+# as an nginx htpasswd file and survives redeploys.
 #
 # With no domain, --self-signed is strongly recommended: the Dune API key
 # travels in a request header, and plain HTTP puts it on the wire in the clear.
@@ -24,16 +32,29 @@ set -euo pipefail
 SERVER_NAME="${1:-}"
 SELF_SIGNED=false
 WITH_GRAPH=false
-for arg in "${@:2}"; do
-    case "$arg" in
+AUTH_USER=""
+args=("${@:2}")
+index=0
+while [[ $index -lt ${#args[@]} ]]; do
+    case "${args[$index]}" in
         --self-signed) SELF_SIGNED=true ;;
         --with-graph)  WITH_GRAPH=true ;;
-        *) echo "unknown option: $arg" >&2; exit 2 ;;
+        --password)
+            index=$((index + 1))
+            AUTH_USER="${args[$index]:-}"
+            if [[ -z "$AUTH_USER" ]]; then
+                echo "--password needs a username" >&2
+                exit 2
+            fi
+            ;;
+        *) echo "unknown option: ${args[$index]}" >&2; exit 2 ;;
     esac
+    index=$((index + 1))
 done
 
 if [[ -z "$SERVER_NAME" ]]; then
-    echo "usage: bash deploy/install.sh <domain-or-ip> [--self-signed] [--with-graph]" >&2
+    echo "usage: bash deploy/install.sh <domain-or-ip> [--self-signed]" \
+         "[--with-graph] [--password <username>]" >&2
     exit 2
 fi
 
@@ -44,6 +65,7 @@ APP_USER=dice
 GRAPH_DIR=/opt/graph-site
 GRAPH_VENV=/opt/graphify-venv
 TLS_DIR=/etc/dice/tls
+HTPASSWD=/etc/nginx/dice.htpasswd
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # A bare IPv4 address gets an sslip.io alias too, so the operator can switch to
@@ -60,7 +82,8 @@ log() { printf '\n== %s\n' "$*"; }
 log "Installing system packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq python3 python3-venv python3-pip nginx rsync openssl
+apt-get install -y -qq python3 python3-venv python3-pip nginx rsync openssl \
+    apache2-utils
 
 log "Creating the $APP_USER service account"
 id -u "$APP_USER" >/dev/null 2>&1 \
@@ -173,8 +196,27 @@ else
     template="$APP_DIR/deploy/nginx-http.conf"
 fi
 
+# ------------------------------------------------------------------- password
+
+GENERATED_PASSWORD=""
+if [[ -n "$AUTH_USER" ]]; then
+    log "Setting a password for $AUTH_USER"
+    # Generated rather than prompted: this runs unattended over ssh as often
+    # as not, and a prompt there hangs the deploy.
+    GENERATED_PASSWORD="$(openssl rand -base64 18 | tr -d '/+=' | cut -c1-20)"
+    htpasswd -bc "$HTPASSWD" "$AUTH_USER" "$GENERATED_PASSWORD" >/dev/null 2>&1
+    chmod 640 "$HTPASSWD"
+    chown root:www-data "$HTPASSWD"
+fi
+
 log "Configuring nginx for $server_names"
 install -m 644 "$APP_DIR/deploy/nginx-proxy.conf" /etc/nginx/snippets/dice-proxy.conf
+if [[ -f "$HTPASSWD" ]]; then
+    # Driven by the file rather than by the flag, so a redeploy without
+    # --password does not quietly unlock a site that was locked.
+    echo "   password file present — enabling the auth gate"
+    sed -i 's|^    # auth_basic |    auth_basic |' /etc/nginx/snippets/dice-proxy.conf
+fi
 sed -e "s|__SERVER_NAME__|$server_names|g" \
     -e "s|__SSL_CERT__|${ssl_cert:-}|g" \
     -e "s|__SSL_KEY__|${ssl_key:-}|g" \
@@ -271,13 +313,32 @@ Add a certificate before anyone enters a Dune API key:
 NEXT
 fi
 
+if [[ -n "$GENERATED_PASSWORD" ]]; then
+cat <<NEXT
+
+The site is now behind a password. Save these — they are shown once:
+
+    username: $AUTH_USER
+    password: $GENERATED_PASSWORD
+
+The Alchemy webhook path stays open on purpose: Alchemy cannot present a
+password, and every delivery is already rejected unless it carries a valid
+signature. Change the password later with:
+
+    htpasswd /etc/nginx/dice.htpasswd $AUTH_USER
+NEXT
+elif [[ ! -f "$HTPASSWD" ]]; then
 cat <<'NEXT'
 
-Optional password gate (DICE has no login of its own):
-    apt-get install -y apache2-utils
-    htpasswd -c /etc/nginx/dice.htpasswd <username>
-    # uncomment the auth_basic lines in /etc/nginx/snippets/dice-proxy.conf
-    systemctl reload nginx
+WARNING: this instance has no password. DICE has no login of its own, so
+anyone who finds the address can delete watchlists, change thresholds, or
+start monitor runs that spend your Dune credits. Fix it with:
+
+    bash deploy/install.sh <this-host> --password <username>
+NEXT
+fi
+
+cat <<'NEXT'
 
 Service management:
     systemctl status dice
