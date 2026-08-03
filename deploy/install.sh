@@ -5,12 +5,14 @@
 #
 # Run as root, on the server:
 #
-#     bash deploy/install.sh <domain-or-ip> [--self-signed]
+#     bash deploy/install.sh <domain-or-ip> [--self-signed] [--with-graph]
 #
 #     bash deploy/install.sh dice.example.com     # domain: add certbot after
 #     bash deploy/install.sh 203.0.113.10 --self-signed
 #                                                 # bare IP: encrypted at once
 #     bash deploy/install.sh 203.0.113.10         # bare IP, plain HTTP
+#     bash deploy/install.sh dice.example.com --with-graph
+#                                                 # also build the /graph code map
 #
 # With no domain, --self-signed is strongly recommended: the Dune API key
 # travels in a request header, and plain HTTP puts it on the wire in the clear.
@@ -21,16 +23,13 @@ set -euo pipefail
 
 SERVER_NAME="${1:-}"
 SELF_SIGNED=false
+WITH_GRAPH=false
 for arg in "${@:2}"; do
     case "$arg" in
         --self-signed) SELF_SIGNED=true ;;
+        --with-graph)  WITH_GRAPH=true ;;
         *) echo "unknown option: $arg" >&2; exit 2 ;;
     esac
-done
-
-WITH_GRAPH=false
-for arg in "$@"; do
-    [[ "$arg" == "--with-graph" ]] && WITH_GRAPH=true
 done
 
 if [[ -z "$SERVER_NAME" ]]; then
