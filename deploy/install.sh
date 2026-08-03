@@ -167,7 +167,31 @@ for candidate in "$SERVER_NAME" "$SSLIP_NAME"; do
     fi
 done
 
-if [[ -n "$LE_NAME" ]] && ! $SELF_SIGNED; then
+if [[ -n "$LE_NAME" ]] && $SELF_SIGNED; then
+    # Refuse rather than obey. --self-signed silently replacing a working
+    # publicly-trusted certificate is how this site ended up serving a
+    # self-signed cert for days: browsers warned, and Alchemy stopped being
+    # able to deliver webhooks at all, with the only clue buried in a
+    # reachability check nobody was watching. Downgrading TLS is never a
+    # reasonable side effect of a flag someone copy-pasted from an old command.
+    cat >&2 <<REFUSE
+Refusing to replace a real certificate with a self-signed one.
+
+A Let's Encrypt certificate already exists for $LE_NAME. Passing
+--self-signed would point nginx at a self-signed certificate instead, which
+breaks webhook delivery: Alchemy validates TLS and will silently stop
+delivering, so signals just stop arriving.
+
+Re-run without --self-signed:
+    bash deploy/install.sh $LE_NAME
+
+If you genuinely want the self-signed certificate, remove the Let's Encrypt
+one first (certbot delete --cert-name $LE_NAME).
+REFUSE
+    exit 2
+fi
+
+if [[ -n "$LE_NAME" ]]; then
     log "Using the existing Let's Encrypt certificate for $LE_NAME"
     ssl_cert="/etc/letsencrypt/live/$LE_NAME/fullchain.pem"
     ssl_key="/etc/letsencrypt/live/$LE_NAME/privkey.pem"
