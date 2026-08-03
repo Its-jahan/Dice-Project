@@ -234,24 +234,41 @@ def test_sync_deletes_the_webhook_when_nothing_is_live(api, monkeypatch):
     assert db.get_webhook("ethereum") is None
 
 
-def test_unsupported_chain_is_reported(api, monkeypatch):
-    api.put(
-        "/api/settings/realtime",
-        json={"auth_token": "tok", "public_base_url": "https://dice.example"},
-    )
-    solana_wallets = ["9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM"]
+def _live_watchlist_on(api, chain, wallets):
     created = api.post(
         "/api/watchlists",
         json={
-            "name": "sol",
-            "chain": "solana",
-            "wallets": solana_wallets,
+            "name": chain,
+            "chain": chain,
+            "wallets": wallets,
             "min_wallets": 2,
             "min_wallets_pct": 0,
         },
     ).json()
     db.update_watchlist_fields(created["id"], {"realtime": 1})
+    return created["id"]
+
+
+def test_unsupported_chain_is_reported(api, monkeypatch):
+    api.put(
+        "/api/settings/realtime",
+        json={"auth_token": "tok", "public_base_url": "https://dice.example"},
+    )
+    _live_watchlist_on(api, "flare", ["0x" + "a" * 40, "0x" + "b" * 40])
 
     result = api.post("/api/settings/realtime/sync").json()["synced"][0]
 
-    assert "not wired up for solana" in result["error"]
+    assert "not wired up for flare" in result["error"]
+
+
+def test_solana_asks_for_the_provider_that_actually_covers_it(api, monkeypatch):
+    """Alchemy Notify is EVM-only; saying "unsupported" would be misleading."""
+    api.put(
+        "/api/settings/realtime",
+        json={"auth_token": "tok", "public_base_url": "https://dice.example"},
+    )
+    _live_watchlist_on(api, "solana", ["9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM"])
+
+    result = api.post("/api/settings/realtime/sync").json()["synced"][0]
+
+    assert "Helius" in result["error"]

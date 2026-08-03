@@ -145,6 +145,13 @@ const FIELD_HELP = {
     "unlocked liquidity) rides along as a warning and the decision stays " +
     "yours. If the risk API is down, tokens pass unchecked rather than being " +
     "silently dropped.",
+  rtHelius:
+    "Solana only. Alchemy's Address Activity webhooks are an EVM product, so " +
+    "Solana needs its own provider — Helius does the same job: register the " +
+    "watched wallets, receive a POST per transaction that touches one. " +
+    "Everything after that (threshold, liquidity gate, contract screening, " +
+    "outcome tracking) is shared, so a Solana signal means exactly what an " +
+    "Ethereum one does. Leave empty if you do not watch Solana.",
   signalAirdrops:
     "Count wallets that were handed a token, not just those that paid for " +
     "it. Safe to leave on because a token with no liquidity pool is dropped " +
@@ -2234,6 +2241,9 @@ async function loadRealtimeSettings() {
     $("rtToken").placeholder = data.token_hint
       ? `Auth token saved (${data.token_hint}) — paste to replace`
       : "Alchemy auth token";
+    $("rtHelius").placeholder = data.helius_configured
+      ? "Helius key saved — paste to replace"
+      : "Helius API key (Solana only)";
     const badge = $("rtBadge");
     const live = data.configured && data.public_base_url;
     badge.className = "badge rounded-pill " +
@@ -2273,9 +2283,12 @@ async function saveRealtimeSettings() {
     const body = { public_base_url: $("rtUrl").value.trim() };
     const token = $("rtToken").value.trim();
     if (token) body.auth_token = token;
+    const heliusKey = $("rtHelius").value.trim();
+    if (heliusKey) body.helius_api_key = heliusKey;
     try {
       await api("/api/settings/realtime", { method: "PUT", body });
       $("rtToken").value = "";
+      $("rtHelius").value = "";
       await Promise.all([loadRealtimeSettings(), refreshConfig()]);
       setStatus("rtStatus", "Saved. Now switch on Live for a watchlist.", "ok");
     } catch (error) {

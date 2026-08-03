@@ -632,7 +632,7 @@
     <!-- ================================================== realtime -->
     <section class="card shadow-sm" aria-labelledby="rtHeading">
       <div class="card-header d-flex justify-content-between align-items-center">
-        <h2 id="rtHeading" class="h6 mb-0">Live monitoring (Alchemy webhooks)</h2>
+        <h2 id="rtHeading" class="h6 mb-0">Live monitoring (webhooks)</h2>
         <span id="rtBadge" class="badge rounded-pill text-bg-secondary">Off</span>
       </div>
       <div class="card-body">
@@ -644,13 +644,20 @@
           <strong>auth token</strong> from the top of your Alchemy
           <em>webhooks dashboard</em> (not the app API key) and the public HTTPS
           address of this server, then switch on <em>Live</em> for a watchlist.
+          Solana needs a <strong>Helius</strong> key instead — Alchemy's
+          Address Activity is EVM-only — but everything after the decoding is
+          shared, so a Solana signal means exactly what an Ethereum one does.
         </p>
         <div class="row g-2 align-items-center">
-          <div class="col-lg-4">
+          <div class="col-lg-3">
             <input id="rtToken" type="password" class="form-control" autocomplete="off"
                    spellcheck="false" placeholder="Alchemy auth token">
           </div>
-          <div class="col-lg-4">
+          <div class="col-lg-3">
+            <input id="rtHelius" type="password" class="form-control" autocomplete="off"
+                   spellcheck="false" placeholder="Helius API key (Solana only)">
+          </div>
+          <div class="col-lg-3">
             <input id="rtUrl" class="form-control" spellcheck="false"
                    placeholder="https://dice.your-domain.example">
           </div>

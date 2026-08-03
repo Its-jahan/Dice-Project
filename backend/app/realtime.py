@@ -32,7 +32,7 @@ import math
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
-from . import db, dexscreener, performance, security
+from . import db, dexscreener, helius, performance, security
 from .config import settings
 from .models import Chain, SignalOut
 from .monitor import effective_min_wallets, send_signal_notification, signal_to_out
@@ -557,7 +557,7 @@ async def announce(fired: list[tuple[SignalOut, bool]], *, chain: Chain) -> None
 
 
 async def ingest(payload: dict[str, Any], *, chain: Chain) -> dict[str, Any]:
-    """Store a delivery's events and fire any signal it completes.
+    """Store an Alchemy delivery's events and fire any signal it completes.
 
     Returns a small summary for the endpoint to log/return. Never raises on
     signal-side problems: the delivery has already been accepted, and Alchemy
@@ -566,8 +566,33 @@ async def ingest(payload: dict[str, Any], *, chain: Chain) -> dict[str, Any]:
     watched = db.realtime_wallets(chain.value)
     if not watched:
         return {"events": 0, "stored": 0, "signals": 0}
+    return await store_and_evaluate(
+        parse_activity(payload, chain=chain, watched=watched), chain=chain
+    )
 
-    events = parse_activity(payload, chain=chain, watched=watched)
+
+async def ingest_solana(payload: Any) -> dict[str, Any]:
+    """The same, for a Helius delivery.
+
+    Only the parsing differs. Everything downstream — the event store, the
+    pooled threshold, the liquidity and contract gates, the outcome stamp —
+    is provider-agnostic and must stay that way, or Solana slowly grows its
+    own subtly different definition of a signal.
+    """
+    chain = Chain.solana
+    watched = db.realtime_wallets(chain.value)
+    if not watched:
+        return {"events": 0, "stored": 0, "signals": 0}
+    events = helius.parse_activity(
+        payload, watched=watched, seen_at=_iso(_utcnow())
+    )
+    return await store_and_evaluate(events, chain=chain)
+
+
+async def store_and_evaluate(
+    events: list[dict[str, Any]], *, chain: Chain
+) -> dict[str, Any]:
+    """Everything a delivery does once its events have been decoded."""
     if not events:
         return {"events": 0, "stored": 0, "signals": 0}
 
@@ -907,6 +932,7 @@ def _json_list(raw: Any) -> Iterable[str]:
 __all__ = [
     "accumulation_board",
     "distribution_board",
+    "ingest_solana",
     "check_token",
     "evaluate_token",
     "ingest",

@@ -361,6 +361,35 @@ evidence of an old pool.
 Give it a couple of weeks of signals before drawing conclusions. Three
 outcomes is an anecdote; thirty is a basis for moving the threshold.
 
+## Solana
+
+Alchemy Notify's Address Activity is an EVM product, so the live path used to
+stop at the chain boundary. Solana goes through **Helius** instead: save a
+Helius API key next to the Alchemy token, switch **Live** on for a Solana
+watchlist, and press *Sync wallets*.
+
+Only the decoding differs. The events Helius produces are deliberately the
+same shape as the Alchemy ones, so the event store, the pooled threshold, the
+liquidity gate, the contract screen and the outcome tracking all work on
+Solana without knowing Solana exists — and a Solana signal means exactly what
+an Ethereum one does.
+
+The buy and sell rules translate directly: a mint arriving is a **buy** when
+the wallet also sent SOL or another token out in the same transaction, and an
+airdrop when it did not; a mint leaving is a **sale** when something other
+than that mint came back. Helius decodes transfers for you, so unlike the EVM
+path there is no inferring a swap from raw logs.
+
+**Two caveats worth knowing.** Helius does not sign delivery bodies — it sends
+back a fixed `Authorization` header agreed at creation time, which is weaker
+than Alchemy's HMAC, so DICE generates a full-length secret and compares it in
+constant time. And the client has **not been exercised against a live Helius
+account**: the parser is covered by tests built from the documented shape, but
+the first real delivery is what proves the HTTP side. `Sync wallets` surfaces
+any mismatch as an explicit error rather than as silence.
+
+Base, meanwhile, needs nothing new — it has been an Alchemy network all along.
+
 ## Can it be sold again?
 
 Every other check asks whether a token is *interesting*. This one asks whether
@@ -479,6 +508,7 @@ requires.
 | `POST /api/watchlists/{id}/monitor` | Run the monitor now. Header: `X-Dune-Api-Key`. |
 | `GET /api/watchlists/{id}/runs` | Monitor run history. |
 | `GET /api/signals` | Active signals (`?include_dismissed=true` for all). |
+| `POST /api/webhooks/helius` | Helius delivery endpoint for Solana (Authorization-header verified). |
 | `GET /api/live/exits` | What the watched wallets are selling. |
 | `GET /api/tokens/risk?chain=&address=` | Screen one contract (honeypot, taxes, owner powers, LP lock). |
 | `GET /api/wallets/leaderboard?chain=` | Wallet quality: score, hit rate, median return, lead time, cohort count. |

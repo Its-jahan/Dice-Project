@@ -32,6 +32,7 @@ from . import (
     arkham,
     cohorts,
     db,
+    helius,
     monitor,
     performance,
     realtime,
@@ -185,7 +186,8 @@ async def get_config() -> dict[str, object]:
         "realtime": {
             "configured": bool(db.get_setting("alchemy_auth_token")),
             "public_url_set": bool(_public_base_url()),
-            "supported_chains": alchemy.supported_chains(),
+            "supported_chains": live_chains(),
+            "helius_configured": bool(db.get_setting("helius_api_key")),
         },
     }
 
@@ -801,6 +803,16 @@ def _public_base_url() -> str | None:
     return (db.get_setting("public_base_url") or settings.public_base_url or "").strip() or None
 
 
+def live_chains() -> list[str]:
+    """Chains DICE can monitor live, across both providers.
+
+    Alchemy Notify covers the EVM chains; Solana is Helius. Kept in one place
+    because two lists of "what works live" drift, and the symptom is a chain
+    the UI offers and the sync then refuses.
+    """
+    return sorted(alchemy.supported_chains() + [Chain.solana.value])
+
+
 def _webhook_url() -> str:
     base = _public_base_url()
     if not base:
@@ -810,6 +822,85 @@ def _webhook_url() -> str:
             "to be able to reach it to deliver events.",
         )
     return base.rstrip("/") + "/api/webhooks/alchemy"
+
+
+def _helius_webhook_url() -> str:
+    base = _public_base_url()
+    if not base:
+        raise HTTPException(
+            status_code=422,
+            detail="Set the public HTTPS URL of this server first — Helius has "
+            "to be able to reach it to deliver events.",
+        )
+    return base.rstrip("/") + "/api/webhooks/helius"
+
+
+async def sync_solana() -> dict[str, object]:
+    """Make Helius watch exactly the wallets Solana's live watchlists hold.
+
+    Helius has no incremental address API, so the full set goes on every sync.
+    That is the safer shape anyway: it cannot drift out of step with the
+    watchlists the way an add/remove reconciliation can.
+    """
+    api_key = db.get_setting("helius_api_key")
+    if not api_key:
+        raise HTTPException(
+            status_code=422,
+            detail="Save your Helius API key first — Solana live monitoring "
+            "does not go through Alchemy.",
+        )
+
+    chain = Chain.solana
+    wanted = db.realtime_wallets(chain.value)
+    existing = db.get_webhook(chain.value)
+
+    try:
+        async with helius.HeliusClient(api_key) as client:
+            if not wanted:
+                if existing:
+                    await client.delete_webhook(existing["webhook_id"])
+                    db.delete_webhook(chain.value)
+                return {"chain": chain.value, "addresses": 0, "webhook_id": None}
+
+            # The delivery secret is the only thing guarding the endpoint, so
+            # it is generated once and then reused — rotating it on every sync
+            # would leave in-flight deliveries failing for no reason.
+            secret = (existing or {}).get("signing_key") or helius.new_auth_secret()
+            url = _helius_webhook_url()
+            if existing:
+                await client.set_addresses(
+                    existing["webhook_id"],
+                    webhook_url=url,
+                    addresses=wanted,
+                    auth_secret=secret,
+                )
+                webhook_id = existing["webhook_id"]
+            else:
+                created = await client.create_webhook(
+                    webhook_url=url, addresses=wanted, auth_secret=secret
+                )
+                webhook_id = str(created.get("webhookID") or created.get("id") or "")
+                if not webhook_id:
+                    raise HTTPException(
+                        status_code=502,
+                        detail="Helius created a webhook but returned no id.",
+                    )
+    except helius.HeliusError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+
+    db.save_webhook(
+        chain=chain.value,
+        network="solana",
+        webhook_id=webhook_id,
+        signing_key=secret,
+        webhook_url=url,
+        address_count=len(wanted),
+    )
+    return {
+        "chain": chain.value,
+        "addresses": len(wanted),
+        "webhook_id": webhook_id,
+    }
 
 
 async def sync_realtime_chain(chain: Chain) -> dict[str, object]:
@@ -887,7 +978,8 @@ async def get_realtime_settings() -> dict[str, object]:
         "configured": bool(token),
         "token_hint": _key_hint(token),
         "public_base_url": _public_base_url(),
-        "supported_chains": alchemy.supported_chains(),
+        "supported_chains": live_chains(),
+        "helius_configured": bool(db.get_setting("helius_api_key")),
         "webhooks": [
             {
                 "chain": row["chain"],
@@ -909,6 +1001,12 @@ async def save_realtime_settings(body: Annotated[dict, Body()]) -> dict[str, obj
             db.set_setting("alchemy_auth_token", token)
         else:
             db.delete_setting("alchemy_auth_token")
+    if "helius_api_key" in body:
+        key = str(body.get("helius_api_key") or "").strip()
+        if key:
+            db.set_setting("helius_api_key", key)
+        else:
+            db.delete_setting("helius_api_key")
     if "public_base_url" in body:
         url = str(body.get("public_base_url") or "").strip().rstrip("/")
         if url and not url.startswith(("http://", "https://")):
@@ -929,7 +1027,12 @@ async def sync_realtime() -> dict[str, object]:
     results = []
     for value in sorted(chains):
         try:
-            results.append(await sync_realtime_chain(Chain(value)))
+            # Solana is not an Alchemy Notify product; it has its own provider
+            # and its own endpoint, but the same event store behind it.
+            if value == Chain.solana.value:
+                results.append(await sync_solana())
+            else:
+                results.append(await sync_realtime_chain(Chain(value)))
         except HTTPException as exc:
             results.append({"chain": value, "error": exc.detail})
     return {"synced": results}
@@ -938,6 +1041,54 @@ async def sync_realtime() -> dict[str, object]:
 #: Marker used by the reachability probe so its own delivery is not mistaken
 #: for a misconfigured webhook in the log.
 PROBE_WEBHOOK_ID = "dice-reachability-probe"
+
+
+@app.post("/api/webhooks/helius")
+async def receive_helius_webhook(request: Request) -> dict[str, object]:
+    """Helius enhanced-webhook delivery — the Solana equivalent of the above.
+
+    Authenticated by the ``Authorization`` header agreed when the webhook was
+    created. That is weaker than Alchemy's HMAC — Helius does not sign bodies
+    — so the secret is full length and compared in constant time, and the path
+    stays idempotent: replaying a delivery re-inserts events already keyed by
+    signature and changes nothing.
+    """
+    registration = db.get_webhook(Chain.solana.value)
+    if registration is None:
+        # Nothing registered means nothing to verify against, so nothing is
+        # processed. Answered 200 for the same reason as the Alchemy path:
+        # a provider that sees non-2xx retries, then disables the webhook.
+        db.record_delivery(
+            chain=Chain.solana.value,
+            status="unknown_webhook",
+            detail="no Solana webhook registered on this server",
+        )
+        return {"ignored": "no solana webhook registered", "events": 0}
+
+    if not helius.verify_auth(
+        request.headers.get("Authorization"), registration["signing_key"]
+    ):
+        db.record_delivery(
+            chain=Chain.solana.value,
+            status="bad_signature",
+            detail="Authorization header did not match the stored secret",
+        )
+        raise HTTPException(status_code=401, detail="Bad authorization.")
+
+    raw = await request.body()
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        db.record_delivery(chain=Chain.solana.value, status="bad_json")
+        raise HTTPException(status_code=400, detail="Body is not JSON.")
+
+    result = await realtime.ingest_solana(payload)
+    db.record_delivery(
+        chain=Chain.solana.value,
+        status="delivered",
+        detail=f"{result['events']} event(s), {result['signals']} signal(s)",
+    )
+    return result
 
 
 @app.post("/api/webhooks/alchemy")
