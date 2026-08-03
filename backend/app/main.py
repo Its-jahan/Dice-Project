@@ -27,7 +27,7 @@ from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import alchemy, arkham, cohorts, db, monitor, realtime
+from . import alchemy, arkham, cohorts, db, monitor, performance, realtime
 from .cache import cache
 from .config import settings
 from .dune import DuneClient, DuneError, ensure_query
@@ -1128,6 +1128,7 @@ async def live_tokens(
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     include_airdrops: Annotated[bool, Query()] = False,
     include_untradeable: Annotated[bool, Query()] = False,
+    max_pool_age_hours: Annotated[float | None, Query(gt=0)] = None,
 ) -> dict[str, object]:
     """What the watched wallets are buying right now, below threshold included.
 
@@ -1143,10 +1144,30 @@ async def live_tokens(
             limit=limit,
             only_buys=not include_airdrops,
             only_tradeable=not include_untradeable,
+            max_pool_age_hours=max_pool_age_hours,
         ),
         "include_airdrops": include_airdrops,
         "include_untradeable": include_untradeable,
+        "max_pool_age_hours": max_pool_age_hours,
     }
+
+
+@app.get("/api/signals/performance")
+def signal_performance() -> dict[str, object]:
+    """Whether the signals were right, measured against the price afterwards.
+
+    Every other number in DICE describes the *inputs* to a signal. This is the
+    only one that describes the result, which makes it the only basis for
+    changing a threshold on evidence instead of on feel.
+    """
+    return performance.summarise()
+
+
+@app.post("/api/signals/performance/refresh")
+async def refresh_signal_performance() -> dict[str, object]:
+    """Fill in any horizons that have come due, now rather than on the sweep."""
+    filled = await performance.fill_horizons(limit=200)
+    return {"filled": filled, **performance.summarise()}
 
 
 @app.post("/api/live/sweep")

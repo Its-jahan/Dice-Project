@@ -164,7 +164,36 @@ CREATE TABLE IF NOT EXISTS token_market (
     checked_at      TEXT    NOT NULL,
     PRIMARY KEY (chain, token_address)
 );
+
+-- What happened after a signal fired. Without this the whole system is
+-- unfalsifiable: no way to tell a working threshold from a broken one, or a
+-- predictive cohort from noise. The entry price is stamped at fire time and
+-- the horizons are filled in later.
+CREATE TABLE IF NOT EXISTS signal_outcomes (
+    signal_id       INTEGER PRIMARY KEY REFERENCES signals(id) ON DELETE CASCADE,
+    chain           TEXT    NOT NULL,
+    token_address   TEXT    NOT NULL,
+    token_symbol    TEXT,
+    fired_at        TEXT    NOT NULL,
+    wallet_count    INTEGER NOT NULL DEFAULT 0,
+    pool_size       INTEGER NOT NULL DEFAULT 0,
+    -- Snapshot of the market at the moment of the signal, so returns are
+    -- measured against what was actually knowable then.
+    entry_price     REAL,
+    entry_liquidity REAL,
+    -- Age of the liquidity pool when the signal fired: the honest measure of
+    -- how early this system actually is.
+    pool_age_hours  REAL,
+    price_1h        REAL,
+    price_24h       REAL,
+    price_7d        REAL,
+    checked_at      TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_outcomes_pending
+    ON signal_outcomes (fired_at);
 """
+
 
 #: Deliveries kept for the diagnostics panel; older rows are pruned.
 DELIVERY_HISTORY_LIMIT = 100
@@ -1357,3 +1386,81 @@ def replace_wallets(watchlist_id: int, wallets: Iterable[str]) -> None:
             "INSERT OR IGNORE INTO watchlist_wallets VALUES (?, ?, ?)",
             [(watchlist_id, wallet, now) for wallet in wallets],
         )
+
+
+# ------------------------------------------------------------------ outcomes
+#
+# The feedback loop. Without it the threshold, the buy window and the cohorts
+# are all tuned by feel; with it they are tuned by hit rate.
+
+
+def record_outcome(
+    *,
+    signal_id: int,
+    chain: str,
+    token_address: str,
+    token_symbol: str | None,
+    wallet_count: int,
+    pool_size: int,
+    entry_price: float | None,
+    entry_liquidity: float | None,
+    pool_age_hours: float | None,
+) -> None:
+    """Stamp the market at the moment a signal fired.
+
+    Only the first fire is recorded: a signal that later gains buyers is the
+    same opportunity, and re-stamping it would quietly re-baseline the entry
+    price to a level the signal itself may have helped move.
+    """
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO signal_outcomes (
+                signal_id, chain, token_address, token_symbol, fired_at,
+                wallet_count, pool_size, entry_price, entry_liquidity,
+                pool_age_hours
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                signal_id, chain, token_address, token_symbol, utcnow_iso(),
+                wallet_count, pool_size, entry_price, entry_liquidity,
+                pool_age_hours,
+            ),
+        )
+
+
+def outcomes_due(column: str, older_than_iso: str, limit: int = 50) -> list[dict[str, Any]]:
+    """Signals old enough for a horizon that has not been filled in yet."""
+    if column not in ("price_1h", "price_24h", "price_7d"):
+        raise ValueError(f"unknown horizon column: {column}")
+    with connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT * FROM signal_outcomes
+            WHERE {column} IS NULL AND entry_price IS NOT NULL
+              AND fired_at <= ?
+            ORDER BY fired_at LIMIT ?
+            """,
+            (older_than_iso, limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def set_outcome_price(signal_id: int, column: str, price: float | None) -> None:
+    if column not in ("price_1h", "price_24h", "price_7d"):
+        raise ValueError(f"unknown horizon column: {column}")
+    with connect() as conn:
+        conn.execute(
+            f"UPDATE signal_outcomes SET {column} = ?, checked_at = ? "
+            "WHERE signal_id = ?",
+            (price, utcnow_iso(), signal_id),
+        )
+
+
+def list_outcomes(limit: int = 200) -> list[dict[str, Any]]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM signal_outcomes ORDER BY fired_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]

@@ -32,7 +32,7 @@ import math
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
-from . import db, dexscreener
+from . import db, dexscreener, performance
 from .config import settings
 from .models import Chain, SignalOut
 from .monitor import effective_min_wallets, send_signal_notification, signal_to_out
@@ -375,6 +375,21 @@ def evaluate_pool(
         buyers=buyers,
         breakdown=breakdown,
     )
+    if created:
+        # Stamp the market now, while it still reflects what was knowable at
+        # the moment of the signal rather than after any reaction to it.
+        db.record_outcome(
+            signal_id=signal_id,
+            chain=chain.value,
+            token_address=token_address,
+            token_symbol=symbol,
+            wallet_count=len(rows),
+            pool_size=len(wallets),
+            entry_price=market.get("price_usd"),
+            entry_liquidity=market.get("liquidity_usd"),
+            pool_age_hours=performance.pool_age_hours(market.get("pair_created_at")),
+        )
+
     row = db.get_signal(signal_id)
     if row is None:  # pragma: no cover - just written
         return None
@@ -580,6 +595,12 @@ async def sweep_loop() -> None:
         try:
             await asyncio.sleep(settings.live_sweep_seconds)
             result = await sweep()
+            try:
+                filled = await performance.fill_horizons()
+                if filled:
+                    log.info("outcome horizons filled: %s", filled)
+            except Exception:  # pragma: no cover - never break the sweep
+                log.exception("filling outcome horizons failed")
             if result["signals"]:
                 log.info(
                     "live sweep fired %s signal(s) from %s token(s)",
@@ -602,6 +623,7 @@ async def accumulation_board(
     limit: int = 50,
     only_buys: bool = True,
     only_tradeable: bool = True,
+    max_pool_age_hours: float | None = None,
 ) -> list[dict[str, Any]]:
     # The board should mirror what can actually signal, so when airdrops
     # count towards a signal they are shown by default too.
@@ -701,7 +723,22 @@ async def accumulation_board(
         row["volume_24h"] = market.get("volume_24h")
         row["token_symbol"] = market.get("symbol") or row["token_symbol"]
         row["pair_url"] = market.get("pair_url")
+        # How long the pool has existed. The whole point of the system is to
+        # be early, and this is the only number that says whether it was: ten
+        # wallets buying a two-hour-old pool is a different event from ten
+        # wallets buying a two-year-old one.
+        row["pool_age_hours"] = performance.pool_age_hours(
+            market.get("pair_created_at")
+        )
         if only_tradeable and not row["has_pair"]:
+            continue
+        if (
+            max_pool_age_hours is not None
+            and row["pool_age_hours"] is not None
+            and row["pool_age_hours"] > max_pool_age_hours
+        ):
+            # Tokens whose age DexScreener does not report survive the filter:
+            # missing metadata is not evidence of an old pool.
             continue
         annotated.append(row)
 

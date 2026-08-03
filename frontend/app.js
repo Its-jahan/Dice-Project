@@ -131,6 +131,12 @@ const FIELD_HELP = {
   poolMinWallets:
     "An absolute floor under the percentage, so a small pool cannot fire on " +
     "one or two wallets. The higher of the two applies.",
+  liveMaxPoolAge:
+    "Hide tokens whose liquidity pool is older than this many hours. The " +
+    "whole point of the system is to be early, and a pool that has existed " +
+    "for a week has already been found by everyone else. Leave it empty to " +
+    "see everything. Tokens whose age DexScreener does not report are still " +
+    "shown — missing data is not evidence of an old pool.",
   signalAirdrops:
     "Count wallets that were handed a token, not just those that paid for " +
     "it. Safe to leave on because a token with no liquidity pool is dropped " +
@@ -1315,9 +1321,11 @@ async function loadLiveTokens() {
   try {
     const airdrops = $("liveIncludeAirdrops").checked ? "true" : "false";
     const untradeable = $("liveIncludeUntradeable").checked ? "true" : "false";
+    const maxAge = Number($("liveMaxPoolAge").value);
     const data = await api(
       `/api/live/tokens?limit=50&include_airdrops=${airdrops}` +
-        `&include_untradeable=${untradeable}`,
+        `&include_untradeable=${untradeable}` +
+        (maxAge > 0 ? `&max_pool_age_hours=${maxAge}` : ""),
     );
     state.liveTokens = data.tokens || [];
     state.liveIncludesAirdrops = !!data.include_airdrops;
@@ -1339,7 +1347,7 @@ function renderLiveTokens() {
   const head = table.tHead.insertRow();
   const columns = ["Token", "From watchlists", "Buyers", "Progress to signal", "Buys"];
   if (state.liveIncludesAirdrops) columns.push("Paid for");
-  columns.push("Liquidity", "Price", "Last buy", "");
+  columns.push("Liquidity", "Pool age", "Price", "Last buy", "");
   for (const title of columns) {
     head.appendChild(el("th", "small text-body-secondary", title));
   }
@@ -1429,6 +1437,11 @@ function renderLiveTokens() {
       liquidityCell.title = `24h volume ${fmtUsd(row.volume_24h)}`;
     }
 
+    // The number that says whether this is early. Ten wallets on a two-hour-old
+    // pool and ten on a two-year-old one are different events entirely.
+    const ageCell = tr.insertCell();
+    ageCell.appendChild(ageBadge(row.pool_age_hours));
+
     const priceCell = tr.insertCell();
     priceCell.textContent =
       row.price_usd === null || row.price_usd === undefined
@@ -1457,6 +1470,178 @@ function renderLiveTokens() {
   }
 }
 
+/** Pool age as a badge — green while a launch is still fresh, grey once it is not. */
+function ageBadge(hours) {
+  if (hours === null || hours === undefined) {
+    const unknown = el("span", "small text-body-secondary", "—");
+    unknown.title = "DexScreener did not report when this pool was created.";
+    return unknown;
+  }
+  const tone =
+    hours < 6 ? "text-bg-success" : hours < 48 ? "text-bg-warning" : "text-bg-light border text-body-secondary";
+  const label =
+    hours < 1
+      ? `${Math.round(hours * 60)}m`
+      : hours < 48
+        ? `${hours.toFixed(1)}h`
+        : `${Math.round(hours / 24)}d`;
+  const badge = el("span", `badge ${tone}`, label);
+  badge.title =
+    `The liquidity pool was created ${label} before now. Under 6 hours is a ` +
+    "genuinely early entry; over a couple of days the wallets are trading " +
+    "something already discovered.";
+  return badge;
+}
+
+/** A percentage return, coloured by direction. */
+function returnCell(entry, later) {
+  if (!entry || later === null || later === undefined) {
+    return el("span", "small text-body-secondary", "—");
+  }
+  const pct = ((later - entry) / entry) * 100;
+  const node = el(
+    "span",
+    "fw-medium " + (pct > 0 ? "text-success" : pct < 0 ? "text-danger" : ""),
+    `${pct > 0 ? "+" : ""}${pct.toFixed(1)}%`,
+  );
+  node.title = `$${Number(entry).toPrecision(4)} → $${Number(later).toPrecision(4)}`;
+  return node;
+}
+
+async function loadPerformance() {
+  try {
+    state.performance = await api("/api/signals/performance");
+    renderPerformance();
+  } catch (error) {
+    setStatus("perfStatus", error.message, "error");
+  }
+}
+
+async function checkPerformanceNow() {
+  await withBusy($("perfCheck"), async () => {
+    setStatus("perfStatus", "Looking up prices for every signal that has come due…", "");
+    try {
+      const result = await api("/api/signals/performance/refresh", { method: "POST" });
+      state.performance = result;
+      renderPerformance();
+      const filled = Object.entries(result.filled || {})
+        .map(([column, count]) => `${count} at ${column.replace("price_", "")}`)
+        .join(", ");
+      setStatus(
+        "perfStatus",
+        filled ? `Scored ${filled}.` : "Nothing new was due to be scored yet.",
+        filled ? "ok" : "",
+      );
+    } catch (error) {
+      setStatus("perfStatus", error.message, "error");
+    }
+  });
+}
+
+function renderPerformance() {
+  const data = state.performance || {};
+  const cards = $("perfCards");
+  cards.innerHTML = "";
+
+  // The headline row: win rate and median return per horizon. Median rather
+  // than average on purpose — one 40x would otherwise hide four losses.
+  for (const horizon of data.horizons || []) {
+    const col = el("div", "col-6 col-lg-3");
+    const box = el("div", "border rounded p-2 h-100");
+    box.appendChild(el("div", "small text-body-secondary", `After ${horizon.horizon}`));
+    if (horizon.measured) {
+      const value = el(
+        "div",
+        "h5 mb-0 " +
+          (horizon.median_return > 0
+            ? "text-success"
+            : horizon.median_return < 0
+              ? "text-danger"
+              : ""),
+        `${horizon.median_return > 0 ? "+" : ""}${horizon.median_return}%`,
+      );
+      box.appendChild(value);
+      box.appendChild(
+        el(
+          "div",
+          "small text-body-secondary",
+          `${horizon.win_rate}% up · ${horizon.measured} scored`,
+        ),
+      );
+      box.title =
+        `Median return ${horizon.median_return}% across ${horizon.measured} ` +
+        `signals. Best ${horizon.best}%, worst ${horizon.worst}%.`;
+    } else {
+      box.appendChild(el("div", "h5 mb-0 text-body-secondary", "—"));
+      box.appendChild(el("div", "small text-body-secondary", "not measured yet"));
+    }
+    col.appendChild(box);
+    cards.appendChild(col);
+  }
+
+  const col = el("div", "col-6 col-lg-3");
+  const box = el("div", "border rounded p-2 h-100");
+  box.appendChild(el("div", "small text-body-secondary", "Median pool age at signal"));
+  box.appendChild(
+    el(
+      "div",
+      "h5 mb-0",
+      data.median_pool_age_hours === null || data.median_pool_age_hours === undefined
+        ? "—"
+        : `${data.median_pool_age_hours}h`,
+    ),
+  );
+  box.appendChild(
+    el("div", "small text-body-secondary", `${data.signals || 0} signals · ${data.pending || 0} pending`),
+  );
+  box.title =
+    "How old the liquidity pool was when the signals fired — the honest " +
+    "measure of how early this system actually is.";
+  col.appendChild(box);
+  cards.appendChild(col);
+
+  const rows = data.recent || [];
+  const table = $("perfTable");
+  $("perfEmpty").classList.toggle("d-none", !!rows.length);
+  table.classList.toggle("d-none", !rows.length);
+  table.tHead.innerHTML = "";
+  table.tBodies[0].innerHTML = "";
+  if (!rows.length) return;
+
+  const head = table.tHead.insertRow();
+  for (const title of [
+    "Token", "Fired", "Buyers", "Pool age", "Entry", "1h", "24h", "7d",
+  ]) {
+    head.appendChild(el("th", "small text-body-secondary", title));
+  }
+
+  for (const row of rows) {
+    const tr = table.tBodies[0].insertRow();
+    const tokenCell = tr.insertCell();
+    const link = el(
+      "a",
+      "link-primary fw-medium text-decoration-none",
+      row.token_symbol || shortAddress(row.token_address),
+    );
+    link.href = dexscreenerUrl(row.chain, row.token_address);
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.title = row.token_address;
+    tokenCell.appendChild(link);
+
+    tr.insertCell().textContent = fmtTime(row.fired_at);
+    tr.insertCell().textContent = `${row.wallet_count} of ${row.pool_size}`;
+    tr.insertCell().appendChild(ageBadge(row.pool_age_hours));
+    tr.insertCell().textContent =
+      row.entry_price === null || row.entry_price === undefined
+        ? "—"
+        : "$" + Number(row.entry_price).toPrecision(4);
+    for (const column of ["price_1h", "price_24h", "price_7d"]) {
+      tr.insertCell().appendChild(returnCell(row.entry_price, row[column]));
+    }
+  }
+}
+
 async function runLiveSweep() {
   await withBusy($("liveSweep"), async () => {
     setStatus("liveStatus", "Re-checking stored buys against every threshold…", "");
@@ -1468,7 +1653,7 @@ async function runLiveSweep() {
           `${result.signals} signal(s) fired.`,
         result.signals ? "ok" : "",
       );
-      await Promise.all([loadLiveTokens(), loadSignals()]);
+      await Promise.all([loadLiveTokens(), loadSignals(), loadPerformance()]);
     } catch (error) {
       setStatus("liveStatus", error.message, "error");
     }
@@ -2095,6 +2280,9 @@ function init() {
   $("rtSimulate").addEventListener("click", simulateSignal);
   $("rtRefreshDeliveries").addEventListener("click", loadDeliveries);
   $("refreshLive").addEventListener("click", loadLiveTokens);
+  $("perfRefresh").addEventListener("click", loadPerformance);
+  $("perfCheck").addEventListener("click", checkPerformanceNow);
+  $("liveMaxPoolAge").addEventListener("change", loadLiveTokens);
   $("refreshCohorts").addEventListener("click", loadCohortOverlap);
   $("deriveCohorts").addEventListener("click", rebuildRepeats);
   $("liveSweep").addEventListener("click", runLiveSweep);
@@ -2119,6 +2307,7 @@ function init() {
     loadLiveTokens();
     loadPoolSettings();
     loadCohortOverlap();
+    loadPerformance();
     updateRealtimeAvailability();
   });
   loadNotificationSettings();

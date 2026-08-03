@@ -324,6 +324,43 @@ default `backend/data/dice.db`; the systemd unit uses `/var/lib/dice/dice.db`).
 The monitor query is generated ad hoc, so plans without query CRUD can use the
 holder side via `DUNE_QUERY_ID` but not scheduled monitoring.
 
+## Was the signal right?
+
+Everything above decides *when* to fire. None of it says whether firing was
+correct, which makes every threshold in DICE a guess — 10% of the pool, a
+48-hour window, this set of cohorts rather than that one. The **Signal
+scoreboard** closes that loop.
+
+When a signal fires for the first time, DICE stamps the token's price,
+liquidity and **pool age** at that instant. Then, as each horizon comes due, it
+looks the price up again at **1 hour, 24 hours and 7 days**. The card reports
+two numbers per horizon:
+
+* **win rate** — the share of signals that were up at all;
+* **median return** — deliberately the median, not the mean. One token that
+  went 40x drags a mean into looking like a strategy while the median says most
+  signals went nowhere.
+
+Only the *first* fire is recorded. A signal that keeps gaining buyers is the
+same opportunity, and re-stamping it would quietly re-baseline the entry to a
+price the signal itself may have helped move.
+
+Two failure modes are recorded honestly rather than hidden. A token whose pool
+has vanished reads as **-100%**, because that is the truth: the position could
+not be exited. A price lookup that *fails* leaves the horizon **pending**, so
+an API outage is never recorded as a token going to zero.
+
+**Pool age** answers the question the whole system exists for — how early was
+this, really? Ten wallets buying a two-hour-old pool and ten buying a
+two-year-old one are different events, and only one of them is being early. The
+age shows on both the accumulation board and the scoreboard, and
+`Max pool age (h)` on the board hides anything older. Tokens whose age
+DexScreener does not report survive the filter: missing metadata is not
+evidence of an old pool.
+
+Give it a couple of weeks of signals before drawing conclusions. Three
+outcomes is an anecdote; thirty is a basis for moving the threshold.
+
 ## API
 
 | Endpoint | Purpose |
@@ -334,7 +371,7 @@ holder side via `DUNE_QUERY_ID` but not scheduled monitoring.
 | `GET` / `PUT /api/settings/notifications` · `POST …/test` | Telegram bot token + chat id, and a test send. |
 | `GET` / `PUT /api/settings/realtime` · `POST …/sync` | Alchemy auth token + public URL; reconcile watched wallets. |
 | `POST …/check-url` · `POST …/simulate` · `GET …/deliveries` | Reachability probe, synthetic signal, delivery log. |
-| `GET /api/live/tokens` · `POST /api/live/sweep` | Accumulation board (below-threshold included) and an on-demand re-check. |
+| `GET /api/live/tokens` · `POST /api/live/sweep` | Accumulation board (below-threshold included) and an on-demand re-check. `max_pool_age_hours` hides pools older than N hours. |
 | `GET /api/coverage` | How far back Dune's balance table reaches, for the table and for one token. |
 | `GET` / `PUT /api/settings/arkham` · `GET /api/arkham/address` | Arkham key, and an address lookup (`raw=true` for the untouched response). |
 | `POST /api/webhooks/alchemy` | Alchemy delivery endpoint (signature-verified). |
@@ -351,6 +388,7 @@ holder side via `DUNE_QUERY_ID` but not scheduled monitoring.
 | `POST /api/watchlists/{id}/monitor` | Run the monitor now. Header: `X-Dune-Api-Key`. |
 | `GET /api/watchlists/{id}/runs` | Monitor run history. |
 | `GET /api/signals` | Active signals (`?include_dismissed=true` for all). |
+| `GET /api/signals/performance` · `POST …/refresh` | Scoreboard: win rate and median return per horizon; the POST looks up any prices now due. |
 | `POST /api/signals/{id}/dismiss` · `/restore` | Mute / unmute a signal. |
 | `GET /api/health` | Liveness. |
 

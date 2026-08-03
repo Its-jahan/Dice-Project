@@ -417,6 +417,13 @@
               </label>
             </div>
           </div>
+          <div class="col-md-2">
+            <label class="form-label small mb-1" for="liveMaxPoolAge">
+              Max pool age (h)
+            </label>
+            <input id="liveMaxPoolAge" type="number" min="1" step="1"
+                   placeholder="any" class="form-control form-control-sm">
+          </div>
           <div class="col-auto">
             <button type="button" id="poolSave" class="btn btn-primary btn-sm">
               Save threshold
@@ -476,6 +483,40 @@
           </table>
         </div>
         <div id="signalsStatus" class="small mt-2" role="status" aria-live="polite"></div>
+      </div>
+    </section>
+
+    <!-- ================================================== scoreboard -->
+    <section class="card shadow-sm" aria-labelledby="perfHeading">
+      <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
+        <h2 id="perfHeading" class="h6 mb-0">Signal scoreboard</h2>
+        <div class="d-flex align-items-center gap-2">
+          <button type="button" id="perfRefresh" class="btn btn-outline-secondary btn-sm">
+            Refresh
+          </button>
+          <button type="button" id="perfCheck" class="btn btn-outline-secondary btn-sm">
+            Check prices now
+          </button>
+        </div>
+      </div>
+      <div class="card-body">
+        <p class="small text-body-secondary">
+          Every other number here describes what went <em>into</em> a signal. This is
+          the only one that says whether it was <em>right</em>: the price at the moment
+          each signal fired, against the price 1 hour, 24 hours and 7 days later. Until
+          this table has entries, any threshold you pick is a guess — with it, you can
+          change the threshold on evidence.
+        </p>
+        <div id="perfCards" class="row g-2 mb-3"></div>
+        <p id="perfEmpty" class="small text-body-secondary mb-0">
+          No signals scored yet. The first one is measurable an hour after it fires.
+        </p>
+        <div class="table-responsive">
+          <table id="perfTable" class="table table-sm table-hover align-middle d-none mb-0">
+            <thead></thead><tbody></tbody>
+          </table>
+        </div>
+        <div id="perfStatus" class="small mt-2" role="status" aria-live="polite"></div>
       </div>
     </section>
 
