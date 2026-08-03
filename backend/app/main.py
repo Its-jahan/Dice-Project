@@ -27,7 +27,7 @@ from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import alchemy, db, monitor, realtime
+from . import alchemy, arkham, db, monitor, realtime
 from .cache import cache
 from .config import settings
 from .dune import DuneClient, DuneError, ensure_query
@@ -43,6 +43,7 @@ from .jobs import store
 from .models import (
     Chain,
     ExportFormat,
+    HistorySource,
     HoldersRequest,
     HoldersResponse,
     MonitorResult,
@@ -66,6 +67,7 @@ from .sql import (
     DISCOVERY_LIMIT,
     build_catalog_sql,
     build_coverage_sql,
+    build_transfer_snapshot_sql,
     build_contracts_catalog_sql,
     build_discovery_sql,
     build_query_parameters,
@@ -482,6 +484,46 @@ async def contracts_if_needed(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+@app.get("/api/settings/arkham")
+async def get_arkham_settings() -> dict[str, object]:
+    key = arkham.api_key()
+    return {"configured": bool(key), "key_hint": _key_hint(key)}
+
+
+@app.put("/api/settings/arkham")
+async def save_arkham_settings(body: Annotated[dict, Body()]) -> dict[str, object]:
+    key = str(body.get("api_key") or "").strip()
+    if key:
+        db.set_setting("arkham_api_key", key)
+    else:
+        db.delete_setting("arkham_api_key")
+    return await get_arkham_settings()
+
+
+@app.get("/api/arkham/address")
+async def arkham_address(
+    address: str,
+    chain: Chain = Chain.ethereum,
+    raw: Annotated[bool, Query()] = False,
+) -> dict[str, object]:
+    """Who Arkham says an address is.
+
+    ``raw=true`` returns the untouched response, which is how the parsing was
+    confirmed against a real key — Arkham's shapes are not published.
+    """
+    try:
+        payload = await arkham.raw_lookup(chain, address.strip())
+    except arkham.ArkhamError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    if raw:
+        return {"address": address, "chain": chain.value, "raw": payload}
+    return {
+        "address": address,
+        "chain": chain.value,
+        **arkham.describe_address(payload, chain),
+    }
+
+
 @app.get("/api/coverage")
 async def token_coverage(
     chain: Chain = Chain.ethereum,
@@ -603,6 +645,20 @@ async def _run_holders_query(client: DuneClient, req: HoldersRequest) -> str:
     raise AssertionError("unreachable")  # pragma: no cover
 
 
+async def _run_transfer_query(client: DuneClient, req: HoldersRequest) -> str:
+    """Execute the transfer-reconstruction query and return its execution id."""
+    query_id = await ensure_query(
+        client,
+        purpose="holders_transfers",
+        name=f"DICE holders via transfers {req.chain.value} "
+        f"{req.token_address[:10]} {req.start_date}..{req.end_date}",
+        query_sql=build_transfer_snapshot_sql(req),
+    )
+    execution_id = await client.execute_query(query_id)
+    await client.wait_for_execution(execution_id)
+    return execution_id
+
+
 @app.post("/api/holders")
 async def get_holders(
     req: Annotated[HoldersRequest, Body()],
@@ -611,16 +667,33 @@ async def get_holders(
     """Run the snapshot query and return a preview plus a job id for export."""
     key = resolve_api_key(x_dune_api_key)
 
+    source_used = "balances"
     async with DuneClient(key) as client:
         if settings.dune_query_id:
             query_id = settings.dune_query_id
             parameters = build_query_parameters(req)
             execution_id = await client.execute_query(query_id, parameters=parameters)
             await client.wait_for_execution(execution_id)
+            rows, truncated = await client.fetch_results(execution_id)
+        elif req.history_source is HistorySource.transfers:
+            execution_id = await _run_transfer_query(client, req)
+            rows, truncated = await client.fetch_results(execution_id)
+            source_used = "transfers"
         else:
             execution_id = await _run_holders_query(client, req)
-
-        rows, truncated = await client.fetch_results(execution_id)
+            rows, truncated = await client.fetch_results(execution_id)
+            if not rows and req.history_source is HistorySource.auto:
+                # The balance table only reaches as far back as Dune
+                # backfilled it. Rather than report "no holders" for a range
+                # it simply does not cover, rebuild the balances from
+                # transfers, which go back to genesis.
+                log.info(
+                    "balance table returned nothing for %s; retrying from transfers",
+                    req.token_address,
+                )
+                execution_id = await _run_transfer_query(client, req)
+                rows, truncated = await client.fetch_results(execution_id)
+                source_used = "transfers"
 
     # classify_wallets also strips the baseline day it needed, so nothing
     # downstream sees a snapshot from before the requested range.
@@ -634,6 +707,7 @@ async def get_holders(
     # wastes the user's credits on re-runs. Count what survived each stage so
     # the UI can say which one it was.
     stages = {
+        "source": source_used,
         "dune_rows": len(rows),
         "after_min_balance": len(parsed),
         "wallets_in_range": len({s.wallet_address for s in in_range}),

@@ -139,6 +139,15 @@
             </div>
 
             <div class="col-md-3">
+              <label class="form-label" for="historySource">History source</label>
+              <select id="historySource" name="history_source" class="form-select">
+                <option value="auto">Auto (balances, then transfers)</option>
+                <option value="balances">Balance table only</option>
+                <option value="transfers">Rebuild from transfers</option>
+              </select>
+            </div>
+
+            <div class="col-md-3">
               <label class="form-label" for="walletFilter">Buyers or holders</label>
               <select id="walletFilter" name="wallet_filter" class="form-select">
                 <option value="all">Everyone</option>
@@ -390,6 +399,45 @@
           </table>
         </div>
         <div id="signalsStatus" class="small mt-2" role="status" aria-live="polite"></div>
+      </div>
+    </section>
+
+    <!-- ================================================== arkham -->
+    <section class="card shadow-sm" aria-labelledby="akHeading">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <h2 id="akHeading" class="h6 mb-0">Arkham labels</h2>
+        <span id="akBadge" class="badge rounded-pill text-bg-secondary">Off</span>
+      </div>
+      <div class="card-body">
+        <p class="form-text mt-0 mb-3">
+          Turns an address into who is behind it — “Binance hot wallet”, a named
+          fund, a bridge. Useful because an exchange wallet receiving a token is a
+          customer deposit, not a conviction buy, and a few of those quietly inflate
+          a co-buy count. Get a key at <strong>intel.arkm.com → Settings → API
+          Keys</strong> (access is by application, and calls are metered).
+          Arkham reports holders as they are <em>now</em>, so it does not answer
+          historical questions — that stays with the Dune sources above.
+        </p>
+        <div class="row g-2 align-items-center">
+          <div class="col-lg-5">
+            <input id="akKey" type="password" class="form-control" autocomplete="off"
+                   spellcheck="false" placeholder="Arkham API key">
+          </div>
+          <div class="col-auto">
+            <button type="button" id="akSave" class="btn btn-primary">Save</button>
+          </div>
+          <div class="col-lg-4">
+            <input id="akProbe" class="form-control" spellcheck="false"
+                   placeholder="0x… address to look up">
+          </div>
+          <div class="col-auto">
+            <button type="button" id="akLookup" class="btn btn-outline-secondary">
+              Look up
+            </button>
+          </div>
+        </div>
+        <div id="akStatus" class="small mt-2" role="status" aria-live="polite"></div>
+        <pre id="akOut" class="bg-body-tertiary border rounded p-3 small mt-2 mb-0 overflow-auto d-none"></pre>
       </div>
     </section>
 

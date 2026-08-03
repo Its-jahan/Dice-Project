@@ -329,6 +329,113 @@ LIMIT {DISCOVERY_LIMIT}
 """.strip()
 
 
+#: Dune's curated cross-chain transfer table. Unlike the balance tables it
+#: covers a chain's whole history, which is the point of using it: balances can
+#: be *reconstructed* from transfers for dates the balance tables never
+#: backfilled.
+TRANSFERS_TABLE = "tokens.transfers"
+
+
+def build_transfer_snapshot_sql(req: HoldersRequest) -> str:
+    """Rebuild daily balances from transfer history.
+
+    Why this exists
+    ---------------
+    ``balances_<chain>.daily_updates`` is the fast path, but it only reaches
+    back as far as Dune backfilled it. Transfers go back to genesis, and a
+    balance is just their running total — so for older ranges the answer can be
+    computed rather than looked up.
+
+    The output is deliberately identical to the balance-table query
+    (``wallet_address, token_address, snapshot_date, balance``) so everything
+    downstream — buyer/holder classification, holder modes, exports — works
+    without knowing which source produced it.
+
+    Cost warning: this reads every transfer of the token ever made and expands
+    holders across the calendar, so it is far heavier than the balance table.
+    It is worth it only when the balance table cannot answer at all.
+    """
+    chain_filter = f"t.blockchain = {_quote(req.chain.value)}"
+    token = _address_literal(req.chain, req.token_address)
+    baseline = f"date {_quote(req.baseline_date.isoformat())}"
+    end = f"date {_quote(req.effective_end_date.isoformat())}"
+
+    burn_filter = ""
+    if req.exclude_burn_addresses:
+        burn_filter = (
+            f"\n  AND wallet NOT IN "
+            f"({_address_list(req.chain, _burn_addresses(req))})"
+        )
+
+    return f"""
+-- DICE: daily balances rebuilt from transfer history
+-- Used when the balance table does not reach far enough back. A balance is
+-- the running total of transfers in minus transfers out, so the whole series
+-- can be derived from {TRANSFERS_TABLE}, which covers full chain history.
+WITH moves AS (
+    SELECT t."to" AS wallet, t.amount AS delta, t.block_time
+    FROM {TRANSFERS_TABLE} t
+    WHERE {chain_filter}
+      AND t.contract_address = {token}
+      AND t.block_time < {end} + interval '1' day
+    UNION ALL
+    SELECT t."from" AS wallet, -t.amount AS delta, t.block_time
+    FROM {TRANSFERS_TABLE} t
+    WHERE {chain_filter}
+      AND t.contract_address = {token}
+      AND t.block_time < {end} + interval '1' day
+),
+-- Everything that happened before the window collapses into one number per
+-- wallet: the balance it carried in.
+opening AS (
+    SELECT wallet, SUM(delta) AS balance
+    FROM moves
+    WHERE block_time < {baseline}
+    GROUP BY 1
+),
+daily AS (
+    SELECT wallet, CAST(block_time AS date) AS day, SUM(delta) AS delta
+    FROM moves
+    WHERE block_time >= {baseline}
+    GROUP BY 1, 2
+),
+-- Wallets worth expanding: they either carried a balance in, or moved the
+-- token during the window.
+holders AS (
+    SELECT wallet FROM opening WHERE balance > 0
+    UNION
+    SELECT wallet FROM daily
+),
+calendar AS (
+    SELECT day
+    FROM UNNEST(sequence({baseline}, {end}, interval '1' day)) AS c(day)
+),
+running AS (
+    SELECT
+        h.wallet,
+        c.day,
+        COALESCE(o.balance, 0) + COALESCE(
+            SUM(d.delta) OVER (
+                PARTITION BY h.wallet ORDER BY c.day
+                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            ), 0
+        ) AS balance
+    FROM holders h
+    CROSS JOIN calendar c
+    LEFT JOIN opening o ON o.wallet = h.wallet
+    LEFT JOIN daily d ON d.wallet = h.wallet AND d.day = c.day
+)
+SELECT
+    wallet AS wallet_address,
+    {token} AS token_address,
+    day AS snapshot_date,
+    balance
+FROM running
+WHERE balance > {req.min_balance!r}{burn_filter}
+ORDER BY day, balance DESC
+""".strip()
+
+
 def build_coverage_sql(chain: Chain, token_address: str, source: Source) -> str:
     """Ask Dune what history it actually holds — for the table and the token.
 

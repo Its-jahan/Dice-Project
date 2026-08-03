@@ -65,6 +65,12 @@ const FIELD_HELP = {
     "Daily gives one row per wallet per day. Held at any time gives wallets " +
     "that appeared at least once. Continuous keeps only wallets that held on " +
     "every single day of the range.",
+  historySource:
+    "Dune's balance table is fast but only reaches as far back as Dune " +
+    "backfilled it. Rebuilding from transfers covers the whole chain history " +
+    "— a balance is just the running total of transfers — but reads every " +
+    "transfer the token ever had, so it is much heavier. Auto tries the " +
+    "balance table first and falls back only when it returns nothing.",
   walletFilter:
     "A buyer's balance went up during the range — either it held none and " +
     "bought, or it already held some and bought more. A holder's balance only " +
@@ -120,6 +126,13 @@ const FIELD_HELP = {
     "Also show tokens that merely arrived without the wallet paying anything " +
     "in the same transaction — almost always spam airdrops. They never count " +
     "towards a signal; this is only for inspecting what was filtered out.",
+  akKey:
+    "Your Arkham API key, from intel.arkm.com → Settings → API Keys. Access " +
+    "is granted by application and calls are metered.",
+  akProbe:
+    "An address to identify. Uses the chain selected in the holder query " +
+    "above. The raw response is shown too, since Arkham's shapes are not " +
+    "published.",
   liveIncludeUntradeable:
     "Also show tokens with no liquidity pool on any DEX. Nobody can buy or " +
     "sell those, so they never signal — this reveals what was filtered and why.",
@@ -473,6 +486,7 @@ function readRequest() {
     min_balance: Number($("minBalance").value || 0),
     holder_mode: $("holderMode").value,
     wallet_filter: $("walletFilter").value,
+    history_source: $("historySource").value,
     include_contracts: $("includeContracts").checked,
     exclude_burn_addresses: $("excludeBurn").checked,
   };
@@ -1435,6 +1449,73 @@ function renderSignalDetails(tbody, signal) {
   cell.appendChild(wrap);
 }
 
+/* ---------------------------------------------------------------- arkham */
+
+async function loadArkhamSettings() {
+  try {
+    const data = await api("/api/settings/arkham");
+    $("akKey").placeholder = data.key_hint
+      ? `Key saved (${data.key_hint}) — paste to replace`
+      : "Arkham API key";
+    const badge = $("akBadge");
+    badge.className =
+      "badge rounded-pill " + (data.configured ? "text-bg-success" : "text-bg-secondary");
+    badge.textContent = data.configured ? "On" : "Off";
+  } catch {
+    /* non-fatal */
+  }
+}
+
+async function saveArkhamSettings() {
+  await withBusy($("akSave"), async () => {
+    try {
+      await api("/api/settings/arkham", {
+        method: "PUT",
+        body: { api_key: $("akKey").value.trim() },
+      });
+      $("akKey").value = "";
+      await loadArkhamSettings();
+      setStatus("akStatus", "Saved. Try a lookup to confirm the key works.", "ok");
+    } catch (error) {
+      setStatus("akStatus", error.message, "error");
+    }
+  });
+}
+
+async function lookupArkham() {
+  const address = $("akProbe").value.trim();
+  if (!address) {
+    setStatus("akStatus", "Enter an address to look up.", "error");
+    return;
+  }
+  await withBusy($("akLookup"), async () => {
+    setStatus("akStatus", "Asking Arkham…", "");
+    try {
+      const chain = encodeURIComponent($("chain").value);
+      const data = await api(
+        `/api/arkham/address?address=${encodeURIComponent(address)}&chain=${chain}`,
+      );
+      const parts = [
+        data.entity ? `Entity: ${data.entity}` : "No entity on record",
+        data.label ? `Label: ${data.label}` : null,
+        data.entity_type ? `Type: ${data.entity_type}` : null,
+        data.is_service ? "Flagged as an exchange/bridge wallet" : null,
+      ].filter(Boolean);
+      setStatus("akStatus", parts.join(" · "), "ok");
+
+      // Show the raw answer too: Arkham's shapes are undocumented, so this is
+      // how a parsing mismatch becomes visible instead of silently empty.
+      const rawData = await api(
+        `/api/arkham/address?address=${encodeURIComponent(address)}&chain=${chain}&raw=true`,
+      );
+      $("akOut").textContent = JSON.stringify(rawData.raw, null, 2).slice(0, 4000);
+      $("akOut").classList.remove("d-none");
+    } catch (error) {
+      setStatus("akStatus", error.message, "error");
+    }
+  });
+}
+
 /* -------------------------------------------------------------- realtime */
 
 function realtimeReady() {
@@ -1756,6 +1837,8 @@ function init() {
 
   $("tgSave").addEventListener("click", saveNotificationSettings);
   $("tgTest").addEventListener("click", testNotification);
+  $("akSave").addEventListener("click", saveArkhamSettings);
+  $("akLookup").addEventListener("click", lookupArkham);
   $("rtSave").addEventListener("click", saveRealtimeSettings);
   $("rtSync").addEventListener("click", syncRealtime);
   $("rtCheckUrl").addEventListener("click", checkWebhookUrl);
@@ -1784,6 +1867,7 @@ function init() {
     updateRealtimeAvailability();
   });
   loadNotificationSettings();
+  loadArkhamSettings();
   loadRealtimeSettings();
   loadDeliveries();
   startPolling();

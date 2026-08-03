@@ -66,6 +66,43 @@ request header, so plain HTTP puts it on the wire in the clear. Without a
 domain you can still get a **publicly-trusted** certificate via sslip.io — see
 [deploy/README.md](deploy/README.md).
 
+## Where the history comes from
+
+Dune's balance tables are the fast path, but they only reach as far back as
+Dune backfilled them — and Dune does not publish that date. **Check coverage**
+asks directly: it reports the table's first and last day, the first and last
+day your token appears in it, and how many rows exist for it. Zero rows means
+the holder query cannot answer for any date.
+
+When the balance table cannot reach a range, balances can be **rebuilt from
+transfers**. A balance is just the running total of transfers in minus
+transfers out, and `tokens.transfers` covers a chain's whole history. The
+reconstruction emits exactly the same shape as the balance query, so buyer/
+holder classification, holder modes and exports all work unchanged.
+
+| History source | Reads | Cost |
+| --- | --- | --- |
+| **Auto** *(default)* | The balance table; falls back to transfers only if it returns nothing | One query, occasionally two |
+| **Balance table only** | Never falls back — useful to confirm what the fast path alone knows | Cheapest |
+| **Rebuild from transfers** | Every transfer the token ever had, expanded across the range | Much heavier; use for old ranges |
+
+The response reports which source actually answered, and an empty result names
+the stage that emptied it rather than guessing.
+
+## Arkham labels (optional)
+
+[Arkham](https://intel.arkm.com) turns an address into who is behind it —
+"Binance hot wallet", a named fund, a bridge. That matters for signals: an
+exchange wallet receiving a token is a customer deposit, not a conviction buy,
+and a few of those quietly inflate a co-buy count.
+
+Arkham reports holders **as they are now**, so it does not answer historical
+questions — that stays with the two Dune sources above. Access is by
+application and calls are metered. Paste the key in the *Arkham labels* card;
+the lookup shows both the parsed labels and the raw response, because Arkham's
+response shapes are not published and the parser is deliberately tolerant of
+several spellings.
+
 ## Buyers versus holders
 
 On a token that has existed for years, "who held it between 1 and 5 July" is
@@ -289,6 +326,8 @@ holder side via `DUNE_QUERY_ID` but not scheduled monitoring.
 | `GET` / `PUT /api/settings/realtime` · `POST …/sync` | Alchemy auth token + public URL; reconcile watched wallets. |
 | `POST …/check-url` · `POST …/simulate` · `GET …/deliveries` | Reachability probe, synthetic signal, delivery log. |
 | `GET /api/live/tokens` · `POST /api/live/sweep` | Accumulation board (below-threshold included) and an on-demand re-check. |
+| `GET /api/coverage` | How far back Dune's balance table reaches, for the table and for one token. |
+| `GET` / `PUT /api/settings/arkham` · `GET /api/arkham/address` | Arkham key, and an address lookup (`raw=true` for the untouched response). |
 | `POST /api/webhooks/alchemy` | Alchemy delivery endpoint (signature-verified). |
 | `POST /api/dune/archive-queries` | Archive every `DICE …` query in the Dune account (frees private-query slots). |
 | `POST /api/sql` | Preview the generated DuneSQL. Needs a key, since the table is resolved from the catalogue. |

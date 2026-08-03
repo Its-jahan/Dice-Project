@@ -96,6 +96,21 @@ class WalletType(str, Enum):
     holder = "holder"
 
 
+class HistorySource(str, Enum):
+    """Where daily balances come from.
+
+    ``balances`` reads Dune's curated balance table: fast and cheap, but only
+    as far back as Dune backfilled it. ``transfers`` rebuilds the balances
+    from transfer history, which covers the whole chain but reads every
+    transfer the token ever had. ``auto`` uses the balance table and falls
+    back to transfers when it returns nothing.
+    """
+
+    auto = "auto"
+    balances = "balances"
+    transfers = "transfers"
+
+
 class HoldersRequest(BaseModel):
     chain: Chain
     token_address: str
@@ -110,6 +125,8 @@ class HoldersRequest(BaseModel):
     #: keep only wallets that added to their position in the range, only those
     #: that did not, or both
     wallet_filter: WalletFilter = WalletFilter.all
+    #: which source the daily balances come from
+    history_source: HistorySource = HistorySource.auto
 
     @field_validator("token_address")
     @classmethod
