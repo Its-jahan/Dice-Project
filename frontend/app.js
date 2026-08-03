@@ -163,7 +163,8 @@ const FIELD_HELP = {
     "model never decides to buy, never sets a threshold, and never replaces " +
     "the contract screen. Leave it empty and everything else works as before.",
   aiModel:
-    "Which model to use. Empty means the default shown — Claude Opus 5, the " +
+    "Which model to use — type to search the provider's live catalogue, or " +
+    "paste any slug. Empty means the default shown — Claude Opus 5, the " +
     "same model either way. Any OpenRouter slug works if you want to trade " +
     "cost against judgement, but the review is the part that benefits from " +
     "the stronger model: it is reading a table and deciding what the numbers " +
@@ -1947,6 +1948,7 @@ async function loadAiSettings() {
     $("aiModel").value = data.model && data.model !== $("aiModel").placeholder
       ? data.model : "";
     $("aiEnrichment").checked = !!data.enrichment;
+    describeSelectedModel();
     const badge = $("aiBadge");
     badge.className =
       "badge rounded-pill " + (data.enrichment ? "text-bg-success" : "text-bg-secondary");
@@ -1956,6 +1958,79 @@ async function loadAiSettings() {
     renderThemes(data.themes || []);
   } catch {
     /* non-fatal */
+  }
+}
+
+/** Fill the picker from the provider's live catalogue. */
+async function loadAiModels() {
+  try {
+    const data = await api("/api/ai/models");
+    state.aiModels = data.models || [];
+    const list = $("aiModelList");
+    list.innerHTML = "";
+    for (const m of state.aiModels) {
+      const option = document.createElement("option");
+      option.value = m.id;
+      // Shown beside the slug while typing, so the choice is made with the
+      // price visible rather than looked up afterwards.
+      option.label = `${describePrice(m)}${m.structured_outputs ? "" : " · no schema support"}`;
+      list.appendChild(option);
+    }
+    describeSelectedModel();
+  } catch {
+    /* the picker is a convenience — a free-typed slug still works */
+  }
+}
+
+function describePrice(m) {
+  if (m.input_per_m === null || m.output_per_m === null) return "variable pricing";
+  return `$${m.input_per_m}/M in · $${m.output_per_m}/M out`;
+}
+
+/** What the currently-typed model costs, and whether it fits both jobs. */
+function describeSelectedModel() {
+  const host = $("aiModelInfo");
+  host.innerHTML = "";
+  const chosen =
+    $("aiModel").value.trim() || $("aiModel").placeholder.trim();
+  const m = (state.aiModels || []).find((x) => x.id === chosen);
+  if (!m) {
+    if (chosen && state.aiModels?.length) {
+      host.appendChild(
+        el(
+          "span",
+          "text-body-secondary",
+          `${chosen} is not in the catalogue — it will be sent as typed.`,
+        ),
+      );
+    }
+    return;
+  }
+  const bits = [
+    el("span", "text-body-secondary", `${m.name} · ${describePrice(m)}`),
+  ];
+  if (m.context) {
+    // "1000K" is a worse way of writing "1M".
+    const ctx =
+      m.context >= 1_000_000
+        ? `${(m.context / 1_000_000).toFixed(m.context % 1_000_000 ? 1 : 0)}M`
+        : `${Math.round(m.context / 1000)}K`;
+    bits.push(el("span", "text-body-secondary", ` · ${ctx} context`));
+  }
+  for (const bit of bits) host.appendChild(bit);
+  if (!m.structured_outputs) {
+    // Not fatal — the review falls back to reading JSON out of prose — but
+    // worth knowing before the review comes back messier than expected.
+    const warn = el(
+      "span",
+      "badge text-bg-warning ms-2",
+      "no structured output",
+    );
+    warn.title =
+      "This model does not support a fixed response schema. Briefs are " +
+      "unaffected; the review still works by reading JSON out of the reply, " +
+      "but a model that honours the schema is more reliable.";
+    host.appendChild(warn);
   }
 }
 
@@ -2756,6 +2831,7 @@ function init() {
   $("aiSave").addEventListener("click", saveAiSettings);
   $("aiReview").addEventListener("click", runAiReview);
   $("aiTest").addEventListener("click", testAiKey);
+  $("aiModel").addEventListener("input", describeSelectedModel);
   $("aiEnrichment").addEventListener("change", saveAiSettings);
   $("refreshExits").addEventListener("click", loadExits);
   $("wqChain").addEventListener("change", loadWalletQuality);
@@ -2794,6 +2870,7 @@ function init() {
   loadArkhamSettings();
   loadRealtimeSettings();
   loadAiSettings();
+  loadAiModels();
   loadLastReview();
   loadDeliveries();
   startPolling();

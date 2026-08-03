@@ -1369,6 +1369,24 @@ def save_ai_settings(body: Annotated[dict, Body()]) -> dict[str, object]:
     return get_ai_settings()
 
 
+@app.get("/api/ai/models")
+async def ai_models(refresh: Annotated[bool, Query()] = False) -> dict[str, object]:
+    """Every model the active provider accepts, with what it costs.
+
+    Public on OpenRouter, so the picker is populated before a key is saved —
+    choosing a model and pasting a key are the same sitting.
+    """
+    try:
+        models = await ai.list_models(refresh=refresh)
+    except ai.AIUnavailable as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    return {
+        "provider": ai.provider() or "openrouter",
+        "selected": ai.model(),
+        "models": models,
+    }
+
+
 @app.post("/api/settings/ai/test")
 async def test_ai_key() -> dict[str, object]:
     """Prove the key works now, rather than finding out when a signal fires."""

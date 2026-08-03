@@ -459,6 +459,20 @@ guarantee below are identical. The two differ only in how a request is shaped
 on the wire — which is exactly as much as should differ. **Test** proves the
 saved key works now rather than when a signal fires.
 
+### Which model
+
+The picker is filled from the provider's live catalogue — type to search 338
+models on OpenRouter, or paste any slug. The price per million tokens and the
+context window are shown for whatever is selected, so the choice is made with
+the cost visible rather than looked up afterwards. Empty means the default,
+Claude Opus 5.
+
+Models that cannot honour a fixed response schema are marked. That is not
+fatal — briefs are unaffected, and the review falls back to reading JSON out
+of the reply — but the review is the half that benefits from the stronger
+model anyway: it is deciding what a small table does *not* yet support, which
+is precisely where a weaker model manufactures confidence.
+
 One cost worth knowing: the briefs use web search, which OpenRouter bills per
 result — five per signal.
 
@@ -565,6 +579,7 @@ requires.
 | `POST /api/webhooks/helius` | Helius delivery endpoint for Solana (Authorization-header verified). |
 | `GET /api/live/exits` | What the watched wallets are selling. |
 | `GET /api/tokens/risk?chain=&address=` | Screen one contract (honeypot, taxes, owner powers, LP lock). |
+| `GET /api/ai/models` | The active provider's catalogue: ids, prices, context, schema support. |
 | `GET` / `PUT /api/settings/ai` · `POST …/test` | Model key (server-side), enrichment toggle, theme breakdown, and a live key check. |
 | `POST` / `GET /api/ai/review` | Run a review of the measured results / read the last one. |
 | `GET /api/signals/{id}/brief` | The researched brief for one signal. |

@@ -52,6 +52,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from typing import Any
 
 import httpx
@@ -62,6 +63,11 @@ from .config import settings
 log = logging.getLogger(__name__)
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
+
+#: The catalogue changes rarely and is fetched to fill a picker, so a long
+#: cache keeps the settings page instant without ever being meaningfully stale.
+CATALOGUE_TTL_SECONDS = 3600
 
 #: Same model either way — on OpenRouter the slug is namespaced, and it is
 #: listed there at Anthropic's own price, so routing through the gateway costs
@@ -197,6 +203,112 @@ REVIEW_SCHEMA: dict[str, Any] = {
 
 class AIUnavailable(RuntimeError):
     """No key, disabled, or the API could not be reached. Never fatal."""
+
+
+# ------------------------------------------------------------- the catalogue
+
+
+_catalogue: dict[str, Any] = {"at": 0.0, "provider": None, "models": []}
+
+
+def _price(value: Any) -> float | None:
+    """Per-million-token price. None when the gateway reports it as variable.
+
+    A router that picks the model per request quotes -1 rather than a number;
+    showing that as "$-1000000/M" would be worse than showing nothing.
+    """
+    try:
+        per_token = float(value)
+    except (TypeError, ValueError):
+        return None
+    return round(per_token * 1_000_000, 4) if per_token >= 0 else None
+
+
+async def list_models(*, refresh: bool = False) -> list[dict[str, Any]]:
+    """Every model the active provider will accept, with what it costs.
+
+    Sorted so the ones that support structured output come first: the review
+    asks for a fixed schema, and while there is a fallback that reads JSON out
+    of prose, a model that honours the schema is simply more reliable.
+    """
+    active = provider() or "openrouter"
+    fresh = (
+        not refresh
+        and _catalogue["provider"] == active
+        and time.monotonic() - _catalogue["at"] < CATALOGUE_TTL_SECONDS
+    )
+    if fresh and _catalogue["models"]:
+        return _catalogue["models"]
+
+    models = (
+        await _anthropic_models() if active == "anthropic" else await _openrouter_models()
+    )
+    models.sort(key=lambda m: (not m["structured_outputs"], m["id"]))
+    _catalogue.update({"at": time.monotonic(), "provider": active, "models": models})
+    return models
+
+
+async def _openrouter_models() -> list[dict[str, Any]]:
+    """The public catalogue — no key needed, so the picker works before setup."""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(OPENROUTER_MODELS_URL)
+            response.raise_for_status()
+            data = response.json().get("data") or []
+    except (httpx.HTTPError, ValueError) as error:
+        raise AIUnavailable(f"Could not read the model list: {error}") from error
+
+    models = []
+    for entry in data:
+        if not isinstance(entry, dict) or not entry.get("id"):
+            continue
+        pricing = entry.get("pricing") or {}
+        supported = entry.get("supported_parameters") or []
+        models.append(
+            {
+                "id": entry["id"],
+                "name": entry.get("name") or entry["id"],
+                "context": entry.get("context_length"),
+                "input_per_m": _price(pricing.get("prompt")),
+                "output_per_m": _price(pricing.get("completion")),
+                "structured_outputs": "structured_outputs" in supported
+                or "response_format" in supported,
+            }
+        )
+    return models
+
+
+async def _anthropic_models() -> list[dict[str, Any]]:
+    """The account's own model list, which needs the key it is listing for."""
+    try:
+        import anthropic
+    except ImportError as error:  # pragma: no cover - dependency is pinned
+        raise AIUnavailable("The anthropic package is not installed.") from error
+
+    key = api_key("anthropic")
+    if not key:
+        raise AIUnavailable("No Anthropic API key saved.")
+    client = anthropic.AsyncAnthropic(api_key=key)
+    try:
+        page = await client.models.list()
+    except Exception as error:
+        raise AIUnavailable(f"Could not read the model list: {error}") from error
+    finally:
+        await client.close()
+
+    return [
+        {
+            "id": entry.id,
+            "name": getattr(entry, "display_name", entry.id),
+            "context": getattr(entry, "max_input_tokens", None),
+            # Anthropic's models endpoint carries capabilities but not prices;
+            # showing a guessed price would be worse than showing none.
+            "input_per_m": None,
+            "output_per_m": None,
+            "structured_outputs": True,
+        }
+        for entry in page
+    ]
 
 
 # --------------------------------------------------------------- which provider
@@ -534,6 +646,7 @@ async def check_key() -> dict[str, Any]:
 
 __all__ = [
     "AIUnavailable",
+    "list_models",
     "DEFAULT_MODELS",
     "ENRICH_TIMEOUT_SECONDS",
     "api_key",

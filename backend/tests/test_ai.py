@@ -536,3 +536,106 @@ async def test_the_key_can_be_proved_before_a_signal_needs_it(store, monkeypatch
         "ok": True, "provider": "openrouter",
         "model": "anthropic/claude-opus-5", "reply": "ok",
     }
+
+
+# ---------------------------------------------------------------- catalogue
+
+
+def _catalogue_stub(monkeypatch, payload, status=200):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, json=payload)
+
+    def patched(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return REAL_ASYNC_CLIENT(*args, **kwargs)
+
+    monkeypatch.setattr(ai.httpx, "AsyncClient", patched)
+
+
+@pytest.fixture(autouse=True)
+def _clear_catalogue():
+    """The catalogue is cached process-wide; tests must not leak into each other."""
+    ai._catalogue.update({"at": 0.0, "provider": None, "models": []})
+    yield
+    ai._catalogue.update({"at": 0.0, "provider": None, "models": []})
+
+
+@pytest.mark.anyio
+async def test_the_catalogue_is_normalised_and_ordered(store, monkeypatch):
+    _catalogue_stub(monkeypatch, {"data": [
+        {"id": "z/no-schema", "name": "Z", "context_length": 8000,
+         "pricing": {"prompt": "0.000001", "completion": "0.000002"},
+         "supported_parameters": ["max_tokens"]},
+        {"id": "a/schema", "name": "A", "context_length": 200000,
+         "pricing": {"prompt": "0.000005", "completion": "0.000025"},
+         "supported_parameters": ["structured_outputs", "response_format"]},
+    ]})
+
+    models = await ai.list_models()
+
+    # Schema-capable first: the review asks for a fixed shape, and a model
+    # that honours it is more reliable than the prose fallback.
+    assert [m["id"] for m in models] == ["a/schema", "z/no-schema"]
+    assert models[0]["input_per_m"] == 5.0
+    assert models[0]["output_per_m"] == 25.0
+    assert models[0]["structured_outputs"] is True
+    assert models[1]["structured_outputs"] is False
+
+
+@pytest.mark.anyio
+async def test_variable_pricing_is_reported_as_unknown(store, monkeypatch):
+    """A router that picks per request quotes -1; that is not a price."""
+    _catalogue_stub(monkeypatch, {"data": [
+        {"id": "openrouter/auto", "name": "Auto",
+         "pricing": {"prompt": "-1", "completion": "-1"},
+         "supported_parameters": ["structured_outputs"]},
+    ]})
+    model = (await ai.list_models())[0]
+    assert model["input_per_m"] is None and model["output_per_m"] is None
+
+
+@pytest.mark.anyio
+async def test_the_catalogue_is_cached_between_calls(store, monkeypatch):
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"data": [
+            {"id": "a/b", "pricing": {"prompt": "0", "completion": "0"},
+             "supported_parameters": []},
+        ]})
+
+    def patched(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return REAL_ASYNC_CLIENT(*args, **kwargs)
+
+    monkeypatch.setattr(ai.httpx, "AsyncClient", patched)
+
+    await ai.list_models()
+    await ai.list_models()
+    assert calls == 1
+    await ai.list_models(refresh=True)
+    assert calls == 2
+
+
+@pytest.mark.anyio
+async def test_a_catalogue_outage_does_not_look_like_an_empty_catalogue(
+    store, monkeypatch
+):
+    """An empty picker and a broken one need to be told apart."""
+    _catalogue_stub(monkeypatch, {"error": "nope"}, status=500)
+    with pytest.raises(ai.AIUnavailable, match="Could not read the model list"):
+        await ai.list_models()
+
+
+@pytest.mark.anyio
+async def test_a_chosen_model_is_used_for_the_request(store, monkeypatch):
+    db.set_setting("openrouter_api_key", "sk-or-test")
+    db.set_setting("ai_model", "google/gemini-3-pro")
+    sent = _openrouter_stub(monkeypatch, _reply(BRIEF))
+
+    await ai.brief_token(chain="ethereum", token_address=GEM, symbol="GEM", facts={})
+
+    assert sent["body"]["model"] == "google/gemini-3-pro"
+    assert ai.model() == "google/gemini-3-pro"
