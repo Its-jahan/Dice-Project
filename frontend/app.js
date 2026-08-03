@@ -130,6 +130,11 @@ const FIELD_HELP = {
   poolMinWallets:
     "An absolute floor under the percentage, so a small pool cannot fire on " +
     "one or two wallets. The higher of the two applies.",
+  signalAirdrops:
+    "Count wallets that were handed a token, not just those that paid for " +
+    "it. Safe to leave on because a token with no liquidity pool is dropped " +
+    "either way — that is what spam is. Signals stay labelled bought, " +
+    "airdrop or mixed, so the two are never blurred together.",
   liveIncludeAirdrops:
     "Also show tokens that merely arrived without the wallet paying anything " +
     "in the same transaction — almost always spam airdrops. They never count " +
@@ -1110,6 +1115,7 @@ async function loadPoolSettings() {
     const data = await api("/api/settings/pool");
     $("poolPct").value = data.pool_pct;
     $("poolMinWallets").value = data.pool_min_wallets;
+    $("signalAirdrops").checked = !!data.signal_airdrops;
     const pools = (data.pools || [])
       .map(
         (pool) =>
@@ -1132,6 +1138,7 @@ async function savePoolSettings() {
         body: {
           pool_pct: Number($("poolPct").value),
           pool_min_wallets: Number($("poolMinWallets").value),
+          signal_airdrops: $("signalAirdrops").checked,
         },
       });
       await Promise.all([loadPoolSettings(), loadLiveTokens()]);
@@ -1404,12 +1411,19 @@ function renderSignalRow(tbody, signal) {
   );
   // How the buyers were seen: confirmed DEX swaps vs. positions that simply
   // appeared. A signal made only of the latter deserves a closer look.
-  const counts = { dex: 0, balance: 0, live: 0 };
-  for (const buyer of signal.buyers) counts[buyer.via || "dex"] += 1;
+  // Every via needs a key here: an uninitialised one would increment
+  // undefined into NaN and the badge would silently vanish.
+  const counts = { dex: 0, balance: 0, live: 0, airdrop: 0 };
+  for (const buyer of signal.buyers) {
+    const via = buyer.via || "dex";
+    counts[via] = (counts[via] || 0) + 1;
+  }
   const badges = [
     ["dex", "text-bg-success", "DEX", "Confirmed DEX swaps"],
     ["live", "text-bg-danger", "live",
-      "Pushed by Alchemy within seconds of the block"],
+      "Paid for, pushed by Alchemy within seconds of the block"],
+    ["airdrop", "text-bg-warning", "airdrop",
+      "Handed the token without paying for it in the same transaction"],
     ["balance", "text-bg-secondary", "pos",
       "New position with no matching DEX trade (OTC, CEX, transfer…)"],
   ];
@@ -1425,6 +1439,21 @@ function renderSignalRow(tbody, signal) {
   tr.insertCell().textContent = fmtUsd(signal.total_usd);
 
   const statusCell = tr.insertCell();
+  // How the token was acquired sits next to the status, because "5 wallets
+  // were airdropped this" and "5 wallets bought this" warrant very different
+  // reactions.
+  if (signal.kind && signal.kind !== "bought") {
+    const kindBadge = el(
+      "span",
+      "badge text-bg-warning me-1",
+      signal.kind === "airdrop" ? "airdrop" : "mixed",
+    );
+    kindBadge.title =
+      signal.kind === "airdrop"
+        ? "Every wallet was handed this token rather than paying for it."
+        : "Some wallets paid for this token and some were handed it.";
+    statusCell.appendChild(kindBadge);
+  }
   const isNew =
     signal.status === "active" && signal.first_seen_at === signal.last_updated_at;
   statusCell.appendChild(
@@ -1504,8 +1533,10 @@ function renderSignalDetails(tbody, signal) {
     const style = {
       dex: ["text-bg-success", "DEX buy",
         "Confirmed swap in Dune's DEX trade tables"],
-      live: ["text-bg-danger", "live",
-        "Token arrival pushed by Alchemy seconds after the block"],
+      live: ["text-bg-danger", "bought live",
+        "Paid for in the same transaction, seen seconds after the block"],
+      airdrop: ["text-bg-warning", "airdrop",
+        "Handed the token — nothing was paid for it in that transaction"],
       balance: ["text-bg-secondary", "new position",
         "Balance went 0 → positive with no matching DEX trade"],
     }[via] || ["text-bg-secondary", via, ""];

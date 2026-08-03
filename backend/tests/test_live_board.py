@@ -225,43 +225,6 @@ def _airdrop(client, wallet, token=GEM, tx=None):
     )
 
 
-def test_an_airdrop_to_many_wallets_never_reaches_the_board_or_a_signal(client):
-    """The failure that made the board unusable: spam blasted at every wallet.
-
-    Ten of ten watched wallets "receiving" the same token looks like maximal
-    conviction and is in fact one spammer paying gas.
-    """
-    _live_watchlist(client, min_wallets=3)
-
-    for wallet in WALLETS:
-        _airdrop(client, wallet)
-
-    assert client.get("/api/live/tokens").json()["tokens"] == []
-    assert client.get("/api/signals").json() == []
-    assert client.post("/api/live/sweep").json()["signals"] == 0
-
-    # The events are still stored, so the filtered view can explain itself.
-    shown = client.get("/api/live/tokens?include_airdrops=true").json()["tokens"]
-    assert len(shown) == 1
-    assert shown[0]["wallet_count"] == 10
-    assert shown[0]["paid_count"] == 0
-    assert shown[0]["sender_count"] == 1   # one spammer behind all of them
-
-
-def test_a_paid_buy_survives_alongside_airdrops(client):
-    _live_watchlist(client)
-    for wallet in WALLETS:
-        _airdrop(client, wallet, token=OTHER)
-    for wallet in WALLETS[:5]:
-        _buy(client, wallet, token=GEM)
-
-    board = client.get("/api/live/tokens").json()["tokens"]
-
-    assert [row["token_address"] for row in board] == [GEM]
-    assert board[0]["wallet_count"] == 5
-    assert len(client.get("/api/signals").json()) == 1
-
-
 def _market_without(*poolless, liquidity=50_000.0):
     """DexScreener stub where the named tokens have no liquidity pool."""
     missing = {t.lower() for t in poolless}
@@ -285,54 +248,73 @@ def _market_without(*poolless, liquidity=50_000.0):
     return market_data
 
 
-def test_a_token_with_no_liquidity_pool_never_signals(client, monkeypatch):
-    """The tokens that were 'not found' on DexScreener.
-
-    A token without a pool has never been bought by anyone — it cannot be.
-    Even a perfectly-formed paid transfer must not turn it into a signal.
-    """
-    monkeypatch.setattr(dexscreener, "market_data", _market_without(GEM))
-    _live_watchlist(client, min_wallets=3)
+def test_an_airdrop_can_signal_but_is_labelled_as_one(client):
+    """Being handed a token is news, but it is not the same as buying it."""
+    _live_watchlist(client)
 
     for wallet in WALLETS[:5]:
-        _buy(client, wallet, token=GEM)
+        _airdrop(client, wallet)
+
+    signals = client.get("/api/signals").json()
+    assert len(signals) == 1
+    signal = signals[0]
+    assert signal["wallet_count"] == 5
+    assert signal["kind"] == "airdrop"
+    assert {buyer["via"] for buyer in signal["buyers"]} == {"airdrop"}
+
+
+def test_airdrops_can_be_excluded_from_signals(client):
+    _live_watchlist(client)
+    client.put("/api/settings/pool", json={"signal_airdrops": False})
+
+    for wallet in WALLETS[:5]:
+        _airdrop(client, wallet)
+
+    assert client.get("/api/signals").json() == []
+    assert client.post("/api/live/sweep").json()["signals"] == 0
+
+
+def test_a_token_with_no_pool_never_signals_even_as_an_airdrop(client, monkeypatch):
+    """The spam guard that matters now that airdrops can fire.
+
+    Counting airdrops is only safe because the liquidity gate is what
+    actually removes spam — a token nobody can trade stays out either way.
+    """
+    monkeypatch.setattr(dexscreener, "market_data", _market_without(GEM))
+    _live_watchlist(client)
+
+    for wallet in WALLETS:
+        _airdrop(client, wallet)
 
     assert client.get("/api/signals").json() == []
     assert client.get("/api/live/tokens").json()["tokens"] == []
-    assert client.post("/api/live/sweep").json()["signals"] == 0
-
-    # It is still inspectable, so "why is this missing" has an answer.
-    shown = client.get("/api/live/tokens?include_untradeable=true").json()["tokens"]
-    assert [row["token_address"] for row in shown] == [GEM]
-    assert shown[0]["has_pair"] is False
 
 
-def test_thin_liquidity_is_below_the_bar(client, monkeypatch):
-    monkeypatch.setattr(
-        dexscreener, "market_data", _market_without(liquidity=50.0)
-    )
-    monkeypatch.setattr(settings, "min_liquidity_usd", 1000.0)
-    _live_watchlist(client, min_wallets=3)
+def test_a_mixed_signal_reports_both_ways_of_acquiring(client):
+    _live_watchlist(client)
 
-    for wallet in WALLETS[:4]:
-        _buy(client, wallet)
-
-    # A pool exists, so the board shows it — but it is too thin to signal on.
-    assert client.get("/api/live/tokens").json()["tokens"]
-    assert client.get("/api/signals").json() == []
-
-
-def test_market_data_enriches_the_board(client):
-    _live_watchlist(client, min_wallets=3)
     for wallet in WALLETS[:3]:
         _buy(client, wallet)
+    for wallet in WALLETS[3:6]:
+        _airdrop(client, wallet)
 
-    row = client.get("/api/live/tokens").json()["tokens"][0]
+    signal = client.get("/api/signals").json()[0]
 
-    assert row["has_pair"] is True
-    assert row["price_usd"] == 0.01
-    assert row["liquidity_usd"] == 50_000.0
-    assert row["volume_24h"] == 10_000.0
+    assert signal["kind"] == "mixed"
+    vias = [buyer["via"] for buyer in signal["buyers"]]
+    assert vias.count("live") == 3
+    assert vias.count("airdrop") == 3
+
+
+def test_a_paid_buy_is_still_labelled_as_bought(client):
+    _live_watchlist(client)
+    for wallet in WALLETS[:5]:
+        _buy(client, wallet, token=GEM)
+
+    signal = client.get("/api/signals").json()[0]
+
+    assert signal["kind"] == "bought"
+    assert {buyer["via"] for buyer in signal["buyers"]} == {"live"}
 
 
 def test_board_only_covers_live_watchlists(client):

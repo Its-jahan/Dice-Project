@@ -389,7 +389,7 @@ class TokenBuyer(BaseModel):
     #: how this wallet was detected: ``dex`` (confirmed swap), ``balance``
     #: (new position found by the Dune monitor) or ``live`` (token arrival
     #: pushed by Alchemy within seconds of the block)
-    via: Literal["dex", "balance", "live"] = "dex"
+    via: Literal["dex", "balance", "live", "airdrop"] = "dex"
 
 
 class WatchlistShare(BaseModel):
@@ -410,6 +410,10 @@ class SignalOut(BaseModel):
     watchlist_name: str | None = None
     #: which watchlists the buyers came from; empty for a per-watchlist signal
     breakdown: list[WatchlistShare] = Field(default_factory=list)
+    #: how the wallets got the token — ``bought`` (all paid), ``airdrop``
+    #: (none did) or ``mixed``. An airdrop is worth seeing but is not the same
+    #: evidence as money changing hands, so it is never silently blended in.
+    kind: Literal["bought", "airdrop", "mixed"] = "bought"
     chain: Chain
     token_address: str
     token_symbol: str | None

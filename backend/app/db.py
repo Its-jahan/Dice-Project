@@ -1037,7 +1037,10 @@ def events_in_window(
                 COUNT(*)            AS buy_count,
                 MAX(token_symbol)   AS token_symbol,
                 MIN(seen_at)        AS first_buy_at,
-                MAX(seen_at)        AS last_buy_at
+                MAX(seen_at)        AS last_buy_at,
+                -- 1 when this wallet paid for the token at least once, so a
+                -- buyer can be told from an airdrop recipient per wallet.
+                MAX(is_buy)         AS paid
             FROM wallet_events
             WHERE chain = ? AND token_address = ? AND seen_at >= ?
               AND wallet_address IN ({placeholders})

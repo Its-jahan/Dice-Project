@@ -283,8 +283,17 @@ The same lookup fills the gap the transfer feed leaves: price, liquidity and
 24h volume now appear on the live board, and token links point at the actual
 pair URL so they always resolve. Answers are cached for 30 minutes.
 
-The trade-off is that a genuine CEX withdrawal or OTC purchase is also
-one-way and therefore not counted. **Include airdrops** on the live board shows
+**Airdrops count, but stay labelled.** Being handed a token by a real project
+is worth knowing about, so one-way arrivals do count towards a signal
+(`DICE_SIGNAL_AIRDROPS`, on by default, toggleable in the live card). That is
+only safe because the liquidity gate is what removes spam — a token with no
+pool is dropped whether it was bought or handed out. Every signal carries a
+kind, `bought` / `airdrop` / `mixed`, and every buyer carries its own badge, so
+"five wallets bought this" is never blurred into "five wallets were given
+this". Turn the toggle off to require payment.
+
+The remaining trade-off is that a genuine CEX withdrawal or OTC purchase looks
+like an airdrop, since both are one-way. **Include airdrops** on the live board shows
 everything that was filtered, with a `Paid for` column — `0 of 20` and a single
 sender is an airdrop wearing a signal's clothes. Those rows never fire a
 signal.

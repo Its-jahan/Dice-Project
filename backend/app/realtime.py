@@ -237,6 +237,20 @@ def ignored_for(watchlist: dict[str, Any], chain: Chain) -> set[str]:
     )
 
 
+def signal_airdrops() -> bool:
+    """Whether wallets handed a token count towards a signal.
+
+    Off means only tokens the wallets paid for can fire. On also counts
+    one-way arrivals, which is worth having now that the liquidity gate
+    removes tokens with no pool: a real project airdropping to wallets you
+    track is news, even though it is not the same evidence as a purchase.
+    """
+    stored = db.get_setting("signal_airdrops")
+    if stored is None:
+        return settings.signal_airdrops
+    return stored.strip().lower() in ("1", "true", "yes", "on")
+
+
 def pool_pct() -> float:
     stored = db.get_setting("pool_pct")
     try:
@@ -322,6 +336,10 @@ def evaluate_pool(
         token_address=token_address,
         since_iso=since,
         wallets=wallets,
+        # Airdrop recipients count towards the threshold when enabled. The
+        # liquidity gate still applies, so what survives is a token with a
+        # real pool distributed to wallets worth watching — not spam.
+        only_buys=not signal_airdrops(),
     )
     if not rows or len(rows) < pool_threshold(len(wallets)):
         return None
@@ -337,7 +355,9 @@ def evaluate_pool(
             "amount_usd": None,
             "first_buy_at": row["first_buy_at"],
             "last_buy_at": row["last_buy_at"],
-            "via": "live",
+            # Labelled per wallet, so a signal never blurs "paid for it" into
+            # "was handed it".
+            "via": "live" if row.get("paid") else "airdrop",
         }
         for row in rows
     ]
@@ -528,7 +548,10 @@ async def sweep() -> dict[str, Any]:
         candidates = [
             row["token_address"]
             for row in db.token_activity(
-                chain=chain_value, wallets=wallets, since_iso=since
+                chain=chain_value,
+                wallets=wallets,
+                since_iso=since,
+                only_buys=not signal_airdrops(),
             )
             # token_activity is sorted by wallet_count, so once one falls
             # short nothing below it can qualify either.
@@ -580,6 +603,9 @@ async def accumulation_board(
     only_buys: bool = True,
     only_tradeable: bool = True,
 ) -> list[dict[str, Any]]:
+    # The board should mirror what can actually signal, so when airdrops
+    # count towards a signal they are shown by default too.
+    only_buys = only_buys and not signal_airdrops()
     """What the watched wallets are buying right now, threshold or not.
 
     A signal only exists once the threshold is crossed; this shows the

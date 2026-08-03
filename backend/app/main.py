@@ -1010,6 +1010,7 @@ async def get_pool_settings() -> dict[str, object]:
     return {
         "pool_pct": realtime.pool_pct(),
         "pool_min_wallets": realtime.pool_min_wallets(),
+        "signal_airdrops": realtime.signal_airdrops(),
         "window_hours": realtime.pool_window_hours(),
         "pools": [
             {
@@ -1046,6 +1047,10 @@ async def save_pool_settings(body: Annotated[dict, Body()]) -> dict[str, object]
                 status_code=422, detail="pool_min_wallets must be at least 2."
             )
         db.set_setting("pool_min_wallets", str(floor))
+    if "signal_airdrops" in body:
+        db.set_setting(
+            "signal_airdrops", "true" if body["signal_airdrops"] else "false"
+        )
     return await get_pool_settings()
 
 

@@ -261,11 +261,16 @@ def signal_to_out(row: dict[str, Any]) -> SignalOut:
     breakdown = [
         WatchlistShare(**share) for share in json.loads(row.get("breakdown") or "[]")
     ]
+    paid = sum(1 for buyer in buyers if buyer.via != "airdrop")
+    kind = (
+        "bought" if paid == len(buyers) else "airdrop" if paid == 0 else "mixed"
+    )
     return SignalOut(
         id=row["id"],
         watchlist_id=row["watchlist_id"],
         watchlist_name=row.get("watchlist_name"),
         breakdown=breakdown,
+        kind=kind,
         chain=Chain(row["chain"]),
         token_address=row["token_address"],
         token_symbol=row.get("token_symbol"),
@@ -618,14 +623,18 @@ async def send_signal_notification(
         usd = (
             f" ≈ ${signal.total_usd:,.0f}" if signal.total_usd is not None else ""
         )
-        dex = sum(1 for buyer in signal.buyers if buyer.via == "dex")
-        positions = len(signal.buyers) - dex
-        breakdown = f" [{dex} DEX"
-        breakdown += f", {positions} new position]" if positions else "]"
+        counts: dict[str, int] = {}
+        for buyer in signal.buyers:
+            counts[buyer.via] = counts.get(buyer.via, 0) + 1
+        detail = ", ".join(f"{n} {via}" for via, n in sorted(counts.items()))
+        # "bought" would be a lie for an airdrop, so the verb follows the kind.
+        verb = {"airdrop": "received", "mixed": "acquired"}.get(
+            signal.kind, "bought"
+        )
         lines.append(
             f"{'NEW' if is_new else 'UP'} {label}: "
-            f"{signal.wallet_count}/{signal.watchlist_size} wallets bought{usd}"
-            f"{breakdown}"
+            f"{signal.wallet_count}/{signal.watchlist_size} wallets {verb}{usd}"
+            f" [{detail}]"
         )
         if signal.breakdown:
             # Pooled signals lose the owning watchlist, so name the sources.

@@ -121,6 +121,12 @@ class Settings:
     pool_min_wallets: int = field(
         default_factory=lambda: _env_int("DICE_POOL_MIN_WALLETS", 3)
     )
+    # Whether wallets that were *handed* a token count towards a signal. Safe
+    # to leave on because the liquidity gate already drops tokens with no
+    # pool, which is what spam airdrops are.
+    signal_airdrops: bool = field(
+        default_factory=lambda: _env_bool("DICE_SIGNAL_AIRDROPS", True)
+    )
 
 
 settings = Settings()
