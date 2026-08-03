@@ -1001,6 +1001,54 @@ async def receive_alchemy_webhook(request: Request) -> dict[str, object]:
     return summary
 
 
+@app.get("/api/settings/pool")
+async def get_pool_settings() -> dict[str, object]:
+    """The pooled signal threshold, and what it currently works out to."""
+    chains = {
+        chain: db.pool_size(chain) for chain in db.realtime_chains()
+    }
+    return {
+        "pool_pct": realtime.pool_pct(),
+        "pool_min_wallets": realtime.pool_min_wallets(),
+        "window_hours": realtime.pool_window_hours(),
+        "pools": [
+            {
+                "chain": chain,
+                "wallets": size,
+                "required": realtime.pool_threshold(size),
+            }
+            for chain, size in sorted(chains.items())
+        ],
+    }
+
+
+@app.put("/api/settings/pool")
+async def save_pool_settings(body: Annotated[dict, Body()]) -> dict[str, object]:
+    if "pool_pct" in body:
+        try:
+            pct = float(body["pool_pct"])
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail="pool_pct must be a number.")
+        if not 0 <= pct <= 100:
+            raise HTTPException(
+                status_code=422, detail="pool_pct must be between 0 and 100."
+            )
+        db.set_setting("pool_pct", str(pct))
+    if "pool_min_wallets" in body:
+        try:
+            floor = int(body["pool_min_wallets"])
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=422, detail="pool_min_wallets must be a whole number."
+            )
+        if floor < 2:
+            raise HTTPException(
+                status_code=422, detail="pool_min_wallets must be at least 2."
+            )
+        db.set_setting("pool_min_wallets", str(floor))
+    return await get_pool_settings()
+
+
 @app.get("/api/live/tokens")
 async def live_tokens(
     watchlist_id: Annotated[int | None, Query()] = None,

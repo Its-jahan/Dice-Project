@@ -112,6 +112,15 @@ class Settings:
     min_liquidity_usd: float = field(
         default_factory=lambda: float(os.getenv("DICE_MIN_LIQUIDITY_USD", "1000"))
     )
+    # Live signals are pooled across every live watchlist: a token fires when
+    # this share of *all* tracked wallets bought it. Editable in the UI, which
+    # takes precedence over these.
+    pool_pct: float = field(
+        default_factory=lambda: float(os.getenv("DICE_POOL_PCT", "10"))
+    )
+    pool_min_wallets: int = field(
+        default_factory=lambda: _env_int("DICE_POOL_MIN_WALLETS", 3)
+    )
 
 
 settings = Settings()

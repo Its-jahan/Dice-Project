@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
@@ -236,6 +237,163 @@ def ignored_for(watchlist: dict[str, Any], chain: Chain) -> set[str]:
     )
 
 
+def pool_pct() -> float:
+    stored = db.get_setting("pool_pct")
+    try:
+        return float(stored) if stored is not None else settings.pool_pct
+    except ValueError:
+        return settings.pool_pct
+
+
+def pool_min_wallets() -> int:
+    stored = db.get_setting("pool_min_wallets")
+    try:
+        return int(stored) if stored is not None else settings.pool_min_wallets
+    except ValueError:
+        return settings.pool_min_wallets
+
+
+def pool_threshold(pool: int) -> int:
+    """How many distinct wallets, out of the whole pool, a token needs.
+
+    The pool is every wallet across every live watchlist, so the question a
+    signal answers is "did enough of everyone we track buy this?", not "did
+    enough of one list?". The percentage is the operator's dial; the absolute
+    floor stops a small pool firing on a couple of wallets.
+    """
+    pct = pool_pct()
+    required = math.ceil(pct / 100 * pool) if pct > 0 else 0
+    return max(required, pool_min_wallets(), 2)
+
+
+def pool_window_hours() -> int:
+    """Buy window for pooled signals: the widest any live list asks for.
+
+    Taking the widest keeps one narrow list from truncating the pool's view,
+    and matches the span the accumulation board displays.
+    """
+    windows = [int(wl["buy_window_hours"]) for wl in db.live_watchlists()]
+    return max(windows) if windows else 48
+
+
+def attribute(
+    buyers: list[str], owners: dict[str, list[dict[str, Any]]]
+) -> list[dict[str, Any]]:
+    """Which watchlists a signal's buyers came from, largest share first.
+
+    Pooling loses the answer to "whose wallets were these?", and that is
+    exactly the interesting part — five wallets from one carefully-built list
+    means something different from five scattered across ten. A wallet in
+    several lists counts towards each, so shares can total more than 100.
+    """
+    counts: dict[int, dict[str, Any]] = {}
+    for wallet in buyers:
+        for owner in owners.get(wallet, []):
+            entry = counts.setdefault(
+                owner["watchlist_id"],
+                {
+                    "watchlist_id": owner["watchlist_id"],
+                    "name": owner["name"],
+                    "wallets": 0,
+                },
+            )
+            entry["wallets"] += 1
+
+    total = len(buyers) or 1
+    shares = [
+        {**entry, "share_pct": round(entry["wallets"] / total * 100, 1)}
+        for entry in counts.values()
+    ]
+    shares.sort(key=lambda share: -share["wallets"])
+    return shares
+
+
+def evaluate_pool(
+    chain: Chain, token_address: str, *, market: dict[str, Any] | None = None
+) -> tuple[SignalOut, bool, int] | None:
+    """Check one token against the pooled threshold across every live list."""
+    wallets = db.realtime_wallets(chain.value)
+    if not wallets:
+        return None
+
+    since = _iso(_utcnow() - timedelta(hours=pool_window_hours()))
+    rows = db.events_in_window(
+        chain=chain.value,
+        token_address=token_address,
+        since_iso=since,
+        wallets=wallets,
+    )
+    if not rows or len(rows) < pool_threshold(len(wallets)):
+        return None
+
+    market = market or {}
+    symbol = market.get("symbol") or next(
+        (row["token_symbol"] for row in rows if row["token_symbol"]), None
+    )
+    buyers = [
+        {
+            "wallet_address": row["wallet_address"],
+            "buy_count": int(row["buy_count"] or 1),
+            "amount_usd": None,
+            "first_buy_at": row["first_buy_at"],
+            "last_buy_at": row["last_buy_at"],
+            "via": "live",
+        }
+        for row in rows
+    ]
+    breakdown = attribute(
+        [row["wallet_address"] for row in rows], db.wallet_watchlists(chain.value)
+    )
+
+    signal_id, created, previous = db.upsert_pool_signal(
+        chain=chain.value,
+        token_address=token_address,
+        token_symbol=symbol,
+        wallet_count=len(rows),
+        pool_size=len(wallets),
+        total_usd=None,
+        buyers=buyers,
+        breakdown=breakdown,
+    )
+    row = db.get_signal(signal_id)
+    if row is None:  # pragma: no cover - just written
+        return None
+    return signal_to_out(row), created, previous
+
+
+def check_pool_token(
+    chain: Chain, token: str, *, market: dict[str, Any] | None = None
+) -> tuple[SignalOut, bool] | None:
+    """Pooled equivalent of :func:`check_token`: fire, strengthen, or nothing."""
+    if token in pooled_ignores(chain):
+        return None
+    try:
+        result = evaluate_pool(chain, token, market=market)
+    except Exception:  # pragma: no cover - defensive
+        log.exception("pooled evaluation failed for %s", token[:12])
+        return None
+    if result is None:
+        return None
+    signal, created, previous = result
+    if created:
+        return signal, True
+    if signal.status == "active" and signal.wallet_count > previous:
+        return signal, False
+    return None
+
+
+def pooled_ignores(chain: Chain) -> set[str]:
+    """A token ignored by *any* live watchlist is ignored for the pool.
+
+    The pool has no ignore list of its own, and the safe reading of "ignore
+    this" is that the operator does not want to hear about it at all.
+    """
+    ignored: set[str] = set(ignored_tokens_for(chain))
+    for watchlist in db.live_watchlists(chain.value):
+        ignored |= ignored_for(watchlist, chain)
+    return ignored
+
+
 async def tradeable(chain: Chain, tokens: Iterable[str]) -> dict[str, dict[str, Any]]:
     """Market data for tokens that actually have a pool; others are dropped.
 
@@ -328,20 +486,15 @@ async def ingest(payload: dict[str, Any], *, chain: Chain) -> dict[str, Any]:
     # a token with no pool cannot have been bought and must not signal.
     markets = await tradeable(chain, {token for _, token in pairs})
 
+    # One check per token against the pooled threshold — signals belong to the
+    # whole pool, not to whichever watchlist happened to contain the buyer.
     fired: list[tuple[SignalOut, bool]] = []
-    checked: set[tuple[int, str]] = set()
-
-    for wallet, token in pairs:
+    for token in {token for _, token in pairs}:
         if token not in markets:
             continue
-        for watchlist in db.realtime_watchlists_for_wallet(chain.value, wallet):
-            key = (int(watchlist["id"]), token)
-            if key in checked:
-                continue
-            checked.add(key)
-            outcome = check_token(watchlist, token, chain, market=markets[token])
-            if outcome:
-                fired.append(outcome)
+        outcome = check_pool_token(chain, token, market=markets[token])
+        if outcome:
+            fired.append(outcome)
 
     await announce(fired, chain=chain)
     db.prune_events(_iso(_utcnow() - timedelta(days=EVENT_RETENTION_DAYS)))
@@ -366,36 +519,31 @@ async def sweep() -> dict[str, Any]:
 
     for chain_value in db.realtime_chains():
         chain = Chain(chain_value)
+        wallets = db.realtime_wallets(chain_value)
+        if not wallets:
+            continue
+
+        since = _iso(_utcnow() - timedelta(hours=pool_window_hours()))
+        required = pool_threshold(len(wallets))
+        candidates = [
+            row["token_address"]
+            for row in db.token_activity(
+                chain=chain_value, wallets=wallets, since_iso=since
+            )
+            # token_activity is sorted by wallet_count, so once one falls
+            # short nothing below it can qualify either.
+            if row["wallet_count"] >= required
+        ]
+        markets = await tradeable(chain, candidates)
+
         fired: list[tuple[SignalOut, bool]] = []
-        for watchlist in db.live_watchlists(chain_value):
-            wallets = db.get_wallets(int(watchlist["id"]))
-            if not wallets:
+        for token in candidates:
+            if token not in markets:
                 continue
-            since = _iso(
-                _utcnow() - timedelta(hours=int(watchlist["buy_window_hours"]))
-            )
-            required = effective_min_wallets(
-                int(watchlist["min_wallets"]),
-                float(watchlist["min_wallets_pct"]),
-                len(wallets),
-            )
-            candidates = [
-                row["token_address"]
-                for row in db.token_activity(
-                    chain=chain_value, wallets=wallets, since_iso=since
-                )
-                # token_activity is sorted by wallet_count, so once one falls
-                # short nothing below it can qualify either.
-                if row["wallet_count"] >= required
-            ]
-            markets = await tradeable(chain, candidates)
-            for token in candidates:
-                if token not in markets:
-                    continue
-                checked_total += 1
-                outcome = check_token(watchlist, token, chain, market=markets[token])
-                if outcome:
-                    fired.append(outcome)
+            checked_total += 1
+            outcome = check_pool_token(chain, token, market=markets[token])
+            if outcome:
+                fired.append(outcome)
         await announce(fired, chain=chain)
         fired_total += len(fired)
 
@@ -439,34 +587,31 @@ async def accumulation_board(
     that is worth keeping an eye on.
     """
     rows: list[dict[str, Any]] = []
-    watchlists = [
-        wl
-        for wl in db.live_watchlists()
-        if watchlist_id is None or int(wl["id"]) == watchlist_id
-    ]
+    window_hours = pool_window_hours()
+    since = _iso(_utcnow() - timedelta(hours=window_hours))
 
-    for watchlist in watchlists:
-        chain = Chain(watchlist["chain"])
-        wallets = db.get_wallets(int(watchlist["id"]))
+    for chain_value in db.realtime_chains():
+        chain = Chain(chain_value)
+        # The board mirrors what actually signals: one pooled row per token,
+        # counted against every live wallet on the chain.
+        wallets = db.realtime_wallets(chain_value)
+        if watchlist_id is not None:
+            wallets = set(db.get_wallets(watchlist_id)) & wallets
         if not wallets:
             continue
-        window_hours = int(watchlist["buy_window_hours"])
-        since = _iso(_utcnow() - timedelta(hours=window_hours))
-        required = effective_min_wallets(
-            int(watchlist["min_wallets"]),
-            float(watchlist["min_wallets_pct"]),
-            len(wallets),
-        )
-        ignores = ignored_for(watchlist, chain)
+
+        pool = db.realtime_wallets(chain_value)
+        required = pool_threshold(len(pool))
+        ignores = pooled_ignores(chain)
+        owners = db.wallet_watchlists(chain_value)
         signals = {
             row["token_address"]: row["status"]
-            for row in db.list_signals(
-                watchlist_id=int(watchlist["id"]), include_dismissed=True, limit=500
-            )
+            for row in db.list_signals(include_dismissed=True, limit=500)
+            if row["chain"] == chain_value and row["watchlist_id"] is None
         }
 
         for row in db.token_activity(
-            chain=chain.value,
+            chain=chain_value,
             wallets=wallets,
             since_iso=since,
             only_buys=only_buys,
@@ -474,11 +619,19 @@ async def accumulation_board(
             token = row["token_address"]
             if token in ignores:
                 continue
+            buyers = [
+                event["wallet_address"]
+                for event in db.events_in_window(
+                    chain=chain_value,
+                    token_address=token,
+                    since_iso=since,
+                    wallets=wallets,
+                    only_buys=only_buys,
+                )
+            ]
             rows.append(
                 {
-                    "watchlist_id": int(watchlist["id"]),
-                    "watchlist_name": watchlist["name"],
-                    "chain": chain.value,
+                    "chain": chain_value,
                     "token_address": token,
                     "token_symbol": row["token_symbol"],
                     "wallet_count": row["wallet_count"],
@@ -488,9 +641,10 @@ async def accumulation_board(
                     # unfiltered one, which is how an airdrop shows itself.
                     "paid_count": int(row.get("paid_count") or 0),
                     "sender_count": int(row.get("sender_count") or 0),
-                    "watchlist_size": len(wallets),
+                    "pool_size": len(pool),
                     "required": required,
                     "window_hours": window_hours,
+                    "breakdown": attribute(buyers, owners),
                     "first_buy_at": row["first_buy_at"],
                     "last_buy_at": row["last_buy_at"],
                     "signal_status": signals.get(token),

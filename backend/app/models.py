@@ -392,10 +392,24 @@ class TokenBuyer(BaseModel):
     via: Literal["dex", "balance", "live"] = "dex"
 
 
+class WatchlistShare(BaseModel):
+    """How much of a pooled signal came from one watchlist."""
+
+    watchlist_id: int
+    name: str
+    wallets: int
+    #: share of the signal's buyers, as a percentage. Shares can exceed 100 in
+    #: total when a wallet belongs to more than one watchlist.
+    share_pct: float
+
+
 class SignalOut(BaseModel):
     id: int
-    watchlist_id: int
+    #: None for a pooled signal — it belongs to every live watchlist at once
+    watchlist_id: int | None = None
     watchlist_name: str | None = None
+    #: which watchlists the buyers came from; empty for a per-watchlist signal
+    breakdown: list[WatchlistShare] = Field(default_factory=list)
     chain: Chain
     token_address: str
     token_symbol: str | None

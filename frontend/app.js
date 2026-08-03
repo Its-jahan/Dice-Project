@@ -122,6 +122,14 @@ const FIELD_HELP = {
   showDismissed:
     "Also list signals you dismissed. A dismissed signal stays muted even " +
     "when the same token triggers again.",
+  poolPct:
+    "Every live watchlist is pooled into one set of wallets, and a token " +
+    "signals when this share of that whole pool has bought it. 10% of 200 " +
+    "pooled wallets means 20 buyers. The signal still records which " +
+    "watchlists those buyers came from.",
+  poolMinWallets:
+    "An absolute floor under the percentage, so a small pool cannot fire on " +
+    "one or two wallets. The higher of the two applies.",
   liveIncludeAirdrops:
     "Also show tokens that merely arrived without the wallet paying anything " +
     "in the same transaction — almost always spam airdrops. They never count " +
@@ -1097,6 +1105,59 @@ async function deleteWatchlist(wl) {
 
 /* ------------------------------------------------------- live accumulation */
 
+async function loadPoolSettings() {
+  try {
+    const data = await api("/api/settings/pool");
+    $("poolPct").value = data.pool_pct;
+    $("poolMinWallets").value = data.pool_min_wallets;
+    const pools = (data.pools || [])
+      .map(
+        (pool) =>
+          `${pool.chain}: ${pool.wallets.toLocaleString()} wallets pooled → ` +
+          `${pool.required} needed to signal`,
+      )
+      .join(" · ");
+    $("poolSummary").textContent =
+      pools || "No live watchlists yet — switch Live on for one to build the pool.";
+  } catch {
+    /* non-fatal */
+  }
+}
+
+async function savePoolSettings() {
+  await withBusy($("poolSave"), async () => {
+    try {
+      await api("/api/settings/pool", {
+        method: "PUT",
+        body: {
+          pool_pct: Number($("poolPct").value),
+          pool_min_wallets: Number($("poolMinWallets").value),
+        },
+      });
+      await Promise.all([loadPoolSettings(), loadLiveTokens()]);
+      setStatus("liveStatus", "Threshold saved.", "ok");
+    } catch (error) {
+      setStatus("liveStatus", error.message, "error");
+    }
+  });
+}
+
+/** Badges naming which watchlists a signal's buyers came from. */
+function renderBreakdown(cell, breakdown) {
+  if (!breakdown || !breakdown.length) return;
+  for (const share of breakdown.slice(0, 4)) {
+    const badge = el(
+      "span",
+      "badge text-bg-light border text-body-secondary ms-1",
+      `${share.name}: ${share.share_pct}%`,
+    );
+    badge.title =
+      `${share.wallets} of the buyers are in “${share.name}”. Shares can total ` +
+      "over 100% when a wallet belongs to more than one watchlist.";
+    cell.appendChild(badge);
+  }
+}
+
 async function loadLiveTokens() {
   try {
     const airdrops = $("liveIncludeAirdrops").checked ? "true" : "false";
@@ -1123,7 +1184,7 @@ function renderLiveTokens() {
   if (!rows.length) return;
 
   const head = table.tHead.insertRow();
-  const columns = ["Token", "Watchlist", "Buyers", "Progress to signal", "Buys"];
+  const columns = ["Token", "From watchlists", "Buyers", "Progress to signal", "Buys"];
   if (state.liveIncludesAirdrops) columns.push("Paid for");
   columns.push("Liquidity", "Price", "Last buy", "");
   for (const title of columns) {
@@ -1147,10 +1208,16 @@ function renderLiveTokens() {
     tokenCell.appendChild(link);
     tokenCell.appendChild(el("span", "mono ms-2", shortAddress(row.token_address)));
 
-    tr.insertCell().textContent = row.watchlist_name;
+    // Pooling loses "whose wallets were these", so the attribution is shown
+    // right here rather than only on the fired signal.
+    const fromCell = tr.insertCell();
+    if (row.breakdown && row.breakdown.length) {
+      renderBreakdown(fromCell, row.breakdown);
+    } else {
+      fromCell.appendChild(el("span", "small text-body-secondary", "—"));
+    }
 
-    tr.insertCell().textContent =
-      `${row.wallet_count} of ${row.watchlist_size}`;
+    tr.insertCell().textContent = `${row.wallet_count} of ${row.pool_size}`;
 
     // The bar is the point of this table: how close is it to firing? The
     // count sits beside the bar rather than inside it — a low percentage
@@ -1279,7 +1346,7 @@ function renderSignals() {
 
   const headRow = table.tHead.insertRow();
   for (const title of [
-    "Updated", "Watchlist", "Token", "Buyers", "Volume", "Status", "",
+    "Updated", "From watchlists", "Token", "Buyers", "Volume", "Status", "",
   ]) {
     headRow.appendChild(el("th", "small text-body-secondary", title));
   }
@@ -1297,7 +1364,13 @@ function renderSignalRow(tbody, signal) {
   updated.textContent = fmtTime(signal.last_updated_at);
   updated.title = `first seen ${fmtTime(signal.first_seen_at)}`;
 
-  tr.insertCell().textContent = signal.watchlist_name || `#${signal.watchlist_id}`;
+  const originCell = tr.insertCell();
+  if (signal.breakdown && signal.breakdown.length) {
+    renderBreakdown(originCell, signal.breakdown);
+  } else {
+    originCell.textContent =
+      signal.watchlist_name || (signal.watchlist_id ? `#${signal.watchlist_id}` : "pool");
+  }
 
   const tokenCell = tr.insertCell();
   const link = el(
@@ -1847,6 +1920,7 @@ function init() {
   $("refreshLive").addEventListener("click", loadLiveTokens);
   $("liveSweep").addEventListener("click", runLiveSweep);
   $("liveIncludeAirdrops").addEventListener("change", loadLiveTokens);
+  $("poolSave").addEventListener("click", savePoolSettings);
   $("liveIncludeUntradeable").addEventListener("change", loadLiveTokens);
   $("chain").addEventListener("change", updateRealtimeAvailability);
 
@@ -1864,6 +1938,7 @@ function init() {
     loadWatchlists();
     loadSignals();
     loadLiveTokens();
+    loadPoolSettings();
     updateRealtimeAvailability();
   });
   loadNotificationSettings();

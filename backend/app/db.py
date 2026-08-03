@@ -15,6 +15,7 @@ zero rows changed.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -29,7 +30,7 @@ RUN_HISTORY_LIMIT = 50
 # Cap on buyer entries stored per signal, so one absurd token cannot bloat a row.
 SIGNAL_BUYERS_LIMIT = 200
 
-_SCHEMA = """
+_SCHEMA_HEAD = """
 CREATE TABLE IF NOT EXISTS watchlists (
     id                     INTEGER PRIMARY KEY AUTOINCREMENT,
     name                   TEXT    NOT NULL,
@@ -77,22 +78,6 @@ CREATE TABLE IF NOT EXISTS monitor_runs (
 
 CREATE INDEX IF NOT EXISTS idx_runs_watchlist
     ON monitor_runs (watchlist_id, id DESC);
-
-CREATE TABLE IF NOT EXISTS signals (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    watchlist_id    INTEGER NOT NULL REFERENCES watchlists(id) ON DELETE CASCADE,
-    chain           TEXT    NOT NULL,
-    token_address   TEXT    NOT NULL,
-    token_symbol    TEXT,
-    wallet_count    INTEGER NOT NULL,
-    watchlist_size  INTEGER NOT NULL,
-    total_usd       REAL,
-    buyers          TEXT    NOT NULL DEFAULT '[]',
-    first_seen_at   TEXT    NOT NULL,
-    last_updated_at TEXT    NOT NULL,
-    status          TEXT    NOT NULL DEFAULT 'active',
-    UNIQUE (watchlist_id, token_address)
-);
 
 CREATE TABLE IF NOT EXISTS dune_query_slots (
     key_hash   TEXT    NOT NULL,
@@ -183,6 +168,39 @@ CREATE TABLE IF NOT EXISTS token_market (
 #: Deliveries kept for the diagnostics panel; older rows are pruned.
 DELIVERY_HISTORY_LIMIT = 100
 
+_SIGNALS_SCHEMA = """
+-- Signals are either pooled across every live watchlist (watchlist_id NULL,
+-- the default for the live path) or owned by one watchlist (the Dune monitor).
+-- Partial unique indexes keep both kinds deduplicated, since SQLite treats
+-- NULLs as distinct and a plain UNIQUE would let pooled duplicates through.
+CREATE TABLE IF NOT EXISTS signals (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    watchlist_id    INTEGER REFERENCES watchlists(id) ON DELETE CASCADE,
+    chain           TEXT    NOT NULL,
+    token_address   TEXT    NOT NULL,
+    token_symbol    TEXT,
+    wallet_count    INTEGER NOT NULL,
+    watchlist_size  INTEGER NOT NULL,
+    total_usd       REAL,
+    buyers          TEXT    NOT NULL DEFAULT '[]',
+    breakdown       TEXT    NOT NULL DEFAULT '[]',
+    first_seen_at   TEXT    NOT NULL,
+    last_updated_at TEXT    NOT NULL,
+    status          TEXT    NOT NULL DEFAULT 'active'
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_signals_owned
+    ON signals (watchlist_id, token_address) WHERE watchlist_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_signals_pooled
+    ON signals (chain, token_address) WHERE watchlist_id IS NULL;
+"""
+
+#: The full schema: everything else, plus the signals tables. Kept separable
+#: because the pooled-signal migration has to recreate signals on its own.
+_SCHEMA = _SCHEMA_HEAD + _SIGNALS_SCHEMA
+
+log = logging.getLogger(__name__)
+
 _init_lock = threading.Lock()
 _initialized_paths: set[str] = set()
 
@@ -206,6 +224,38 @@ def _migrate(conn: sqlite3.Connection) -> None:
         except sqlite3.OperationalError as exc:
             if "duplicate column" not in str(exc).lower():
                 raise
+    _migrate_pooled_signals(conn)
+
+
+def _migrate_pooled_signals(conn: sqlite3.Connection) -> None:
+    """Let a signal belong to the whole pool rather than one watchlist.
+
+    Signals used to be per-watchlist, so ``watchlist_id`` was NOT NULL. A
+    pooled signal has no single owner, so the column has to become nullable —
+    which SQLite cannot do in place, hence the copy. Existing rows keep their
+    watchlist and carry on working.
+    """
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(signals)")}
+    if not columns or "breakdown" in columns:
+        return  # fresh database, or already migrated
+
+    conn.execute("ALTER TABLE signals RENAME TO signals_legacy")
+    conn.executescript(_SIGNALS_SCHEMA)
+    conn.execute(
+        """
+        INSERT INTO signals (
+            id, watchlist_id, chain, token_address, token_symbol, wallet_count,
+            watchlist_size, total_usd, buyers, first_seen_at, last_updated_at,
+            status
+        )
+        SELECT id, watchlist_id, chain, token_address, token_symbol,
+               wallet_count, watchlist_size, total_usd, buyers, first_seen_at,
+               last_updated_at, status
+        FROM signals_legacy
+        """
+    )
+    conn.execute("DROP TABLE signals_legacy")
+    log.info("migrated signals table to support pooled signals")
 
 
 def utcnow_iso() -> str:
@@ -576,15 +626,113 @@ def upsert_signal(
         return int(existing["id"]), False, int(existing["wallet_count"])
 
 
+def upsert_pool_signal(
+    *,
+    chain: str,
+    token_address: str,
+    token_symbol: str | None,
+    wallet_count: int,
+    pool_size: int,
+    total_usd: float | None,
+    buyers: list[dict[str, Any]],
+    breakdown: list[dict[str, Any]],
+) -> tuple[int, bool, int]:
+    """Insert or refresh the pooled signal for a token on a chain.
+
+    Mirrors :func:`upsert_signal` but keyed on the chain rather than a
+    watchlist, because the pool spans all of them. ``breakdown`` records which
+    watchlists the buyers came from, which is the only thing lost by pooling.
+    """
+    now = utcnow_iso()
+    buyers_json = json.dumps(buyers[:SIGNAL_BUYERS_LIMIT])
+    breakdown_json = json.dumps(breakdown)
+    with connect() as conn:
+        existing = conn.execute(
+            "SELECT id, wallet_count FROM signals "
+            "WHERE watchlist_id IS NULL AND chain = ? AND token_address = ?",
+            (chain, token_address),
+        ).fetchone()
+        if existing is None:
+            cursor = conn.execute(
+                """
+                INSERT INTO signals (
+                    watchlist_id, chain, token_address, token_symbol,
+                    wallet_count, watchlist_size, total_usd, buyers, breakdown,
+                    first_seen_at, last_updated_at, status
+                ) VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
+                """,
+                (
+                    chain,
+                    token_address,
+                    token_symbol,
+                    wallet_count,
+                    pool_size,
+                    total_usd,
+                    buyers_json,
+                    breakdown_json,
+                    now,
+                    now,
+                ),
+            )
+            return int(cursor.lastrowid), True, 0
+
+        conn.execute(
+            """
+            UPDATE signals SET
+                token_symbol = COALESCE(?, token_symbol),
+                wallet_count = ?, watchlist_size = ?, total_usd = ?,
+                buyers = ?, breakdown = ?, last_updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                token_symbol,
+                wallet_count,
+                pool_size,
+                total_usd,
+                buyers_json,
+                breakdown_json,
+                now,
+                existing["id"],
+            ),
+        )
+        return int(existing["id"]), False, int(existing["wallet_count"])
+
+
+def wallet_watchlists(chain: str) -> dict[str, list[dict[str, Any]]]:
+    """Which live watchlists each wallet belongs to, for signal attribution.
+
+    A wallet can sit in several lists, so this is a list per wallet rather
+    than a single owner.
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT ww.wallet_address, w.id, w.name
+            FROM watchlist_wallets ww
+            JOIN watchlists w ON w.id = ww.watchlist_id
+            WHERE w.chain = ? AND w.realtime = 1
+            """,
+            (chain,),
+        ).fetchall()
+    owners: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        owners.setdefault(row["wallet_address"], []).append(
+            {"watchlist_id": row["id"], "name": row["name"]}
+        )
+    return owners
+
+
 def list_signals(
     *,
     watchlist_id: int | None = None,
     include_dismissed: bool = False,
     limit: int = 200,
 ) -> list[dict[str, Any]]:
+    # LEFT JOIN, not JOIN: a pooled signal has no watchlist and an inner join
+    # would silently hide every one of them.
     query = (
         "SELECT s.*, w.name AS watchlist_name FROM signals s "
-        "JOIN watchlists w ON w.id = s.watchlist_id"
+        "LEFT JOIN watchlists w ON w.id = s.watchlist_id"
     )
     conditions: list[str] = []
     params: list[Any] = []
@@ -606,10 +754,15 @@ def get_signal(signal_id: int) -> dict[str, Any] | None:
     with connect() as conn:
         row = conn.execute(
             "SELECT s.*, w.name AS watchlist_name FROM signals s "
-            "JOIN watchlists w ON w.id = s.watchlist_id WHERE s.id = ?",
+            "LEFT JOIN watchlists w ON w.id = s.watchlist_id WHERE s.id = ?",
             (signal_id,),
         ).fetchone()
         return dict(row) if row else None
+
+
+def pool_size(chain: str) -> int:
+    """Distinct wallets across every live watchlist on a chain."""
+    return len(realtime_wallets(chain))
 
 
 def set_signal_status(signal_id: int, status: str) -> bool:

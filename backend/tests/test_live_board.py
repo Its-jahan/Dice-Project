@@ -49,6 +49,10 @@ def client(monkeypatch, tmp_path):
     monkeypatch.setattr(dexscreener, "market_data", _fake_market())
     monkeypatch.setattr(settings, "monitor_enabled", False)
     monkeypatch.setattr(settings, "live_sweep_seconds", 3600)  # no background run
+    # Live signals are pooled: the threshold is a share of every live
+    # wallet, not a per-watchlist count. 50% of the 10-wallet pool = 5.
+    monkeypatch.setattr(settings, "pool_pct", 50.0)
+    monkeypatch.setattr(settings, "pool_min_wallets", 3)
     monkeypatch.setattr(settings, "dune_api_key", None, raising=False)
     monkeypatch.setattr(settings, "telegram_bot_token", None, raising=False)
     monkeypatch.setattr(settings, "telegram_chat_id", None, raising=False)
@@ -164,8 +168,8 @@ def test_board_ranks_by_closeness_to_firing(client):
 
 
 def test_board_marks_tokens_that_already_signalled(client):
-    _live_watchlist(client, min_wallets=3)
-    for wallet in WALLETS[:3]:
+    _live_watchlist(client)
+    for wallet in WALLETS[:5]:     # 50% of the pool
         _buy(client, wallet)
 
     board = client.get("/api/live/tokens").json()["tokens"]
@@ -245,16 +249,16 @@ def test_an_airdrop_to_many_wallets_never_reaches_the_board_or_a_signal(client):
 
 
 def test_a_paid_buy_survives_alongside_airdrops(client):
-    _live_watchlist(client, min_wallets=3)
+    _live_watchlist(client)
     for wallet in WALLETS:
         _airdrop(client, wallet, token=OTHER)
-    for wallet in WALLETS[:3]:
+    for wallet in WALLETS[:5]:
         _buy(client, wallet, token=GEM)
 
     board = client.get("/api/live/tokens").json()["tokens"]
 
     assert [row["token_address"] for row in board] == [GEM]
-    assert board[0]["wallet_count"] == 3
+    assert board[0]["wallet_count"] == 5
     assert len(client.get("/api/signals").json()) == 1
 
 
@@ -342,19 +346,137 @@ def test_board_only_covers_live_watchlists(client):
     assert client.get("/api/live/tokens").json()["tokens"] == []
 
 
+# ----------------------------------------------------------------- pooling
+
+
+def _second_watchlist(client, name, wallets):
+    created = client.post(
+        "/api/watchlists",
+        json={
+            "name": name,
+            "chain": "ethereum",
+            "wallets": wallets,
+            "min_wallets": 2,
+            "min_wallets_pct": 0,
+            "buy_window_hours": 48,
+        },
+    ).json()
+    db.update_watchlist_fields(created["id"], {"realtime": 1})
+    return created["id"]
+
+
+def test_wallets_from_several_watchlists_pool_into_one_threshold(client):
+    """No single list reaches the threshold; together they do.
+
+    This is the point of pooling — three buyers here and two there is five
+    wallets buying the same token, and that is what matters.
+    """
+    _live_watchlist(client, wallets=WALLETS[:5])         # pool wallets 1-5
+    _second_watchlist(client, "second list", WALLETS[5:])  # pool wallets 6-10
+
+    for wallet in WALLETS[:3]:
+        _buy(client, wallet)
+    assert client.get("/api/signals").json() == []
+
+    for wallet in WALLETS[5:7]:
+        _buy(client, wallet)
+
+    signals = client.get("/api/signals").json()
+    assert len(signals) == 1
+    signal = signals[0]
+    assert signal["wallet_count"] == 5
+    # A pooled signal belongs to no single watchlist.
+    assert signal["watchlist_id"] is None
+    assert signal["watchlist_size"] == 10
+
+
+def test_a_pooled_signal_says_which_watchlists_it_came_from(client):
+    first = _live_watchlist(client, wallets=WALLETS[:5])
+    second = _second_watchlist(client, "second list", WALLETS[5:])
+
+    for wallet in WALLETS[:3]:      # three from the first list
+        _buy(client, wallet)
+    for wallet in WALLETS[5:7]:     # two from the second
+        _buy(client, wallet)
+
+    signal = client.get("/api/signals").json()[0]
+    shares = {share["name"]: share for share in signal["breakdown"]}
+
+    assert shares["early buyers"]["wallets"] == 3
+    assert shares["early buyers"]["share_pct"] == 60.0
+    assert shares["second list"]["wallets"] == 2
+    assert shares["second list"]["share_pct"] == 40.0
+    # Largest contributor first, so the badge order reads sensibly.
+    assert signal["breakdown"][0]["watchlist_id"] == first
+    assert signal["breakdown"][1]["watchlist_id"] == second
+
+
+def test_a_wallet_in_two_watchlists_counts_once_but_credits_both(client):
+    _live_watchlist(client, wallets=WALLETS[:5])
+    _second_watchlist(client, "overlapping", WALLETS[:5])   # the same wallets
+
+    for wallet in WALLETS[:5]:
+        _buy(client, wallet)
+
+    signal = client.get("/api/signals").json()[0]
+
+    # Five wallets bought, not ten: the pool is distinct wallets.
+    assert signal["wallet_count"] == 5
+    assert signal["watchlist_size"] == 5
+    # Both lists are credited, so the shares total more than 100 — which is
+    # honest for overlapping lists rather than silently picking one.
+    assert [share["wallets"] for share in signal["breakdown"]] == [5, 5]
+
+
+def test_the_pooled_percentage_is_adjustable(client):
+    _live_watchlist(client)
+
+    for wallet in WALLETS[:3]:
+        _buy(client, wallet)
+    assert client.get("/api/signals").json() == []   # 3 of 10 is under 50%
+
+    settings_now = client.put("/api/settings/pool", json={"pool_pct": 30}).json()
+    assert settings_now["pool_pct"] == 30.0
+    assert settings_now["pools"][0]["required"] == 3
+
+    assert client.post("/api/live/sweep").json()["signals"] == 1
+
+
+def test_the_pooled_percentage_is_validated(client):
+    assert client.put("/api/settings/pool", json={"pool_pct": 140}).status_code == 422
+    assert (
+        client.put("/api/settings/pool", json={"pool_min_wallets": 1}).status_code
+        == 422
+    )
+
+
+def test_the_absolute_floor_stops_a_tiny_pool_firing_on_one_wallet(client, monkeypatch):
+    monkeypatch.setattr(settings, "pool_pct", 10.0)
+    monkeypatch.setattr(settings, "pool_min_wallets", 3)
+    _live_watchlist(client)
+
+    # 10% of ten wallets is one, but a single wallet is not a signal.
+    _buy(client, WALLETS[0])
+    assert client.get("/api/signals").json() == []
+
+    for wallet in WALLETS[1:3]:
+        _buy(client, wallet)
+    assert len(client.get("/api/signals").json()) == 1
+
+
 # ------------------------------------------------------------------- sweep
 
 
-def test_sweep_fires_a_signal_the_event_path_could_not(client):
-    """Lowering the threshold must not need a new buy to take effect."""
-    watchlist_id = _live_watchlist(client, min_wallets=5)
+def test_sweep_fires_a_signal_the_event_path_could_not(client, monkeypatch):
+    """Lowering the pooled percentage must not need a new buy to take effect."""
+    _live_watchlist(client)
     for wallet in WALLETS[:4]:
         _buy(client, wallet)
     assert client.get("/api/signals").json() == []
 
-    # Four buyers already qualify at the new threshold, but no further event
-    # will ever arrive to trigger the check.
-    client.patch(f"/api/watchlists/{watchlist_id}", json={"min_wallets": 4})
+    # Four buyers already clear 40% of the pool, but no further event will
+    # ever arrive to trigger the check.
+    client.put("/api/settings/pool", json={"pool_pct": 40})
     assert client.get("/api/signals").json() == []
 
     result = client.post("/api/live/sweep").json()
@@ -397,8 +519,8 @@ def test_sweep_fires_when_wallets_are_added_to_the_list_later(client):
 
 
 def test_sweep_is_idempotent_for_an_unchanged_signal(client):
-    _live_watchlist(client, min_wallets=3)
-    for wallet in WALLETS[:3]:
+    _live_watchlist(client)
+    for wallet in WALLETS[:5]:
         _buy(client, wallet)
     assert len(client.get("/api/signals").json()) == 1
 
@@ -412,15 +534,15 @@ def test_sweep_is_idempotent_for_an_unchanged_signal(client):
 
 
 def test_sweep_reports_a_strengthened_signal_once(client):
-    _live_watchlist(client, min_wallets=3)
-    for wallet in WALLETS[:3]:
+    _live_watchlist(client)
+    for wallet in WALLETS[:5]:
         _buy(client, wallet)
 
     db.record_events(
         [
             {
                 "chain": "ethereum",
-                "wallet_address": WALLETS[4],
+                "wallet_address": WALLETS[5],
                 "token_address": GEM,
                 "tx_hash": "0xextra",
                 "token_symbol": "GEM",
@@ -431,7 +553,7 @@ def test_sweep_reports_a_strengthened_signal_once(client):
 
     assert client.post("/api/live/sweep").json()["signals"] == 1   # buyer count grew
     assert client.post("/api/live/sweep").json()["signals"] == 0   # already reported
-    assert client.get("/api/signals").json()[0]["wallet_count"] == 4
+    assert client.get("/api/signals").json()[0]["wallet_count"] == 6
 
 
 def test_sweep_ignores_tokens_below_threshold(client):

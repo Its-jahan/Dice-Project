@@ -36,7 +36,14 @@ from . import db
 from .config import settings
 from .dune import DuneClient, ensure_query
 from .holders import _to_float
-from .models import Chain, MonitorResult, MonitorRunOut, SignalOut, TokenBuyer
+from .models import (
+    Chain,
+    MonitorResult,
+    MonitorRunOut,
+    SignalOut,
+    TokenBuyer,
+    WatchlistShare,
+)
 from .sql import build_new_positions_sql, build_trades_sql, ignored_tokens_for
 
 log = logging.getLogger(__name__)
@@ -251,10 +258,14 @@ def aggregate_candidates(
 
 def signal_to_out(row: dict[str, Any]) -> SignalOut:
     buyers = [TokenBuyer(**b) for b in json.loads(row.get("buyers") or "[]")]
+    breakdown = [
+        WatchlistShare(**share) for share in json.loads(row.get("breakdown") or "[]")
+    ]
     return SignalOut(
         id=row["id"],
         watchlist_id=row["watchlist_id"],
         watchlist_name=row.get("watchlist_name"),
+        breakdown=breakdown,
         chain=Chain(row["chain"]),
         token_address=row["token_address"],
         token_symbol=row.get("token_symbol"),
@@ -616,6 +627,15 @@ async def send_signal_notification(
             f"{signal.wallet_count}/{signal.watchlist_size} wallets bought{usd}"
             f"{breakdown}"
         )
+        if signal.breakdown:
+            # Pooled signals lose the owning watchlist, so name the sources.
+            lines.append(
+                "  from "
+                + ", ".join(
+                    f"{share.name} {share.share_pct:g}%"
+                    for share in signal.breakdown[:4]
+                )
+            )
         lines.append(signal.token_address)
         lines.append(f"https://dexscreener.com/{chain.value}/{signal.token_address}")
     text = "\n".join(lines)
