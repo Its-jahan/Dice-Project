@@ -50,6 +50,7 @@ from .models import (
     SignalOut,
     WatchlistCreate,
     WatchlistFromJob,
+    WalletType,
     WatchlistOut,
     WatchlistUpdate,
     normalize_addresses,
@@ -574,9 +575,28 @@ async def get_holders(
 
     # classify_wallets also strips the baseline day it needed, so nothing
     # downstream sees a snapshot from before the requested range.
-    in_range, facts = classify_wallets(parse_rows(rows, req), req)
-    snapshots = apply_holder_mode(apply_wallet_filter(in_range, facts, req), req)
+    parsed = parse_rows(rows, req)
+    in_range, facts = classify_wallets(parsed, req)
+    filtered = apply_wallet_filter(in_range, facts, req)
+    snapshots = apply_holder_mode(filtered, req)
     summary = build_summary(snapshots, facts)
+
+    # An empty result has several very different causes, and guessing at them
+    # wastes the user's credits on re-runs. Count what survived each stage so
+    # the UI can say which one it was.
+    stages = {
+        "dune_rows": len(rows),
+        "after_min_balance": len(parsed),
+        "wallets_in_range": len({s.wallet_address for s in in_range}),
+        "buyers": sum(
+            1 for f in facts.values() if f["wallet_type"] is WalletType.buyer
+        ),
+        "holders": sum(
+            1 for f in facts.values() if f["wallet_type"] is WalletType.holder
+        ),
+        "after_wallet_filter": len({s.wallet_address for s in filtered}),
+        "after_holder_mode": len({s.wallet_address for s in snapshots}),
+    }
     result = HoldersResponse(
         request=req,
         execution_id=execution_id,
@@ -596,6 +616,7 @@ async def get_holders(
         "truncated": result.truncated,
         "effective_end_date": req.effective_end_date.isoformat(),
         "end_date_clamped": req.end_date_clamped,
+        "stages": stages,
         "preview": [s.model_dump(mode="json") for s in snapshots[:PREVIEW_ROWS]],
         "summary_preview": [s.model_dump(mode="json") for s in summary[:PREVIEW_ROWS]],
     }

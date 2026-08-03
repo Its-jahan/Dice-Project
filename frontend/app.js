@@ -570,7 +570,7 @@ async function runQuery(event) {
       prepareWatchlistSave();
       setStatus(
         "runStatus",
-        data.row_count ? "Done." : "No holders matched — try a wider range or a lower minimum.",
+        data.row_count ? "Done." : explainEmptyResult(data, request),
         data.row_count ? "ok" : "",
       );
     } catch (error) {
@@ -581,6 +581,46 @@ async function runQuery(event) {
 }
 
 /* ----------------------------------------------------------------- results */
+
+/** Say which stage emptied the result, rather than guessing at a cause.
+ *
+ * Every one of these needs a different fix, and re-running a query to find
+ * out which costs Dune credits. */
+function explainEmptyResult(data, request) {
+  const s = data.stages || {};
+  if (!s.dune_rows) {
+    return (
+      "Dune returned no rows at all for this token and range. Either the " +
+      `token had no holders above ${request.min_balance.toLocaleString()} then, ` +
+      "or the dates are outside the period it existed — check the range and " +
+      "lower the minimum balance."
+    );
+  }
+  if (!s.after_min_balance) {
+    return (
+      `Dune returned ${s.dune_rows.toLocaleString()} rows, but every balance ` +
+      `was at or below the minimum of ${request.min_balance.toLocaleString()}. ` +
+      "Lower it."
+    );
+  }
+  if (!s.after_wallet_filter) {
+    const wanted = request.wallet_filter === "buyers" ? "buyers" : "holders";
+    return (
+      `${s.wallets_in_range.toLocaleString()} wallets held this token in the ` +
+      `range, but none were ${wanted} — ${s.buyers.toLocaleString()} bought ` +
+      `and ${s.holders.toLocaleString()} did not. Switch "Buyers or holders" ` +
+      "to Everyone to see them."
+    );
+  }
+  if (!s.after_holder_mode) {
+    return (
+      `${s.after_wallet_filter.toLocaleString()} wallets matched, but none ` +
+      "held on every single day of the range. Switch Holder mode away from " +
+      '"Continuous holders".'
+    );
+  }
+  return "No holders matched — try a wider range or a lower minimum.";
+}
 
 function renderResults(data) {
   $("resultsCard").classList.remove("d-none");
