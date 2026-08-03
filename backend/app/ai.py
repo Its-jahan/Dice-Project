@@ -5,7 +5,7 @@ Where it is *not* used
 Detection. Which wallets bought what, how many, inside which window, and
 whether that crosses a threshold — that is set arithmetic and SQL. Handing it
 to a model would make it slower, more expensive, occasionally wrong, and
-worst of all **untestable**: the 300 tests that currently pin signal behaviour
+worst of all **untestable**: the tests that currently pin signal behaviour
 would all become approximately true. Contract safety is likewise a dedicated
 service's job (:mod:`app.security`), not a model's opinion about bytecode.
 
@@ -17,11 +17,25 @@ of the edge. The enrichment brief answers that question — with web search, so
 it can report what the token claims to be rather than paraphrasing numbers
 DICE already showed you.
 
-**Review.** Once :mod:`app.performance` has outcomes and
-:mod:`app.wallets` has scores, someone has to read them and say "signals under
-six hours old won; over 48 lost; move the filter". That is judgement over a
-small table, which is exactly what a model is good at — and it only became
-possible once the outcome data existed.
+**Review.** Once :mod:`app.performance` has outcomes and :mod:`app.wallets`
+has scores, someone has to read them and say "signals under six hours old won;
+over 48 lost; move the filter". That is judgement over a small table, which is
+exactly what a model is good at — and it only became possible once the outcome
+data existed.
+
+Two ways to reach a model
+-------------------------
+**OpenRouter** (default) is a gateway: one key, an OpenAI-shaped API, and the
+same Claude models at the same list price. It is the right choice when the
+Anthropic API is not directly reachable, which for a lot of the world it is
+not.
+
+**Anthropic direct** uses the official SDK and is used automatically when an
+Anthropic key is the one saved.
+
+Both go through :func:`complete`, so the prompts, the parsing, and every
+guarantee below are shared. The two backends differ only in how a request is
+shaped on the wire — which is exactly as much as should differ.
 
 Rules both paths follow
 -----------------------
@@ -37,19 +51,25 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import Any
 
-import anthropic
+import httpx
 
 from . import db
 from .config import settings
 
 log = logging.getLogger(__name__)
 
-#: One model for both paths. The enrichment call is short and runs at low
-#: effort; the review is long and runs high. Splitting models to save pennies
-#: would trade away the judgement that is the entire point of the review.
-MODEL = "claude-opus-5"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+#: Same model either way — on OpenRouter the slug is namespaced, and it is
+#: listed there at Anthropic's own price, so routing through the gateway costs
+#: nothing extra on tokens.
+DEFAULT_MODELS = {
+    "openrouter": "anthropic/claude-opus-5",
+    "anthropic": "claude-opus-5",
+}
 
 #: Generous, because it is a ceiling rather than a charge — you pay for what
 #: is generated. A tight cap only buys the chance of a truncated answer.
@@ -57,9 +77,14 @@ ENRICH_MAX_TOKENS = 8_000
 REVIEW_MAX_TOKENS = 16_000
 
 #: Enrichment sits in the webhook request path, and Alchemy retries a delivery
-#: that answers too slowly. Past this, the signal goes out unenriched — a
-#: late brief is worth less than a duplicate delivery.
+#: that answers too slowly. Past this, the signal goes out unenriched — a late
+#: brief is worth less than a duplicate delivery.
 ENRICH_TIMEOUT_SECONDS = 12.0
+
+#: Web results per brief. OpenRouter bills search per result, so this is the
+#: one knob that turns "research every signal" into a line on a bill; five is
+#: enough to establish whether a project exists at all.
+WEB_RESULTS = 5
 
 ENRICH_SYSTEM = """\
 You brief a crypto trader on a token their wallet-tracking system just \
@@ -99,12 +124,15 @@ far more often than it is given, and a confident recommendation from four \
 data points is worse than silence.
 
 Prefer one change that matters to five that might. The operator applies these \
-by hand, so each one costs their attention.\
+by hand, so each one costs their attention.
+
+Reply with JSON only, matching the requested schema. No prose around it.\
 """
 
 #: The review returns a fixed shape so the UI can render it without parsing
-#: prose. Constraint keywords (minLength, maximum, …) are unsupported by the
-#: structured-output schema compiler and are deliberately absent.
+#: prose. Constraint keywords (minLength, maximum, …) are omitted: neither
+#: provider's structured-output compiler supports them, and a schema that is
+#: rejected buys nothing.
 REVIEW_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -171,8 +199,35 @@ class AIUnavailable(RuntimeError):
     """No key, disabled, or the API could not be reached. Never fatal."""
 
 
-def api_key() -> str | None:
+# --------------------------------------------------------------- which provider
+
+
+def provider() -> str | None:
+    """Which backend to use, decided by the key that is actually saved.
+
+    OpenRouter wins when both exist: someone who saved a gateway key chose the
+    gateway, and silently preferring the other one would spend on an account
+    they were not expecting to use.
+    """
+    if db.get_setting("openrouter_api_key") or settings.openrouter_api_key:
+        return "openrouter"
+    if db.get_setting("anthropic_api_key") or settings.anthropic_api_key:
+        return "anthropic"
+    return None
+
+
+def api_key(for_provider: str) -> str | None:
+    if for_provider == "openrouter":
+        return db.get_setting("openrouter_api_key") or settings.openrouter_api_key
     return db.get_setting("anthropic_api_key") or settings.anthropic_api_key
+
+
+def model() -> str:
+    """The configured model, or the right default for the active provider."""
+    chosen = (db.get_setting("ai_model") or "").strip()
+    if chosen:
+        return chosen
+    return DEFAULT_MODELS.get(provider() or "openrouter", DEFAULT_MODELS["openrouter"])
 
 
 def enabled() -> bool:
@@ -183,40 +238,181 @@ def enabled() -> bool:
         if stored is None
         else stored.strip().lower() in ("1", "true", "yes", "on")
     )
-    return bool(on and api_key())
+    return bool(on and provider())
 
 
-def _client() -> anthropic.AsyncAnthropic:
-    key = api_key()
-    if not key:
-        raise AIUnavailable("No Anthropic API key saved.")
-    return anthropic.AsyncAnthropic(api_key=key)
+# ------------------------------------------------------------------ the call
 
 
-def _text(response: Any) -> str:
-    """Concatenate the text blocks of a response, ignoring tool bookkeeping."""
-    return "\n".join(
+async def complete(
+    *,
+    system: str,
+    user: str,
+    max_tokens: int,
+    effort: str,
+    schema: dict[str, Any] | None = None,
+    web: bool = False,
+    timeout: float = 90.0,
+) -> str:
+    """One completion, from whichever provider is configured. Returns text."""
+    active = provider()
+    if active is None:
+        raise AIUnavailable("No API key saved.")
+    key = api_key(active)
+    if not key:  # pragma: no cover - provider() already proved one exists
+        raise AIUnavailable("No API key saved.")
+
+    if active == "openrouter":
+        return await _openrouter(
+            key=key, system=system, user=user, max_tokens=max_tokens,
+            effort=effort, schema=schema, web=web, timeout=timeout,
+        )
+    return await _anthropic(
+        key=key, system=system, user=user, max_tokens=max_tokens,
+        effort=effort, schema=schema, web=web, timeout=timeout,
+    )
+
+
+async def _openrouter(
+    *, key: str, system: str, user: str, max_tokens: int, effort: str,
+    schema: dict[str, Any] | None, web: bool, timeout: float,
+) -> str:
+    """OpenAI-shaped request against the gateway."""
+    payload: dict[str, Any] = {
+        "model": model(),
+        "max_tokens": max_tokens,
+        "reasoning": {"effort": effort},
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    }
+    if web:
+        # The gateway runs the search itself and folds the results into the
+        # prompt, so the model needs no tool loop of its own.
+        payload["plugins"] = [{"id": "web", "max_results": WEB_RESULTS}]
+    if schema is not None:
+        payload["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {"name": "review", "strict": True, "schema": schema},
+        }
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(
+                OPENROUTER_URL,
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    # Identifies this app on OpenRouter's side; harmless and
+                    # makes the spend legible on their dashboard.
+                    "HTTP-Referer": "https://github.com/Its-jahan/Dice-Project",
+                    "X-Title": "DICE",
+                },
+            )
+    except httpx.HTTPError as error:
+        raise AIUnavailable(f"OpenRouter did not answer: {error}") from error
+
+    if response.status_code >= 400:
+        raise AIUnavailable(f"OpenRouter returned {response.status_code}: "
+                            f"{_openrouter_error(response)}")
+    try:
+        body = response.json()
+    except ValueError as error:
+        raise AIUnavailable("OpenRouter returned a non-JSON body") from error
+
+    # A 200 can still carry an error — an upstream provider failure is
+    # reported in-band rather than as a status code.
+    if isinstance(body.get("error"), dict):
+        raise AIUnavailable(str(body["error"].get("message") or body["error"]))
+
+    choices = body.get("choices") or []
+    if not choices:
+        raise AIUnavailable("OpenRouter returned no completion")
+    message = choices[0].get("message") or {}
+    if message.get("refusal"):
+        raise AIUnavailable("the model declined to answer")
+    text = (message.get("content") or "").strip()
+    if not text:
+        # An empty content with a length finish reason is a truncation, which
+        # is worth saying plainly rather than reporting as "returned nothing".
+        if choices[0].get("finish_reason") == "length":
+            raise AIUnavailable("the answer was cut short before it was complete")
+        raise AIUnavailable("the model returned nothing")
+    return text
+
+
+def _openrouter_error(response: httpx.Response) -> str:
+    try:
+        body = response.json()
+    except ValueError:
+        return response.text.strip()[:200] or response.reason_phrase
+    error = body.get("error")
+    if isinstance(error, dict):
+        return str(error.get("message") or error)
+    return str(error or body)[:200]
+
+
+async def _anthropic(
+    *, key: str, system: str, user: str, max_tokens: int, effort: str,
+    schema: dict[str, Any] | None, web: bool, timeout: float,
+) -> str:
+    """The official SDK, for a key that talks to Anthropic directly."""
+    try:
+        import anthropic
+    except ImportError as error:  # pragma: no cover - dependency is pinned
+        raise AIUnavailable("The anthropic package is not installed.") from error
+
+    output_config: dict[str, Any] = {"effort": effort}
+    if schema is not None:
+        output_config["format"] = {"type": "json_schema", "schema": schema}
+    request: dict[str, Any] = {
+        "model": model(),
+        "max_tokens": max_tokens,
+        "output_config": output_config,
+        "system": system,
+        "messages": [{"role": "user", "content": user}],
+    }
+    if web:
+        request["tools"] = [
+            {"type": "web_search_20260209", "name": "web_search",
+             "max_uses": WEB_RESULTS}
+        ]
+
+    client = anthropic.AsyncAnthropic(api_key=key, timeout=timeout)
+    try:
+        response = await client.messages.create(**request)
+        if response.stop_reason == "pause_turn":
+            # A server-side search can exhaust its tool loop and come back a
+            # complete-looking half answer. Resume once; a second pause means
+            # the search is wandering and the partial beats more latency.
+            response = await client.messages.create(
+                **request,
+                messages=[
+                    *request["messages"],
+                    {"role": "assistant", "content": response.content},
+                ],
+            )
+    except anthropic.AuthenticationError as error:
+        raise AIUnavailable("The saved Anthropic API key was rejected.") from error
+    except (anthropic.APIStatusError, anthropic.APIConnectionError) as error:
+        raise AIUnavailable(str(error)) from error
+    finally:
+        await client.close()
+
+    if response.stop_reason == "refusal":
+        raise AIUnavailable("the model declined to answer")
+    if response.stop_reason == "max_tokens":
+        raise AIUnavailable("the answer was cut short before it was complete")
+    text = "\n".join(
         block.text for block in response.content if getattr(block, "type", "") == "text"
     ).strip()
+    if not text:
+        raise AIUnavailable("the model returned nothing")
+    return text
 
 
-async def _ask(client: anthropic.AsyncAnthropic, **kwargs: Any) -> Any:
-    """One request, resuming a server-tool pause once.
-
-    A web search can exhaust the server-side tool loop and come back
-    ``pause_turn`` — a complete-looking response that is actually half an
-    answer. Resuming once is enough for a brief; a second pause means the
-    search is wandering and the partial answer is better than more latency.
-    """
-    response = await client.messages.create(**kwargs)
-    if response.stop_reason != "pause_turn":
-        return response
-    resumed = dict(kwargs)
-    resumed["messages"] = [
-        *kwargs["messages"],
-        {"role": "assistant", "content": response.content},
-    ]
-    return await client.messages.create(**resumed)
+# ----------------------------------------------------------------- the briefs
 
 
 def parse_brief(text: str) -> dict[str, Any]:
@@ -239,98 +435,70 @@ def parse_brief(text: str) -> dict[str, Any]:
 
 
 async def brief_token(
-    *,
-    chain: str,
-    token_address: str,
-    symbol: str | None,
-    facts: dict[str, Any],
+    *, chain: str, token_address: str, symbol: str | None, facts: dict[str, Any]
 ) -> dict[str, Any]:
     """Research a signalled token and return a short brief.
 
     Raises :class:`AIUnavailable` on any failure — callers treat a missing
     brief as normal, because a signal without one is still a signal.
     """
-    client = _client()
-    lines = [
-        f"Chain: {chain}",
-        f"Token: {symbol or 'unknown symbol'} ({token_address})",
-    ]
+    lines = [f"Chain: {chain}", f"Token: {symbol or 'unknown symbol'} ({token_address})"]
     for label, value in facts.items():
         if value not in (None, "", [], {}):
             lines.append(f"{label}: {value}")
 
-    try:
-        response = await _ask(
-            client,
-            model=MODEL,
-            max_tokens=ENRICH_MAX_TOKENS,
-            # Low effort: this is a search-and-summarise task with a fixed
-            # output shape, and the latency sits in a webhook request path.
-            output_config={"effort": "low"},
-            system=ENRICH_SYSTEM,
-            tools=[
-                {"type": "web_search_20260209", "name": "web_search", "max_uses": 5}
-            ],
-            messages=[{"role": "user", "content": "\n".join(lines)}],
-        )
-    except (anthropic.APIStatusError, anthropic.APIConnectionError) as error:
-        raise AIUnavailable(str(error)) from error
-    finally:
-        await client.close()
-
-    if response.stop_reason == "refusal":
-        # A safety decline is a valid outcome, not a bug. Surface it as "no
-        # brief" rather than letting a caller read an empty content list.
-        raise AIUnavailable("the model declined to answer")
-
-    text = _text(response)
-    if not text:
-        raise AIUnavailable("the model returned nothing")
+    text = await complete(
+        system=ENRICH_SYSTEM,
+        user="\n".join(lines),
+        max_tokens=ENRICH_MAX_TOKENS,
+        # Low effort: search-and-summarise with a fixed output shape, and the
+        # latency sits in a webhook request path.
+        effort="low",
+        web=True,
+        timeout=ENRICH_TIMEOUT_SECONDS + 5,
+    )
     return parse_brief(text)
+
+
+def parse_json(text: str) -> dict[str, Any]:
+    """Read the review JSON, tolerating a model that wrapped it in prose.
+
+    Structured output is requested, but not every model on a gateway honours
+    it. Falling back to the first JSON object in the text turns "the model
+    added a sentence" from a failure into a non-event.
+    """
+    try:
+        return json.loads(text)
+    except ValueError:
+        pass
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S)
+    candidate = fenced.group(1) if fenced else None
+    if candidate is None:
+        braces = re.search(r"\{.*\}", text, re.S)
+        candidate = braces.group(0) if braces else None
+    if candidate is None:
+        raise AIUnavailable("the model returned unreadable JSON")
+    try:
+        return json.loads(candidate)
+    except ValueError as error:
+        raise AIUnavailable("the model returned unreadable JSON") from error
 
 
 async def review(payload: dict[str, Any]) -> dict[str, Any]:
     """Read the measured outcomes and propose parameter changes."""
-    client = _client()
-    try:
-        response = await client.messages.create(
-            model=MODEL,
-            max_tokens=REVIEW_MAX_TOKENS,
-            # High effort and a fixed schema: this is the judgement call, and
-            # the UI renders the result field by field.
-            output_config={
-                "effort": "high",
-                "format": {"type": "json_schema", "schema": REVIEW_SCHEMA},
-            },
-            system=REVIEW_SYSTEM,
-            messages=[
-                {
-                    "role": "user",
-                    "content": (
-                        "Here is everything the system has measured so far.\n\n"
-                        + json.dumps(payload, indent=2, default=str)
-                    ),
-                }
-            ],
-        )
-    except anthropic.AuthenticationError as error:
-        raise AIUnavailable("The saved Anthropic API key was rejected.") from error
-    except (anthropic.APIStatusError, anthropic.APIConnectionError) as error:
-        raise AIUnavailable(str(error)) from error
-    finally:
-        await client.close()
-
-    if response.stop_reason == "refusal":
-        raise AIUnavailable("the model declined to answer")
-    if response.stop_reason == "max_tokens":
-        # Structured output truncated mid-JSON is unparseable; say so rather
-        # than surfacing a JSONDecodeError from three frames down.
-        raise AIUnavailable("the answer was cut short before it was complete")
-
-    try:
-        return json.loads(_text(response))
-    except ValueError as error:  # pragma: no cover - schema makes this rare
-        raise AIUnavailable("the model returned unreadable JSON") from error
+    text = await complete(
+        system=REVIEW_SYSTEM,
+        user=(
+            "Here is everything the system has measured so far.\n\n"
+            + json.dumps(payload, indent=2, default=str)
+        ),
+        max_tokens=REVIEW_MAX_TOKENS,
+        # High effort and a fixed schema: this is the judgement call, and the
+        # UI renders the result field by field.
+        effort="high",
+        schema=REVIEW_SCHEMA,
+    )
+    return parse_json(text)
 
 
 async def brief_with_timeout(**kwargs: Any) -> dict[str, Any] | None:
@@ -352,13 +520,31 @@ async def brief_with_timeout(**kwargs: Any) -> dict[str, Any] | None:
         return None
 
 
+async def check_key() -> dict[str, Any]:
+    """Prove the saved key works, without waiting for a signal to find out."""
+    text = await complete(
+        system="Reply with the single word: ok",
+        user="Reply with the single word: ok",
+        max_tokens=1_000,
+        effort="low",
+        timeout=45.0,
+    )
+    return {"ok": True, "provider": provider(), "model": model(), "reply": text[:80]}
+
+
 __all__ = [
     "AIUnavailable",
+    "DEFAULT_MODELS",
     "ENRICH_TIMEOUT_SECONDS",
-    "MODEL",
+    "api_key",
     "brief_token",
     "brief_with_timeout",
+    "check_key",
+    "complete",
     "enabled",
+    "model",
     "parse_brief",
+    "parse_json",
+    "provider",
     "review",
 ]

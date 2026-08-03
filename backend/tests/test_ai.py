@@ -11,7 +11,7 @@ import hashlib
 import hmac
 import json
 
-import anthropic
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -60,6 +60,17 @@ def client(monkeypatch, tmp_path):
     monkeypatch.setattr(dexscreener, "market_data", market_data)
     with TestClient(main.app) as test_client:
         yield test_client
+
+
+@pytest.fixture
+def store(monkeypatch, tmp_path):
+    """A bare database — the gateway tests need no app, only settings."""
+    monkeypatch.setattr(settings, "db_path", str(tmp_path / "dice.db"))
+    monkeypatch.setattr(settings, "openrouter_api_key", None, raising=False)
+    monkeypatch.setattr(settings, "anthropic_api_key", None, raising=False)
+    with db.connect():
+        pass
+    return db
 
 
 def _live_watchlist():
@@ -345,3 +356,183 @@ def test_enrichment_can_be_switched_off_without_removing_the_key(client):
     off = client.put("/api/settings/ai", json={"enrichment": False}).json()
     assert off["configured"] is True and off["enrichment"] is False
     assert ai.enabled() is False
+
+
+# --------------------------------------------------------------- openrouter
+#
+# The gateway is the path this deployment actually uses, and its wire format
+# is the one thing here that cannot be checked without a live key. These pin
+# the request shape against a stubbed transport so a typo in the payload
+# surfaces at test time rather than the first time a signal fires.
+
+
+#: Captured once at import. Reading httpx.AsyncClient inside the helper would
+#: pick up a previous stub when a test installs two in a row, and the first
+#: handler would silently answer the second request.
+REAL_ASYNC_CLIENT = httpx.AsyncClient
+
+
+def _openrouter_stub(monkeypatch, handler):
+    """Point the OpenRouter client at a handler and capture what it sent."""
+    sent = {}
+
+    def transport_handler(request: httpx.Request) -> httpx.Response:
+        sent["url"] = str(request.url)
+        sent["auth"] = request.headers.get("Authorization")
+        sent["body"] = json.loads(request.content)
+        return handler(sent["body"])
+
+    def patched(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(transport_handler)
+        return REAL_ASYNC_CLIENT(*args, **kwargs)
+
+    monkeypatch.setattr(ai.httpx, "AsyncClient", patched)
+    return sent
+
+
+def _reply(text, **extra):
+    return lambda body: httpx.Response(
+        200,
+        json={"choices": [{"message": {"content": text}, **extra}]},
+    )
+
+
+@pytest.mark.anyio
+async def test_openrouter_is_preferred_when_both_keys_are_saved(store):
+    """Saving a gateway key is a choice; spending on the other account is not."""
+    db.set_setting("anthropic_api_key", "sk-ant-x")
+    assert ai.provider() == "anthropic"
+    db.set_setting("openrouter_api_key", "sk-or-x")
+    assert ai.provider() == "openrouter"
+    assert ai.model() == "anthropic/claude-opus-5"
+
+
+@pytest.mark.anyio
+async def test_a_brief_request_asks_the_gateway_to_search(store, monkeypatch):
+    db.set_setting("openrouter_api_key", "sk-or-test")
+    sent = _openrouter_stub(monkeypatch, _reply(BRIEF))
+
+    brief = await ai.brief_token(
+        chain="ethereum", token_address=GEM, symbol="GEM",
+        facts={"Wallets that bought it": "19 of 180 tracked"},
+    )
+
+    assert brief["theme"] == "gaming"
+    assert sent["url"] == ai.OPENROUTER_URL
+    assert sent["auth"] == "Bearer sk-or-test"
+    assert sent["body"]["model"] == "anthropic/claude-opus-5"
+    # Search is the whole point of the brief — without it the model can only
+    # restate numbers DICE already showed the operator.
+    assert sent["body"]["plugins"] == [
+        {"id": "web", "max_results": ai.WEB_RESULTS}
+    ]
+    assert sent["body"]["reasoning"] == {"effort": "low"}
+    # Only facts DICE established are sent.
+    assert "19 of 180 tracked" in sent["body"]["messages"][1]["content"]
+
+
+@pytest.mark.anyio
+async def test_a_review_request_asks_for_the_schema_and_does_not_search(
+    store, monkeypatch
+):
+    db.set_setting("openrouter_api_key", "sk-or-test")
+    verdict = {
+        "verdict": "Too few signals.", "confidence": "none",
+        "recommendations": [], "watch_next": "More scored signals.",
+    }
+    sent = _openrouter_stub(monkeypatch, _reply(json.dumps(verdict)))
+
+    assert (await ai.review({"scoreboard": {}}))["confidence"] == "none"
+    fmt = sent["body"]["response_format"]
+    assert fmt["type"] == "json_schema"
+    assert fmt["json_schema"]["strict"] is True
+    assert fmt["json_schema"]["schema"]["required"] == [
+        "verdict", "confidence", "recommendations", "watch_next"
+    ]
+    assert sent["body"]["reasoning"] == {"effort": "high"}
+    # No web search: the review reads measured numbers, not the internet.
+    assert "plugins" not in sent["body"]
+
+
+@pytest.mark.anyio
+async def test_a_gateway_error_becomes_unavailable_not_a_crash(store, monkeypatch):
+    db.set_setting("openrouter_api_key", "sk-or-test")
+    _openrouter_stub(
+        monkeypatch,
+        lambda body: httpx.Response(
+            402, json={"error": {"message": "Insufficient credits"}}
+        ),
+    )
+    with pytest.raises(ai.AIUnavailable, match="Insufficient credits"):
+        await ai.review({})
+
+
+@pytest.mark.anyio
+async def test_an_error_inside_a_200_is_still_an_error(store, monkeypatch):
+    """The gateway reports an upstream failure in-band, with a 200 status."""
+    db.set_setting("openrouter_api_key", "sk-or-test")
+    _openrouter_stub(
+        monkeypatch,
+        lambda body: httpx.Response(
+            200, json={"error": {"message": "upstream provider is down"}}
+        ),
+    )
+    with pytest.raises(ai.AIUnavailable, match="upstream provider is down"):
+        await ai.review({})
+
+
+@pytest.mark.anyio
+async def test_a_refusal_and_a_truncation_are_told_apart(store, monkeypatch):
+    db.set_setting("openrouter_api_key", "sk-or-test")
+
+    _openrouter_stub(
+        monkeypatch,
+        lambda body: httpx.Response(
+            200, json={"choices": [{"message": {"refusal": "no", "content": None}}]}
+        ),
+    )
+    with pytest.raises(ai.AIUnavailable, match="declined"):
+        await ai.review({})
+
+    _openrouter_stub(
+        monkeypatch,
+        lambda body: httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": ""}, "finish_reason": "length"}]},
+        ),
+    )
+    with pytest.raises(ai.AIUnavailable, match="cut short"):
+        await ai.review({})
+
+
+@pytest.mark.anyio
+async def test_json_wrapped_in_prose_or_fences_is_still_read(store, monkeypatch):
+    """Not every model on a gateway honours a response format."""
+    db.set_setting("openrouter_api_key", "sk-or-test")
+    verdict = {"verdict": "v", "confidence": "low", "recommendations": [],
+               "watch_next": "w"}
+
+    _openrouter_stub(
+        monkeypatch,
+        _reply("Here is the review:\n```json\n" + json.dumps(verdict) + "\n```"),
+    )
+    assert (await ai.review({}))["confidence"] == "low"
+
+    _openrouter_stub(monkeypatch, _reply("Sure! " + json.dumps(verdict)))
+    assert (await ai.review({}))["confidence"] == "low"
+
+
+def test_unreadable_output_says_so_rather_than_raising_a_json_error():
+    with pytest.raises(ai.AIUnavailable, match="unreadable JSON"):
+        ai.parse_json("I could not complete this request.")
+
+
+@pytest.mark.anyio
+async def test_the_key_can_be_proved_before_a_signal_needs_it(store, monkeypatch):
+    db.set_setting("openrouter_api_key", "sk-or-test")
+    _openrouter_stub(monkeypatch, _reply("ok"))
+    result = await ai.check_key()
+    assert result == {
+        "ok": True, "provider": "openrouter",
+        "model": "anthropic/claude-opus-5", "reply": "ok",
+    }

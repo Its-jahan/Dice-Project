@@ -1337,26 +1337,45 @@ async def token_risk(
 
 @app.get("/api/settings/ai")
 def get_ai_settings() -> dict[str, object]:
+    active = ai.provider()
     return {
-        "configured": bool(ai.api_key()),
-        "key_hint": _key_hint(db.get_setting("anthropic_api_key")),
+        "provider": active,
+        "configured": bool(active),
+        "openrouter_hint": _key_hint(db.get_setting("openrouter_api_key")),
+        "anthropic_hint": _key_hint(db.get_setting("anthropic_api_key")),
         "enrichment": ai.enabled(),
-        "model": ai.MODEL,
+        "model": ai.model(),
+        "default_models": ai.DEFAULT_MODELS,
         "themes": db.theme_counts(),
     }
 
 
 @app.put("/api/settings/ai")
 def save_ai_settings(body: Annotated[dict, Body()]) -> dict[str, object]:
-    if "anthropic_api_key" in body:
-        key = str(body.get("anthropic_api_key") or "").strip()
-        if key:
-            db.set_setting("anthropic_api_key", key)
+    for field, setting in (
+        ("openrouter_api_key", "openrouter_api_key"),
+        ("anthropic_api_key", "anthropic_api_key"),
+        ("model", "ai_model"),
+    ):
+        if field not in body:
+            continue
+        value = str(body.get(field) or "").strip()
+        if value:
+            db.set_setting(setting, value)
         else:
-            db.delete_setting("anthropic_api_key")
+            db.delete_setting(setting)
     if "enrichment" in body:
         db.set_setting("ai_enrichment", "true" if body["enrichment"] else "false")
     return get_ai_settings()
+
+
+@app.post("/api/settings/ai/test")
+async def test_ai_key() -> dict[str, object]:
+    """Prove the key works now, rather than finding out when a signal fires."""
+    try:
+        return await ai.check_key()
+    except ai.AIUnavailable as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
 
 
 @app.post("/api/ai/review")

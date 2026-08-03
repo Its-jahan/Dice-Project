@@ -608,7 +608,7 @@ async def enrich(
             chain=chain.value,
             token_address=signal.token_address,
             brief=brief,
-            model=ai.MODEL,
+            model=ai.model(),
         )
     except Exception:  # pragma: no cover - a brief must never break a signal
         log.exception("storing the brief failed")

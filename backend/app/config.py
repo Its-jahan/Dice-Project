@@ -136,6 +136,12 @@ class Settings:
     # An LLM brief attached to each new signal: what the token actually is,
     # researched with web search. Off unless a key is saved — it costs money
     # per signal and the system works without it.
+    # Either key works. OpenRouter is a gateway to the same Claude models at
+    # the same list price, and it is the reachable option in a lot of the
+    # world; a direct Anthropic key is used when that is what is saved.
+    openrouter_api_key: str | None = field(
+        default_factory=lambda: os.getenv("OPENROUTER_API_KEY") or None
+    )
     anthropic_api_key: str | None = field(
         default_factory=lambda: os.getenv("ANTHROPIC_API_KEY") or None
     )

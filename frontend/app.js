@@ -153,14 +153,22 @@ const FIELD_HELP = {
     "outcome tracking) is shared, so a Solana signal means exactly what an " +
     "Ethereum one does. Leave empty if you do not watch Solana.",
   aiKey:
-    "An Anthropic API key, saved on this server like the Dune one. It powers " +
-    "two things and nothing else: a three-line brief on what a signalled " +
-    "token actually is (researched with web search — the question your own " +
-    "numbers cannot answer), and an on-demand review of your measured " +
-    "results that proposes threshold changes with the evidence behind them. " +
-    "The model never decides to buy, never sets a threshold, and never " +
-    "replaces the contract screen. Leave it empty and everything else works " +
-    "exactly as before.",
+    "An OpenRouter key (sk-or-…) or an Anthropic one (sk-ant-…) — whichever " +
+    "you paste is detected and used, and it is saved on this server like the " +
+    "Dune key. OpenRouter is a gateway to the same Claude models at the same " +
+    "list price, and it works from places the Anthropic API does not. The key " +
+    "powers two things and nothing else: a brief on what a signalled token " +
+    "actually is (researched with web search — the question your own numbers " +
+    "cannot answer), and an on-demand review of your measured results. The " +
+    "model never decides to buy, never sets a threshold, and never replaces " +
+    "the contract screen. Leave it empty and everything else works as before.",
+  aiModel:
+    "Which model to use. Empty means the default shown — Claude Opus 5, the " +
+    "same model either way. Any OpenRouter slug works if you want to trade " +
+    "cost against judgement, but the review is the part that benefits from " +
+    "the stronger model: it is reading a table and deciding what the numbers " +
+    "do not yet support, which is exactly where a weaker model invents " +
+    "confidence.",
   aiEnrichment:
     "Research each new signal before the Telegram goes out. The brief sits in " +
     "the webhook path, so it is time-boxed: if the model is slow or down, the " +
@@ -1931,14 +1939,20 @@ async function loadAiSettings() {
   try {
     const data = await api("/api/settings/ai");
     state.ai = data;
-    $("aiKey").placeholder = data.key_hint
-      ? `Key saved (${data.key_hint}) — paste to replace`
-      : "Anthropic API key";
+    const hint = data.provider === "anthropic" ? data.anthropic_hint : data.openrouter_hint;
+    $("aiKey").placeholder = hint
+      ? `${data.provider} key saved (${hint}) — paste to replace`
+      : "OpenRouter API key (sk-or-…)";
+    $("aiModel").placeholder = data.default_models?.[data.provider || "openrouter"] || "";
+    $("aiModel").value = data.model && data.model !== $("aiModel").placeholder
+      ? data.model : "";
     $("aiEnrichment").checked = !!data.enrichment;
     const badge = $("aiBadge");
     badge.className =
       "badge rounded-pill " + (data.enrichment ? "text-bg-success" : "text-bg-secondary");
-    badge.textContent = data.enrichment ? "On" : "Off";
+    badge.textContent = data.enrichment
+      ? `On · ${data.provider}`
+      : data.provider ? `Key saved · ${data.provider}` : "Off";
     renderThemes(data.themes || []);
   } catch {
     /* non-fatal */
@@ -1947,9 +1961,17 @@ async function loadAiSettings() {
 
 async function saveAiSettings() {
   await withBusy($("aiSave"), async () => {
-    const body = { enrichment: $("aiEnrichment").checked };
+    const body = {
+      enrichment: $("aiEnrichment").checked,
+      model: $("aiModel").value.trim(),
+    };
     const key = $("aiKey").value.trim();
-    if (key) body.anthropic_api_key = key;
+    if (key) {
+      // The prefix says which service the key belongs to, so nobody has to
+      // pick a provider from a dropdown and get it wrong.
+      if (key.startsWith("sk-ant-")) body.anthropic_api_key = key;
+      else body.openrouter_api_key = key;
+    }
     try {
       await api("/api/settings/ai", { method: "PUT", body });
       $("aiKey").value = "";
@@ -1987,6 +2009,22 @@ function renderThemes(themes) {
     row.appendChild(pill);
   }
   host.appendChild(row);
+}
+
+async function testAiKey() {
+  await withBusy($("aiTest"), async () => {
+    setStatus("aiStatus", "Asking the model to answer one word…", "");
+    try {
+      const result = await api("/api/settings/ai/test", { method: "POST" });
+      setStatus(
+        "aiStatus",
+        `Working — ${result.provider} answered as ${result.model}.`,
+        "ok",
+      );
+    } catch (error) {
+      setStatus("aiStatus", error.message, "error");
+    }
+  });
 }
 
 async function runAiReview() {
@@ -2717,6 +2755,7 @@ function init() {
   $("wqRefresh").addEventListener("click", loadWalletQuality);
   $("aiSave").addEventListener("click", saveAiSettings);
   $("aiReview").addEventListener("click", runAiReview);
+  $("aiTest").addEventListener("click", testAiKey);
   $("aiEnrichment").addEventListener("change", saveAiSettings);
   $("refreshExits").addEventListener("click", loadExits);
   $("wqChain").addEventListener("change", loadWalletQuality);

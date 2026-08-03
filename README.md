@@ -446,6 +446,22 @@ accumulated, and the buy count alone cannot tell those apart.
 
 ## Where a model earns its keep — and where it does not
 
+### Which key
+
+Either an **OpenRouter** key (`sk-or-…`) or an **Anthropic** one (`sk-ant-…`)
+— paste whichever you have and the prefix decides; there is no provider to
+pick. OpenRouter is a gateway that reaches the same Claude models at the same
+list price (`anthropic/claude-opus-5`, $5/$25 per million), and it works from
+places the Anthropic API does not, which is the reason it is the default.
+
+Both go through one internal call, so the prompts, the parsing, and every
+guarantee below are identical. The two differ only in how a request is shaped
+on the wire — which is exactly as much as should differ. **Test** proves the
+saved key works now rather than when a signal fires.
+
+One cost worth knowing: the briefs use web search, which OpenRouter bills per
+result — five per signal.
+
 **Not detection.** Which wallets bought what, how many, inside which window,
 and whether that crosses a threshold is set arithmetic and SQL. Handing it to
 a model would make it slower, more expensive, occasionally wrong, and — worst
@@ -549,7 +565,7 @@ requires.
 | `POST /api/webhooks/helius` | Helius delivery endpoint for Solana (Authorization-header verified). |
 | `GET /api/live/exits` | What the watched wallets are selling. |
 | `GET /api/tokens/risk?chain=&address=` | Screen one contract (honeypot, taxes, owner powers, LP lock). |
-| `GET` / `PUT /api/settings/ai` | Anthropic key (server-side), enrichment toggle, theme breakdown. |
+| `GET` / `PUT /api/settings/ai` · `POST …/test` | Model key (server-side), enrichment toggle, theme breakdown, and a live key check. |
 | `POST` / `GET /api/ai/review` | Run a review of the measured results / read the last one. |
 | `GET /api/signals/{id}/brief` | The researched brief for one signal. |
 | `GET /api/wallets/leaderboard?chain=` | Wallet quality: score, hit rate, median return, lead time, cohort count. |

@@ -575,12 +575,19 @@
           and never replaces the contract screen.
         </p>
         <div class="row g-2 align-items-center">
-          <div class="col-lg-5">
+          <div class="col-lg-4">
             <input id="aiKey" type="password" class="form-control" autocomplete="off"
-                   spellcheck="false" placeholder="Anthropic API key">
+                   spellcheck="false" placeholder="OpenRouter API key (sk-or-…)">
+          </div>
+          <div class="col-lg-3">
+            <input id="aiModel" class="form-control" spellcheck="false"
+                   placeholder="anthropic/claude-opus-5">
           </div>
           <div class="col-auto">
             <button type="button" id="aiSave" class="btn btn-primary">Save</button>
+            <button type="button" id="aiTest" class="btn btn-outline-secondary">
+              Test
+            </button>
           </div>
           <div class="col-auto">
             <div class="form-check form-switch mb-0">
@@ -594,6 +601,15 @@
             <button type="button" id="aiReview" class="btn btn-outline-secondary">
               Review my results
             </button>
+          </div>
+          <div class="col-12">
+            <span class="form-text">
+              An <strong>OpenRouter</strong> key reaches the same Claude models at
+              the same list price, and works from places the Anthropic API does
+              not. A direct Anthropic key (<code>sk-ant-…</code>) is used instead
+              if that is what you paste. Web search for the briefs is billed by
+              OpenRouter per result — five per signal.
+            </span>
           </div>
         </div>
         <div id="aiStatus" class="small mt-2" role="status" aria-live="polite"></div>
