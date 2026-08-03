@@ -323,6 +323,41 @@
       </div>
     </section>
 
+    <!-- ================================================== cohort overlap -->
+    <section class="card shadow-sm" id="cohortCard" aria-labelledby="cohortHeading">
+      <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
+        <h2 id="cohortHeading" class="h6 mb-0">Cohort overlap</h2>
+        <div class="d-flex align-items-center gap-2">
+          <label class="form-label small mb-0" for="cohortUniverse">Universe</label>
+          <input id="cohortUniverse" type="number" min="1000" step="1000"
+                 class="form-control form-control-sm" style="width:9rem">
+          <button type="button" id="refreshCohorts" class="btn btn-outline-secondary btn-sm">
+            Recompute
+          </button>
+        </div>
+      </div>
+      <div class="card-body">
+        <p class="small text-body-secondary">
+          Which watchlists share wallets — “the wallets that farmed X are now in Y”.
+          Computed from data already stored, so it costs no Dune credits.
+          <strong>Shared</strong> is the raw count, which on its own means little;
+          <strong>of smaller</strong> is the share of the smaller cohort that ended up
+          in the other, and <strong>vs chance</strong> is how many times more overlap
+          than coincidence would produce. Below 1× means the two cohorts avoid each
+          other. Ranked by containment, not by raw count.
+        </p>
+        <p id="cohortEmpty" class="small text-body-secondary mb-0">
+          Needs at least two watchlists on the same chain that share wallets.
+        </p>
+        <div class="table-responsive">
+          <table id="cohortTable" class="table table-sm table-hover align-middle d-none mb-0">
+            <thead></thead><tbody></tbody>
+          </table>
+        </div>
+        <div id="cohortStatus" class="small mt-2" role="status" aria-live="polite"></div>
+      </div>
+    </section>
+
     <!-- ================================================== live board -->
     <section class="card shadow-sm" id="liveCard" aria-labelledby="liveHeading">
       <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
@@ -609,6 +644,25 @@
       DICE · holder extraction &amp; wallet co-buy signals via Dune Analytics
     </footer>
   </main>
+
+  <!-- ================================================== shared wallets modal -->
+  <div class="modal fade" id="sharedModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-lg">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h3 class="h6 modal-title" id="sharedTitle">Shared wallets</h3>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <div class="modal-body">
+          <pre id="sharedBody" class="mono small mb-0" style="max-height:55vh;overflow:auto"></pre>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-outline-secondary" id="sharedCopy">Copy all</button>
+          <button type="button" class="btn btn-primary" data-bs-dismiss="modal">Close</button>
+        </div>
+      </div>
+    </div>
+  </div>
 
   <!-- ================================================== watchlist edit modal -->
   <div class="modal fade" id="watchlistModal" tabindex="-1" aria-hidden="true">

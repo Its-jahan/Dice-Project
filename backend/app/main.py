@@ -27,7 +27,7 @@ from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import alchemy, arkham, db, monitor, realtime
+from . import alchemy, arkham, cohorts, db, monitor, realtime
 from .cache import cache
 from .config import settings
 from .dune import DuneClient, DuneError, ensure_query
@@ -1052,6 +1052,33 @@ async def save_pool_settings(body: Annotated[dict, Body()]) -> dict[str, object]
             "signal_airdrops", "true" if body["signal_airdrops"] else "false"
         )
     return await get_pool_settings()
+
+
+@app.get("/api/cohorts/overlap")
+async def cohort_overlap(
+    universe: Annotated[int, Query(ge=1000)] = cohorts.DEFAULT_UNIVERSE,
+    min_overlap: Annotated[int, Query(ge=1)] = cohorts.MIN_OVERLAP,
+) -> dict[str, object]:
+    """Which watchlists share wallets, ranked by how far above chance.
+
+    Answers "the wallets that farmed X are now in Y" from data already
+    stored, so it costs nothing to ask.
+    """
+    return cohorts.overlap_matrix(universe=universe, min_overlap=min_overlap)
+
+
+@app.get("/api/cohorts/overlap/{a_id}/{b_id}")
+async def cohort_shared_wallets(
+    a_id: int, b_id: int, limit: Annotated[int, Query(ge=1, le=2000)] = 500
+) -> dict[str, object]:
+    """The actual wallets two cohorts have in common."""
+    for watchlist_id in (a_id, b_id):
+        if db.get_watchlist(watchlist_id) is None:
+            raise HTTPException(
+                status_code=404, detail=f"Watchlist {watchlist_id} not found."
+            )
+    wallets = db.shared_wallets(a_id, b_id, limit=limit)
+    return {"a_id": a_id, "b_id": b_id, "count": len(wallets), "wallets": wallets}
 
 
 @app.get("/api/live/tokens")

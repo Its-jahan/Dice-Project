@@ -1234,3 +1234,67 @@ def telegram_credentials() -> tuple[str | None, str | None]:
         settings.telegram_chat_id or ""
     ).strip()
     return (token or None, chat_id or None)
+
+
+# ------------------------------------------------------------------ cohorts
+#
+# A watchlist is a cohort: a named set of wallets that shared some history.
+# Asking which cohorts overlap answers "the wallets that farmed X are now in
+# Y" — the question that needs no Dune credit, because both sides are already
+# stored here.
+
+
+def cohort_sizes() -> dict[int, dict[str, Any]]:
+    """Every watchlist with its wallet count, keyed by id."""
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT w.id, w.name, w.chain, w.source_token_address,
+                   COUNT(ww.wallet_address) AS wallets
+            FROM watchlists w
+            LEFT JOIN watchlist_wallets ww ON ww.watchlist_id = w.id
+            GROUP BY w.id
+            """
+        ).fetchall()
+    return {int(row["id"]): dict(row) for row in rows}
+
+
+def cohort_overlaps() -> list[dict[str, Any]]:
+    """Shared wallet counts for every pair of watchlists on the same chain.
+
+    One self-join rather than a query per pair: with N cohorts there are
+    N(N-1)/2 pairs, and asking separately would be quadratic round trips for
+    what SQLite can group in a single pass. ``b.watchlist_id > a.watchlist_id``
+    keeps each pair once and drops self-comparison.
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT a.watchlist_id AS a_id,
+                   b.watchlist_id AS b_id,
+                   COUNT(*)       AS overlap
+            FROM watchlist_wallets a
+            JOIN watchlist_wallets b
+              ON b.wallet_address = a.wallet_address
+             AND b.watchlist_id > a.watchlist_id
+            JOIN watchlists wa ON wa.id = a.watchlist_id
+            JOIN watchlists wb ON wb.id = b.watchlist_id
+            WHERE wa.chain = wb.chain
+            GROUP BY 1, 2
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def shared_wallets(a_id: int, b_id: int, limit: int = 500) -> list[str]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT a.wallet_address FROM watchlist_wallets a
+            JOIN watchlist_wallets b ON b.wallet_address = a.wallet_address
+            WHERE a.watchlist_id = ? AND b.watchlist_id = ?
+            ORDER BY a.wallet_address LIMIT ?
+            """,
+            (a_id, b_id, limit),
+        ).fetchall()
+    return [row["wallet_address"] for row in rows]

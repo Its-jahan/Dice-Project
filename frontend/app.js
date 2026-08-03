@@ -27,6 +27,7 @@ const state = {
   expandedSignals: new Set(),
   realtime: null,     // /api/settings/realtime payload
   liveTokens: [],     // accumulation board rows
+  cohortPairs: [],    // cohort overlap rows
   liveIncludesAirdrops: false,
 };
 
@@ -146,6 +147,11 @@ const FIELD_HELP = {
     "An address to identify. Uses the chain selected in the holder query " +
     "above. The raw response is shown too, since Arkham's shapes are not " +
     "published.",
+  cohortUniverse:
+    "How many wallets could plausibly have joined either cohort. This is a " +
+    "modelling choice, not a measurement: raise it and every overlap looks " +
+    "more surprising, lower it and everything looks mundane. It only affects " +
+    "the “vs chance” column — the shared count and “of smaller” assume nothing.",
   liveIncludeUntradeable:
     "Also show tokens with no liquidity pool on any DEX. Nobody can buy or " +
     "sell those, so they never signal — this reveals what was filtered and why.",
@@ -1116,6 +1122,110 @@ async function deleteWatchlist(wl) {
   }
 }
 
+/* --------------------------------------------------------- cohort overlap */
+
+async function loadCohortOverlap() {
+  try {
+    const universe = Number($("cohortUniverse").value) || 1000000;
+    const data = await api(`/api/cohorts/overlap?universe=${universe}`);
+    state.cohortPairs = data.pairs || [];
+    $("cohortUniverse").value = data.universe;
+    renderCohortOverlap();
+    setStatus(
+      "cohortStatus",
+      `${data.cohorts} watchlists · ${state.cohortPairs.length} overlapping pair(s).`,
+      "",
+    );
+  } catch (error) {
+    setStatus("cohortStatus", error.message, "error");
+  }
+}
+
+function renderCohortOverlap() {
+  const rows = state.cohortPairs;
+  const table = $("cohortTable");
+  $("cohortEmpty").classList.toggle("d-none", !!rows.length);
+  table.classList.toggle("d-none", !rows.length);
+  table.tHead.innerHTML = "";
+  table.tBodies[0].innerHTML = "";
+  if (!rows.length) return;
+
+  const head = table.tHead.insertRow();
+  for (const title of [
+    "Cohort A", "Cohort B", "Shared", "of smaller", "vs chance", "Chain", "",
+  ]) {
+    head.appendChild(el("th", "small text-body-secondary", title));
+  }
+
+  for (const pair of rows) {
+    const tr = table.tBodies[0].insertRow();
+    tr.className = "signal-row";   // reuse the pointer affordance
+
+    const a = tr.insertCell();
+    a.appendChild(el("span", "fw-medium", pair.a_name));
+    a.appendChild(el("span", "small text-body-secondary ms-1", `(${pair.a_size})`));
+    const b = tr.insertCell();
+    b.appendChild(el("span", "fw-medium", pair.b_name));
+    b.appendChild(el("span", "small text-body-secondary ms-1", `(${pair.b_size})`));
+
+    tr.insertCell().textContent = pair.overlap;
+
+    const containment = tr.insertCell();
+    containment.textContent = `${pair.containment}%`;
+    containment.title =
+      `${pair.pct_of_a}% of "${pair.a_name}", ${pair.pct_of_b}% of "${pair.b_name}"`;
+
+    // The column that decides whether any of this means anything.
+    const lift = tr.insertCell();
+    if (pair.lift === null || pair.lift === undefined) {
+      const badge = el("span", "badge text-bg-secondary", "too small");
+      badge.title =
+        "These cohorts are small enough that chance overlap is a fraction of " +
+        "a wallet — a ratio here would describe the universe guess, not them.";
+      lift.appendChild(badge);
+    } else {
+      const strong = pair.lift >= 2;
+      const badge = el(
+        "span",
+        "badge " + (strong ? "text-bg-success" : pair.lift < 1 ? "text-bg-secondary" : "text-bg-warning"),
+        `${pair.lift}×`,
+      );
+      badge.title =
+        `${pair.overlap} shared against ${pair.expected} expected by chance` +
+        (pair.lift < 1 ? " — rarer than coincidence, not a finding." : ".");
+      lift.appendChild(badge);
+    }
+
+    tr.insertCell().appendChild(el("span", "badge text-bg-light border", pair.chain));
+
+    const actions = tr.insertCell();
+    actions.className = "text-end";
+    const btn = el("button", "btn btn-outline-secondary btn-sm", "Wallets");
+    btn.type = "button";
+    btn.addEventListener("click", (event) => {
+      event.stopPropagation();
+      showSharedWallets(pair);
+    });
+    actions.appendChild(btn);
+  }
+}
+
+async function showSharedWallets(pair) {
+  setStatus("cohortStatus", "Loading shared wallets…", "");
+  try {
+    const data = await api(`/api/cohorts/overlap/${pair.a_id}/${pair.b_id}`);
+    $("sharedTitle").textContent =
+      `${data.count} wallets in both “${pair.a_name}” and “${pair.b_name}”`;
+    $("sharedBody").textContent = data.wallets.join("\n");
+    $("sharedCopy").onclick = () =>
+      navigator.clipboard.writeText(data.wallets.join("\n"));
+    bootstrap.Modal.getOrCreateInstance($("sharedModal")).show();
+    setStatus("cohortStatus", "", "");
+  } catch (error) {
+    setStatus("cohortStatus", error.message, "error");
+  }
+}
+
 /* ------------------------------------------------------- live accumulation */
 
 async function loadPoolSettings() {
@@ -1957,6 +2067,7 @@ function init() {
   $("rtSimulate").addEventListener("click", simulateSignal);
   $("rtRefreshDeliveries").addEventListener("click", loadDeliveries);
   $("refreshLive").addEventListener("click", loadLiveTokens);
+  $("refreshCohorts").addEventListener("click", loadCohortOverlap);
   $("liveSweep").addEventListener("click", runLiveSweep);
   $("liveIncludeAirdrops").addEventListener("change", loadLiveTokens);
   $("poolSave").addEventListener("click", savePoolSettings);
@@ -1978,6 +2089,7 @@ function init() {
     loadSignals();
     loadLiveTokens();
     loadPoolSettings();
+    loadCohortOverlap();
     updateRealtimeAvailability();
   });
   loadNotificationSettings();
