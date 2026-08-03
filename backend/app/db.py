@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS watchlists (
     ignore_tokens          TEXT    NOT NULL DEFAULT '[]',
     buy_detection          TEXT    NOT NULL DEFAULT 'both',
     realtime               INTEGER NOT NULL DEFAULT 0,
+    derived                INTEGER NOT NULL DEFAULT 0,
     created_at             TEXT    NOT NULL,
     last_run_at            TEXT,
     next_run_at            TEXT,
@@ -214,6 +215,10 @@ _MIGRATIONS = (
     # Existing rows predate the airdrop check, so they default to "not a buy":
     # they are exactly the one-way arrivals that made the board unusable.
     "ALTER TABLE wallet_events ADD COLUMN is_buy INTEGER NOT NULL DEFAULT 0",
+    # Derived cohorts are built *from* the others, so they must be excluded
+    # from overlap analysis: being a subset, they would score 100% against
+    # everything and crowd out every real finding.
+    "ALTER TABLE watchlists ADD COLUMN derived INTEGER NOT NULL DEFAULT 0",
 )
 
 
@@ -319,6 +324,7 @@ def create_watchlist(
     ignore_tokens: list[str],
     buy_detection: str = "both",
     realtime: bool = False,
+    derived: bool = False,
 ) -> int:
     now = utcnow_iso()
     with connect() as conn:
@@ -328,8 +334,8 @@ def create_watchlist(
                 name, chain, source_token_address, notes,
                 min_wallets, min_wallets_pct, buy_window_hours,
                 monitor_interval_hours, min_buy_usd, auto_monitor,
-                ignore_tokens, buy_detection, realtime, created_at, next_run_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ignore_tokens, buy_detection, realtime, derived, created_at, next_run_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 name,
@@ -345,6 +351,7 @@ def create_watchlist(
                 json.dumps(ignore_tokens),
                 buy_detection,
                 int(realtime),
+                int(derived),
                 now,
                 iso_plus_hours(now, monitor_interval_hours),
             ),
@@ -1280,6 +1287,7 @@ def cohort_overlaps() -> list[dict[str, Any]]:
             JOIN watchlists wa ON wa.id = a.watchlist_id
             JOIN watchlists wb ON wb.id = b.watchlist_id
             WHERE wa.chain = wb.chain
+              AND wa.derived = 0 AND wb.derived = 0
             GROUP BY 1, 2
             """
         ).fetchall()
@@ -1298,3 +1306,54 @@ def shared_wallets(a_id: int, b_id: int, limit: int = 500) -> list[str]:
             (a_id, b_id, limit),
         ).fetchall()
     return [row["wallet_address"] for row in rows]
+
+
+def repeat_wallets(chain: str, min_cohorts: int) -> list[dict[str, Any]]:
+    """Wallets that appear in at least ``min_cohorts`` real cohorts on a chain.
+
+    This is the payoff of collecting cohorts: a wallet that was early to one
+    token may have been lucky, and one that was early to four was probably
+    not. Derived cohorts are excluded from the count, or the set would
+    reinforce itself every time it is rebuilt.
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT ww.wallet_address, COUNT(DISTINCT w.id) AS cohorts
+            FROM watchlist_wallets ww
+            JOIN watchlists w ON w.id = ww.watchlist_id
+            WHERE w.chain = ? AND w.derived = 0
+            GROUP BY ww.wallet_address
+            HAVING cohorts >= ?
+            ORDER BY cohorts DESC, ww.wallet_address
+            """,
+            (chain, min_cohorts),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def find_derived(chain: str) -> dict[str, Any] | None:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM watchlists WHERE chain = ? AND derived = 1 "
+            "ORDER BY id LIMIT 1",
+            (chain,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def replace_wallets(watchlist_id: int, wallets: Iterable[str]) -> None:
+    """Swap a watchlist's membership wholesale, in one transaction.
+
+    Used to refresh a derived cohort: wallets that no longer qualify have to
+    leave, not just new ones arrive.
+    """
+    now = utcnow_iso()
+    with connect() as conn:
+        conn.execute(
+            "DELETE FROM watchlist_wallets WHERE watchlist_id = ?", (watchlist_id,)
+        )
+        conn.executemany(
+            "INSERT OR IGNORE INTO watchlist_wallets VALUES (?, ?, ?)",
+            [(watchlist_id, wallet, now) for wallet in wallets],
+        )

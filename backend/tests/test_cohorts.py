@@ -193,3 +193,104 @@ def test_deleting_a_cohort_removes_it_from_the_matrix(client):
     client.delete(f"/api/watchlists/{a}")
 
     assert client.get("/api/cohorts/overlap").json()["pairs"] == []
+
+
+# --------------------------------------------------------- derived cohorts
+
+
+def test_repeat_wallets_become_their_own_cohort_automatically(client):
+    """The payoff loop, without the copy-paste.
+
+    A wallet early to one token may have been lucky. One early to three
+    probably was not — and that set is the watchlist worth monitoring.
+    """
+    shared = _wallets(1, 10)
+    _cohort(client, "token A buyers", shared + _wallets(100, 50))
+    _cohort(client, "token B buyers", shared + _wallets(200, 50))
+    _cohort(client, "token C buyers", shared + _wallets(300, 50))
+
+    derived = [w for w in client.get("/api/watchlists").json() if w["derived"]]
+
+    assert len(derived) == 1
+    assert derived[0]["wallet_count"] == 10      # exactly the repeats
+    assert "≥3 cohorts" in derived[0]["name"]
+
+    members = client.get(
+        f"/api/watchlists/{derived[0]['id']}/wallets"
+    ).json()["wallets"]
+    assert set(members) == set(shared)
+
+
+def test_a_derived_cohort_is_kept_out_of_the_overlap_matrix(client):
+    """Otherwise it scores 100% against every cohort it was built from.
+
+    A subset overlaps its own sources perfectly, so leaving it in would put
+    meaningless pairs at the top of a table ranked by containment.
+    """
+    shared = _wallets(1, 10)
+    for name, extra in (("A", 100), ("B", 200), ("C", 300)):
+        _cohort(client, name, shared + _wallets(extra, 50))
+
+    pairs = client.get("/api/cohorts/overlap").json()["pairs"]
+
+    assert pairs, "the real cohorts still overlap each other"
+    named = {p["a_name"] for p in pairs} | {p["b_name"] for p in pairs}
+    assert not any("Repeat wallets" in n for n in named)
+
+
+def test_the_derived_cohort_shrinks_when_a_source_is_deleted(client):
+    shared = _wallets(1, 10)
+    a = _cohort(client, "A", shared + _wallets(100, 50))
+    _cohort(client, "B", shared + _wallets(200, 50))
+    _cohort(client, "C", shared + _wallets(300, 50))
+    assert [w for w in client.get("/api/watchlists").json() if w["derived"]][0][
+        "wallet_count"
+    ] == 10
+
+    client.delete(f"/api/watchlists/{a}")
+
+    # Only two cohorts remain, so nothing reaches three any more. Membership
+    # is replaced, not merged, so the stale wallets have to go.
+    derived = [w for w in client.get("/api/watchlists").json() if w["derived"]][0]
+    assert derived["wallet_count"] == 0
+
+
+def test_the_threshold_is_adjustable(client):
+    shared = _wallets(1, 10)
+    _cohort(client, "A", shared + _wallets(100, 50))
+    _cohort(client, "B", shared + _wallets(200, 50))
+
+    # At the default of three, two cohorts cannot produce a repeat.
+    assert not [w for w in client.get("/api/watchlists").json() if w["derived"]]
+
+    body = client.post("/api/cohorts/derive", json={"min_cohorts": 2}).json()
+
+    assert body["min_cohorts"] == 2
+    assert body["derived"][0]["wallets"] == 10
+
+
+def test_the_threshold_rejects_one(client):
+    # Appearing in a single cohort is not a repeat, and allowing it would
+    # duplicate every cohort into the derived set.
+    assert (
+        client.post("/api/cohorts/derive", json={"min_cohorts": 1}).status_code
+        == 422
+    )
+
+
+def test_derived_cohorts_do_not_feed_themselves(client):
+    """A derived cohort must not count towards its own threshold.
+
+    Its wallets are in it by construction, so counting it would let a wallet
+    in two real cohorts qualify at three and never leave again.
+    """
+    shared = _wallets(1, 10)
+    for name, extra in (("A", 100), ("B", 200), ("C", 300)):
+        _cohort(client, name, shared + _wallets(extra, 50))
+
+    # Rebuild repeatedly; the set must be stable rather than growing.
+    first = client.post("/api/cohorts/derive", json={}).json()["derived"][0]
+    second = client.post("/api/cohorts/derive", json={}).json()["derived"][0]
+
+    assert first["wallets"] == second["wallets"] == 10
+    assert first["watchlist_id"] == second["watchlist_id"]

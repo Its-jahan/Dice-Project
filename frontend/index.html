@@ -331,6 +331,12 @@
           <label class="form-label small mb-0" for="cohortUniverse">Universe</label>
           <input id="cohortUniverse" type="number" min="1000" step="1000"
                  class="form-control form-control-sm" style="width:9rem">
+          <label class="form-label small mb-0" for="derivedMinCohorts">Repeat in</label>
+          <input id="derivedMinCohorts" type="number" min="2" step="1"
+                 class="form-control form-control-sm" style="width:5rem">
+          <button type="button" id="deriveCohorts" class="btn btn-primary btn-sm">
+            Rebuild repeats
+          </button>
           <button type="button" id="refreshCohorts" class="btn btn-outline-secondary btn-sm">
             Recompute
           </button>

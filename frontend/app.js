@@ -147,6 +147,11 @@ const FIELD_HELP = {
     "An address to identify. Uses the chain selected in the holder query " +
     "above. The raw response is shown too, since Arkham's shapes are not " +
     "published.",
+  derivedMinCohorts:
+    "How many separate cohorts a wallet must appear in before it counts as a " +
+    "repeat. Two is the loosest setting that means anything; three is where " +
+    "coincidence stops being a comfortable explanation. The resulting " +
+    "watchlist rebuilds itself whenever you add or remove a cohort.",
   cohortUniverse:
     "How many wallets could plausibly have joined either cohort. This is a " +
     "modelling choice, not a measurement: raise it and every overlap looks " +
@@ -1124,6 +1129,29 @@ async function deleteWatchlist(wl) {
 
 /* --------------------------------------------------------- cohort overlap */
 
+async function rebuildRepeats() {
+  await withBusy($("deriveCohorts"), async () => {
+    setStatus("cohortStatus", "Rebuilding the repeat-wallet cohorts…", "");
+    try {
+      const body = { min_cohorts: Number($("derivedMinCohorts").value) || 3 };
+      const data = await api("/api/cohorts/derive", { method: "POST", body });
+      const total = data.derived.reduce((sum, d) => sum + d.wallets, 0);
+      setStatus(
+        "cohortStatus",
+        total
+          ? `${total} wallet(s) appear in ${data.min_cohorts}+ cohorts — saved as a ` +
+            "watchlist. Switch Live on for it."
+          : `No wallet appears in ${data.min_cohorts} cohorts yet. Add more, or ` +
+            "lower the threshold.",
+        total ? "ok" : "",
+      );
+      await Promise.all([loadWatchlists(), loadCohortOverlap()]);
+    } catch (error) {
+      setStatus("cohortStatus", error.message, "error");
+    }
+  });
+}
+
 async function loadCohortOverlap() {
   try {
     const universe = Number($("cohortUniverse").value) || 1000000;
@@ -2068,6 +2096,7 @@ function init() {
   $("rtRefreshDeliveries").addEventListener("click", loadDeliveries);
   $("refreshLive").addEventListener("click", loadLiveTokens);
   $("refreshCohorts").addEventListener("click", loadCohortOverlap);
+  $("deriveCohorts").addEventListener("click", rebuildRepeats);
   $("liveSweep").addEventListener("click", runLiveSweep);
   $("liveIncludeAirdrops").addEventListener("change", loadLiveTokens);
   $("poolSave").addEventListener("click", savePoolSettings);

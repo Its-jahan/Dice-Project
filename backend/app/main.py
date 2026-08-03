@@ -1067,6 +1067,47 @@ async def cohort_overlap(
     return cohorts.overlap_matrix(universe=universe, min_overlap=min_overlap)
 
 
+@app.post("/api/cohorts/derive")
+async def derive_cohorts(body: Annotated[dict, Body()] = None) -> dict[str, object]:
+    """Rebuild the repeat-wallet cohorts from every real cohort.
+
+    Runs automatically whenever cohorts change; this is the manual trigger and
+    the place to change the threshold.
+    """
+    body = body or {}
+    threshold = body.get("min_cohorts")
+    if threshold is not None:
+        try:
+            threshold = int(threshold)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=422, detail="min_cohorts must be a whole number."
+            )
+        if threshold < 2:
+            raise HTTPException(
+                status_code=422,
+                detail="min_cohorts must be at least 2 — appearing in one "
+                "cohort is not a repeat.",
+            )
+        db.set_setting("derived_min_cohorts", str(threshold))
+    return {
+        "min_cohorts": cohorts.min_cohorts(),
+        "derived": cohorts.refresh_all_derived(threshold),
+    }
+
+
+def _refresh_derived_quietly() -> None:
+    """Keep the repeat-wallet cohorts current after any change to the inputs.
+
+    Deliberately swallows failures: adding a watchlist must not fail because a
+    derived one could not be rebuilt.
+    """
+    try:
+        cohorts.refresh_all_derived()
+    except Exception:  # pragma: no cover - defensive
+        log.exception("automatic derived cohort refresh failed")
+
+
 @app.get("/api/cohorts/overlap/{a_id}/{b_id}")
 async def cohort_shared_wallets(
     a_id: int, b_id: int, limit: Annotated[int, Query(ge=1, le=2000)] = 500
@@ -1284,6 +1325,7 @@ def _watchlist_out(row: dict) -> WatchlistOut:
         ignore_tokens=json.loads(row.get("ignore_tokens") or "[]"),
         buy_detection=row.get("buy_detection") or "both",
         realtime=bool(row.get("realtime")),
+        derived=bool(row.get("derived")),
         created_at=row["created_at"],
         last_run_at=row.get("last_run_at"),
         last_run_status=row.get("last_run_status"),
@@ -1346,6 +1388,8 @@ async def create_watchlist(req: Annotated[WatchlistCreate, Body()]) -> Watchlist
         # Register the wallets with Alchemy now; a failure here must not lose
         # the watchlist, so it is reported through last_sync rather than raised.
         await _try_sync(req.chain)
+    # A new cohort can promote wallets into the repeat set, so rebuild it.
+    _refresh_derived_quietly()
     return _watchlist_out(_overview_or_404(watchlist_id))
 
 
@@ -1494,6 +1538,8 @@ async def delete_watchlist(watchlist_id: int) -> Response:
     if was_live and chain is not None:
         # Stop paying Alchemy attention to wallets nothing watches any more.
         await _try_sync(chain)
+    # Losing a cohort can demote wallets out of the repeat set.
+    _refresh_derived_quietly()
     # The reusable Dune query slot for this watchlist is meaningless now.
     db.drop_purpose_slots(f"monitor:{watchlist_id}")
     db.drop_purpose_slots(f"positions:{watchlist_id}")

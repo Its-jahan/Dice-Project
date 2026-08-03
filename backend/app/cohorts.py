@@ -28,9 +28,12 @@ returned instead:
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from . import db
+
+log = logging.getLogger(__name__)
 
 #: Wallets that could plausibly have joined either cohort. A modelling choice,
 #: not a measurement: raise it and every overlap looks more surprising, lower
@@ -110,4 +113,103 @@ def overlap_matrix(
     }
 
 
-__all__ = ["DEFAULT_UNIVERSE", "overlap_matrix", "score_pair"]
+# --------------------------------------------------------- derived cohorts
+
+#: How many cohorts a wallet must appear in before it counts as a repeat.
+#: Two is the loosest setting that means anything; three is where coincidence
+#: stops being a comfortable explanation.
+DEFAULT_MIN_COHORTS = 3
+
+DERIVED_NAME = "Repeat wallets (auto)"
+
+
+def min_cohorts() -> int:
+    stored = db.get_setting("derived_min_cohorts")
+    try:
+        return max(2, int(stored)) if stored is not None else DEFAULT_MIN_COHORTS
+    except ValueError:
+        return DEFAULT_MIN_COHORTS
+
+
+def refresh_derived(chain: str, *, threshold: int | None = None) -> dict[str, Any]:
+    """Rebuild the chain's repeat-wallet cohort from every real cohort.
+
+    The manual version of this was: read the overlap table, open a promising
+    pair, copy the shared wallets, make a watchlist. That only ever compares
+    two cohorts at a time and goes stale the moment another is added. This
+    generalises it — appearing in three cohorts is a stronger claim than
+    appearing in one particular pair — and re-runs whenever the inputs change.
+
+    Membership is replaced rather than merged: a wallet that no longer meets
+    the threshold, because a cohort was deleted, has to leave.
+    """
+    threshold = threshold or min_cohorts()
+    repeats = db.repeat_wallets(chain, threshold)
+    wallets = [row["wallet_address"] for row in repeats]
+
+    existing = db.find_derived(chain)
+    name = f"{DERIVED_NAME} ≥{threshold} cohorts"
+    notes = (
+        f"Rebuilt automatically from every {chain} cohort: wallets appearing "
+        f"in at least {threshold} of them. Excluded from overlap analysis, "
+        "since a subset would score 100% against its own sources."
+    )
+
+    if existing is None:
+        if not wallets:
+            return {"chain": chain, "wallets": 0, "watchlist_id": None,
+                    "threshold": threshold, "created": False}
+        watchlist_id = db.create_watchlist(
+            name=name,
+            chain=chain,
+            wallets=wallets,
+            source_token_address=None,
+            notes=notes,
+            min_wallets=3,
+            min_wallets_pct=10.0,
+            buy_window_hours=48,
+            monitor_interval_hours=24.0,
+            min_buy_usd=0.0,
+            # Kept out of the Dune scheduler: this cohort changes whenever its
+            # inputs do, and paying for a scheduled query on a moving set is
+            # not what it is for. The live path picks it up if switched on.
+            auto_monitor=False,
+            ignore_tokens=[],
+            derived=True,
+        )
+        created = True
+    else:
+        watchlist_id = int(existing["id"])
+        db.replace_wallets(watchlist_id, wallets)
+        db.update_watchlist_fields(watchlist_id, {"name": name, "notes": notes})
+        created = False
+
+    return {
+        "chain": chain,
+        "watchlist_id": watchlist_id,
+        "wallets": len(wallets),
+        "threshold": threshold,
+        "created": created,
+        "top": repeats[:10],
+    }
+
+
+def refresh_all_derived(threshold: int | None = None) -> list[dict[str, Any]]:
+    """Refresh every chain that has real cohorts."""
+    results = []
+    for chain in sorted({c["chain"] for c in db.cohort_sizes().values()}):
+        try:
+            results.append(refresh_derived(chain, threshold=threshold))
+        except Exception:  # pragma: no cover - defensive
+            log.exception("derived cohort refresh failed for %s", chain)
+    return results
+
+
+__all__ = [
+    "DEFAULT_UNIVERSE",
+    "min_cohorts",
+    "overlap_matrix",
+    "refresh_all_derived",
+    "refresh_derived",
+    "score_pair",
+]

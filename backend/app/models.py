@@ -370,6 +370,9 @@ class WatchlistOut(BaseModel):
     ignore_tokens: list[str]
     buy_detection: BuyDetection
     realtime: bool
+    #: built automatically from the other cohorts, and excluded from overlap
+    #: analysis because a subset scores 100% against its own sources
+    derived: bool = False
     created_at: str
     last_run_at: str | None
     last_run_status: str | None
