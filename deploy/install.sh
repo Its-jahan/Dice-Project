@@ -220,7 +220,13 @@ if [[ -f "$HTPASSWD" ]]; then
     # while the first line was live — which nginx accepted and served without
     # asking for anything. A gate that fails open is worse than no gate.
     sed -i 's|^    # auth_basic|    auth_basic|' /etc/nginx/snippets/dice-proxy.conf
-    if [[ "$(grep -c '^    auth_basic' /etc/nginx/snippets/dice-proxy.conf)" != "2" ]]; then
+    # Assert on what must be true rather than on a line count: the webhook
+    # block carries its own `auth_basic off`, so counting every auth_basic
+    # line says 3 and means nothing. What matters is that no commented one
+    # survived and the user file is actually named.
+    if grep -q '# auth_basic' /etc/nginx/snippets/dice-proxy.conf \
+       || ! grep -q "^    auth_basic_user_file $HTPASSWD;" \
+              /etc/nginx/snippets/dice-proxy.conf; then
         echo "Could not enable the password gate — the snippet did not match." >&2
         exit 1
     fi
