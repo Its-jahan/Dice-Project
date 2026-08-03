@@ -417,6 +417,15 @@
               </label>
             </div>
           </div>
+          <div class="col-md-3">
+            <label class="form-label small mb-1 d-block">Contract screening</label>
+            <div class="form-check form-switch">
+              <input class="form-check-input" type="checkbox" id="riskScreening">
+              <label class="form-check-label small" for="riskScreening">
+                block honeypots
+              </label>
+            </div>
+          </div>
           <div class="col-md-2">
             <label class="form-label small mb-1" for="liveMaxPoolAge">
               Max pool age (h)
@@ -454,6 +463,34 @@
           </table>
         </div>
         <div id="liveStatus" class="small mt-2" role="status" aria-live="polite"></div>
+      </div>
+    </section>
+
+    <!-- ================================================== exits -->
+    <section class="card shadow-sm" aria-labelledby="exitHeading">
+      <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
+        <h2 id="exitHeading" class="h6 mb-0">Live distribution (what they are selling)</h2>
+        <button type="button" id="refreshExits" class="btn btn-outline-secondary btn-sm">
+          Refresh
+        </button>
+      </div>
+      <div class="card-body">
+        <p class="small text-body-secondary">
+          Everything else here watches money going <em>in</em>. This is the same
+          evidence read the other way — and for a token you are already holding on
+          a signal, it is the more urgent half. A sale means the token left the
+          wallet <strong>and something came back in the same transaction</strong>;
+          a one-way transfer is somebody funding another wallet, not an exit.
+        </p>
+        <p id="exitEmpty" class="small text-body-secondary mb-0">
+          Nothing sold by any live watchlist's wallets in the current window.
+        </p>
+        <div class="table-responsive">
+          <table id="exitTable" class="table table-sm table-hover align-middle d-none mb-0">
+            <thead></thead><tbody></tbody>
+          </table>
+        </div>
+        <div id="exitStatus" class="small mt-2" role="status" aria-live="polite"></div>
       </div>
     </section>
 

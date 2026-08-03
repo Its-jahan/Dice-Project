@@ -122,6 +122,11 @@ CREATE TABLE IF NOT EXISTS wallet_events (
     -- 1 when the wallet also sent value out in the same transaction, i.e. it
     -- paid for the token. 0 for a one-way arrival: an airdrop.
     is_buy         INTEGER NOT NULL DEFAULT 0,
+    -- 1 when the token *left* this wallet and something else came back in the
+    -- same transaction — a sale rather than a transfer. Both flags can be set
+    -- on one row: a router can move a token through a wallet in both
+    -- directions inside a single transaction.
+    is_sell        INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (chain, wallet_address, token_address, tx_hash)
 );
 
@@ -149,6 +154,18 @@ CREATE INDEX IF NOT EXISTS idx_deliveries_recent
 
 -- Cached DexScreener answers. has_pair = 0 means the token has no liquidity
 -- pool anywhere, so it cannot have been bought and must not signal.
+CREATE TABLE IF NOT EXISTS token_risk (
+    chain           TEXT    NOT NULL,
+    token_address   TEXT    NOT NULL,
+    -- The verdict is a nested shape (lists of blockers and warnings), so it
+    -- is stored whole rather than spread over columns that would need a
+    -- migration every time the risk API grows a field.
+    verdict         TEXT    NOT NULL,
+    blocked         INTEGER NOT NULL DEFAULT 0,
+    checked_at      TEXT    NOT NULL,
+    PRIMARY KEY (chain, token_address)
+);
+
 CREATE TABLE IF NOT EXISTS token_market (
     chain           TEXT    NOT NULL,
     token_address   TEXT    NOT NULL,
@@ -244,6 +261,7 @@ _MIGRATIONS = (
     # Existing rows predate the airdrop check, so they default to "not a buy":
     # they are exactly the one-way arrivals that made the board unusable.
     "ALTER TABLE wallet_events ADD COLUMN is_buy INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE wallet_events ADD COLUMN is_sell INTEGER NOT NULL DEFAULT 0",
     # Derived cohorts are built *from* the others, so they must be excluded
     # from overlap analysis: being a subset, they would score 100% against
     # everything and crowd out every real finding.
@@ -1014,10 +1032,14 @@ def realtime_chains() -> list[str]:
 
 
 def record_events(events: Iterable[dict[str, Any]]) -> int:
-    """Store token arrivals, ignoring ones already seen. Returns rows inserted.
+    """Store token movements, ignoring ones already seen. Returns rows written.
 
     A webhook can be redelivered — Alchemy retries on a non-2xx — so the
     primary key makes replays free rather than double-counting a buyer.
+
+    The flags are OR-ed rather than overwritten. One transaction can carry the
+    same token into and out of a wallet, and a plain INSERT OR IGNORE would
+    keep whichever arrived first and silently lose the other half.
     """
     rows = [
         (
@@ -1031,6 +1053,7 @@ def record_events(events: Iterable[dict[str, Any]]) -> int:
             event.get("seen_at") or utcnow_iso(),
             event.get("from_address"),
             int(bool(event.get("is_buy"))),
+            int(bool(event.get("is_sell"))),
         )
         for event in events
     ]
@@ -1039,8 +1062,20 @@ def record_events(events: Iterable[dict[str, Any]]) -> int:
     with connect() as conn:
         before = conn.total_changes
         conn.executemany(
-            "INSERT OR IGNORE INTO wallet_events "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            """
+            INSERT INTO wallet_events (
+                chain, wallet_address, token_address, tx_hash, token_symbol,
+                amount, block_num, seen_at, from_address, is_buy, is_sell
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (chain, wallet_address, token_address, tx_hash)
+            DO UPDATE SET
+                is_buy  = MAX(is_buy,  excluded.is_buy),
+                is_sell = MAX(is_sell, excluded.is_sell)
+            -- Only when a flag actually gains something. Without this, a
+            -- redelivery of an identical payload would rewrite every row and
+            -- report them all as newly stored.
+            WHERE excluded.is_buy > is_buy OR excluded.is_sell > is_sell
+            """,
             rows,
         )
         return conn.total_changes - before
@@ -1537,3 +1572,172 @@ def wallet_cohort_counts(chain: str) -> dict[str, int]:
             (chain,),
         ).fetchall()
     return {row["wallet_address"]: int(row["cohorts"]) for row in rows}
+
+def get_token_risks(
+    *, chain: str, addresses: Iterable[str], fresh_after: str
+) -> dict[str, dict[str, Any]]:
+    """Cached risk verdicts, dropping entries older than the TTL.
+
+    The risk API answers one token per request, so without this cache a busy
+    board would exhaust its rate limit within a minute.
+    """
+    wanted = list(addresses)
+    if not wanted:
+        return {}
+    placeholders = ", ".join("?" for _ in wanted)
+    with connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT token_address, verdict FROM token_risk
+            WHERE chain = ? AND checked_at >= ?
+              AND token_address IN ({placeholders})
+            """,
+            (chain, fresh_after, *wanted),
+        ).fetchall()
+    out: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        try:
+            out[row["token_address"]] = json.loads(row["verdict"])
+        except (TypeError, ValueError):  # pragma: no cover - corrupt row
+            continue
+    return out
+
+
+def get_token_risk(*, chain: str, token_address: str) -> dict[str, Any] | None:
+    """The stored verdict for one token, however old.
+
+    Used where a slightly stale warning beats a silent one — a signal
+    notification must carry whatever is known, and the gate has usually just
+    refreshed it on the same pass.
+    """
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT verdict FROM token_risk WHERE chain = ? AND token_address = ?",
+            (chain, token_address.lower()),
+        ).fetchone()
+    if row is None:
+        return None
+    try:
+        return json.loads(row["verdict"])
+    except (TypeError, ValueError):  # pragma: no cover - corrupt row
+        return None
+
+
+def save_token_risk(*, chain: str, token_address: str, verdict: dict[str, Any]) -> None:
+    """Store a verdict. Unchecked ones are stored too, but with no TTL value.
+
+    An unchecked verdict is cached deliberately *briefly* by the caller rather
+    than not at all: a chain the API does not cover should not be re-asked on
+    every sweep, but an outage should not be remembered for hours either.
+    """
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO token_risk (chain, token_address, verdict, blocked, checked_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (chain, token_address) DO UPDATE SET
+                verdict = excluded.verdict,
+                blocked = excluded.blocked,
+                checked_at = excluded.checked_at
+            """,
+            (
+                chain,
+                token_address.lower(),
+                json.dumps(verdict),
+                1 if verdict.get("blocked") else 0,
+                utcnow_iso(),
+            ),
+        )
+
+def token_exits(
+    *, chain: str, token_address: str, wallets: Iterable[str], since_iso: str
+) -> dict[str, Any]:
+    """How many of the watched wallets have sold this token, and when.
+
+    The counterpart to the buy count a signal is built from. A signal says ten
+    wallets bought; this says three of them have since sold — which is the
+    difference between a position being built and one being distributed, and
+    the buy count alone cannot tell them apart.
+    """
+    wallet_list = list(wallets)
+    if not wallet_list:
+        return {"sellers": 0, "last_sell_at": None, "wallets": []}
+    placeholders = ", ".join("?" for _ in wallet_list)
+    with connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT wallet_address, MAX(seen_at) AS last_sell_at
+            FROM wallet_events
+            WHERE chain = ? AND token_address = ? AND is_sell = 1
+              AND seen_at >= ?
+              AND wallet_address IN ({placeholders})
+            GROUP BY wallet_address
+            ORDER BY last_sell_at DESC
+            """,
+            (chain, token_address.lower(), since_iso, *wallet_list),
+        ).fetchall()
+    return {
+        "sellers": len(rows),
+        "last_sell_at": rows[0]["last_sell_at"] if rows else None,
+        "wallets": [dict(row) for row in rows],
+    }
+
+
+def exit_counts(
+    *, chain: str, tokens: Iterable[str], wallets: Iterable[str], since_iso: str
+) -> dict[str, int]:
+    """Seller counts for many tokens at once, for the board."""
+    token_list = [token.lower() for token in tokens]
+    wallet_list = list(wallets)
+    if not token_list or not wallet_list:
+        return {}
+    token_marks = ", ".join("?" for _ in token_list)
+    wallet_marks = ", ".join("?" for _ in wallet_list)
+    with connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT token_address, COUNT(DISTINCT wallet_address) AS sellers
+            FROM wallet_events
+            WHERE chain = ? AND is_sell = 1 AND seen_at >= ?
+              AND token_address IN ({token_marks})
+              AND wallet_address IN ({wallet_marks})
+            GROUP BY token_address
+            """,
+            (chain, since_iso, *token_list, *wallet_list),
+        ).fetchall()
+    return {row["token_address"]: int(row["sellers"]) for row in rows}
+
+
+def distribution_board(
+    *, chain: str, wallets: Iterable[str], since_iso: str, limit: int = 50
+) -> list[dict[str, Any]]:
+    """What the watched wallets are selling — the mirror of the buy board.
+
+    Worth its own view rather than a column: the wallets leaving a token they
+    were early to is a signal in its own right, and it is one the buy-side
+    board can never show because nothing is being bought.
+    """
+    wallet_list = list(wallets)
+    if not wallet_list:
+        return []
+    placeholders = ", ".join("?" for _ in wallet_list)
+    with connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT token_address,
+                   MAX(token_symbol) AS token_symbol,
+                   COUNT(DISTINCT wallet_address) AS wallet_count,
+                   COUNT(*) AS sell_count,
+                   MIN(seen_at) AS first_sell_at,
+                   MAX(seen_at) AS last_sell_at
+            FROM wallet_events
+            WHERE chain = ? AND is_sell = 1 AND seen_at >= ?
+              AND wallet_address IN ({placeholders})
+            GROUP BY token_address
+            ORDER BY wallet_count DESC, last_sell_at DESC
+            LIMIT ?
+            """,
+            (chain, since_iso, *wallet_list, limit),
+        ).fetchall()
+    return [dict(row) for row in rows]
+

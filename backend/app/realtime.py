@@ -32,7 +32,7 @@ import math
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
-from . import db, dexscreener, performance
+from . import db, dexscreener, performance, security
 from .config import settings
 from .models import Chain, SignalOut
 from .monitor import effective_min_wallets, send_signal_notification, signal_to_out
@@ -87,13 +87,23 @@ def parse_activity(
     # category counts here — a swap may be paid in native ETH ("external"),
     # in WETH or in a stablecoin ("erc20").
     paid: set[tuple[str, str]] = set()
+    # ...and the mirror: what each wallet *received* in the transaction, keyed
+    # by asset. A sale is a token leaving while something other than that same
+    # token comes back; without the "other than" the token's own arrival would
+    # make every buy look like a sale too.
+    received: dict[tuple[str, str], set[str]] = {}
     for item in activities:
         if item.get("removed"):
             continue
-        sender = str(item.get("fromAddress") or "").strip().lower()
         sender_tx = str(item.get("hash") or "").strip().lower()
-        if sender and sender_tx and sender in watched:
+        if not sender_tx:
+            continue
+        sender = str(item.get("fromAddress") or "").strip().lower()
+        if sender and sender in watched:
             paid.add((sender_tx, sender))
+        recipient = str(item.get("toAddress") or "").strip().lower()
+        if recipient and recipient in watched:
+            received.setdefault((sender_tx, recipient), set()).add(_asset_key(item))
 
     events: list[dict[str, Any]] = []
     for item in activities:
@@ -106,11 +116,13 @@ def parse_activity(
 
         to_address = str(item.get("toAddress") or "").strip().lower()
         from_address = str(item.get("fromAddress") or "").strip().lower()
-        if to_address not in watched:
-            continue  # the watched party is the sender, not the receiver
-        if from_address in watched:
+        inbound = to_address in watched
+        outbound = from_address in watched
+        if not inbound and not outbound:
+            continue
+        if inbound and outbound:
             # Shuffling a token between wallets of the same list is one
-            # position, not two buyers.
+            # position moving, not a buyer and not a seller.
             continue
 
         contract = item.get("rawContract") or {}
@@ -122,11 +134,16 @@ def parse_activity(
         if not tx_hash:
             continue
 
+        wallet = to_address if inbound else from_address
         symbol = item.get("asset")
+        # A token leaving is only a *sale* when something else came back. A
+        # one-way departure is a transfer — funding another wallet, paying
+        # someone — and calling it an exit would misread the position.
+        got_back = received.get((tx_hash, wallet), set()) - {token_address}
         events.append(
             {
                 "chain": chain.value,
-                "wallet_address": to_address,
+                "wallet_address": wallet,
                 "token_address": token_address,
                 "tx_hash": tx_hash,
                 "token_symbol": str(symbol).strip() if symbol else None,
@@ -134,10 +151,18 @@ def parse_activity(
                 "block_num": _to_int(item.get("blockNum")),
                 "seen_at": seen_at,
                 "from_address": from_address or None,
-                "is_buy": (tx_hash, to_address) in paid,
+                "is_buy": inbound and (tx_hash, wallet) in paid,
+                "is_sell": outbound and bool(got_back),
             }
         )
     return events
+
+
+def _asset_key(item: dict[str, Any]) -> str:
+    """What was moved: the token contract, or "native" for plain ETH."""
+    contract = item.get("rawContract") or {}
+    address = str(contract.get("address") or "").strip().lower()
+    return address or "native"
 
 
 def _to_float(value: Any) -> float | None:
@@ -248,6 +273,13 @@ def signal_airdrops() -> bool:
     stored = db.get_setting("signal_airdrops")
     if stored is None:
         return settings.signal_airdrops
+    return stored.strip().lower() in ("1", "true", "yes", "on")
+
+
+def risk_screening() -> bool:
+    stored = db.get_setting("risk_screening")
+    if stored is None:
+        return settings.risk_screening
     return stored.strip().lower() in ("1", "true", "yes", "on")
 
 
@@ -448,12 +480,40 @@ async def tradeable(chain: Chain, tokens: Iterable[str]) -> dict[str, dict[str, 
     except Exception:  # pragma: no cover - defensive
         log.exception("market lookup failed for %s", chain.value)
         return {}
-    return {
+    tradeable_now = {
         address: market
         for address, market in markets.items()
         if market.get("has_pair")
         and (market.get("liquidity_usd") or 0.0) >= settings.min_liquidity_usd
     }
+    if not tradeable_now or not risk_screening():
+        return tradeable_now
+
+    # Having a pool means the token *can* be traded by the market. It does not
+    # mean this wallet can sell: a honeypot has a healthy-looking pool and a
+    # contract that refuses the sell. That is the one verdict worth dropping a
+    # signal over, so it is applied here alongside the liquidity gate.
+    try:
+        verdicts = await security.screen(chain, tradeable_now)
+    except Exception:  # pragma: no cover - never let screening break signals
+        log.exception("risk screening failed for %s", chain.value)
+        return tradeable_now
+
+    kept: dict[str, dict[str, Any]] = {}
+    for address, market in tradeable_now.items():
+        verdict = verdicts.get(address) or security.unchecked("not screened")
+        if verdict.get("blocked"):
+            log.info(
+                "dropped %s on %s: %s",
+                address[:12],
+                chain.value,
+                "; ".join(verdict.get("blockers") or []),
+            )
+            continue
+        # Warnings ride along with the market data so the signal, the board and
+        # the Telegram message all show the same reasons.
+        kept[address] = {**market, "risk": verdict}
+    return kept
 
 
 def check_token(
@@ -714,9 +774,42 @@ async def accumulation_board(
         for address, market in found.items():
             markets[(chain_value, address)] = market
 
+    # Screen whatever survived the pool gate, so the board shows the same
+    # warnings the signal would carry — and shows outright blocked tokens as
+    # blocked rather than hiding them, which would look like a missing row.
+    risks: dict[tuple[str, str], dict[str, Any]] = {}
+    if risk_screening():
+        for chain_value, tokens in by_chain.items():
+            present = [t for t in tokens if (chain_value, t) in markets]
+            if not present:
+                continue
+            try:
+                found = await security.screen(Chain(chain_value), present)
+            except Exception:  # pragma: no cover - defensive
+                log.exception("risk screening failed for %s", chain_value)
+                continue
+            for address, verdict in found.items():
+                risks[(chain_value, address)] = verdict
+
+    # Who has already left. A token twelve wallets bought and five have since
+    # sold is a different proposition from one nobody has exited, and the buy
+    # count alone cannot tell them apart.
+    exits: dict[tuple[str, str], int] = {}
+    for chain_value, tokens in by_chain.items():
+        counts = db.exit_counts(
+            chain=chain_value,
+            tokens=tokens,
+            wallets=db.realtime_wallets(chain_value),
+            since_iso=since,
+        )
+        for address, sellers in counts.items():
+            exits[(chain_value, address)] = sellers
+
     annotated: list[dict[str, Any]] = []
     for row in rows:
         market = markets.get((row["chain"], row["token_address"])) or {}
+        row["risk"] = risks.get((row["chain"], row["token_address"]))
+        row["sellers"] = exits.get((row["chain"], row["token_address"]), 0)
         row["has_pair"] = bool(market.get("has_pair"))
         row["price_usd"] = market.get("price_usd")
         row["liquidity_usd"] = market.get("liquidity_usd")
@@ -751,6 +844,56 @@ async def accumulation_board(
     return annotated[:limit]
 
 
+async def distribution_board(*, limit: int = 50) -> list[dict[str, Any]]:
+    """What the watched wallets are selling right now.
+
+    The system has only ever watched money going in. Watching it come out is
+    the same evidence read the other way — and for a token you already hold on
+    a signal, it is the more urgent half.
+    """
+    rows: list[dict[str, Any]] = []
+    window_hours = pool_window_hours()
+    since = _iso(_utcnow() - timedelta(hours=window_hours))
+
+    for chain_value in db.realtime_chains():
+        wallets = db.realtime_wallets(chain_value)
+        if not wallets:
+            continue
+        pool = len(wallets)
+        for row in db.distribution_board(
+            chain=chain_value, wallets=wallets, since_iso=since, limit=limit
+        ):
+            rows.append(
+                {
+                    **row,
+                    "chain": chain_value,
+                    "pool_size": pool,
+                    "window_hours": window_hours,
+                }
+            )
+
+    by_chain: dict[str, set[str]] = {}
+    for row in rows:
+        by_chain.setdefault(row["chain"], set()).add(row["token_address"])
+    for chain_value, tokens in by_chain.items():
+        try:
+            markets = await dexscreener.market_data(Chain(chain_value), tokens)
+        except Exception:  # pragma: no cover - defensive
+            log.exception("market lookup failed for %s", chain_value)
+            markets = {}
+        for row in rows:
+            if row["chain"] != chain_value:
+                continue
+            market = markets.get(row["token_address"]) or {}
+            row["token_symbol"] = market.get("symbol") or row["token_symbol"]
+            row["price_usd"] = market.get("price_usd")
+            row["liquidity_usd"] = market.get("liquidity_usd")
+            row["pair_url"] = market.get("pair_url")
+
+    rows.sort(key=lambda row: (-row["wallet_count"], row["last_sell_at"] or ""))
+    return rows[:limit]
+
+
 def _json_list(raw: Any) -> Iterable[str]:
     import json
 
@@ -763,6 +906,7 @@ def _json_list(raw: Any) -> Iterable[str]:
 
 __all__ = [
     "accumulation_board",
+    "distribution_board",
     "check_token",
     "evaluate_token",
     "ingest",

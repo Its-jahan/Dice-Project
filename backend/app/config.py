@@ -127,6 +127,12 @@ class Settings:
     signal_airdrops: bool = field(
         default_factory=lambda: _env_bool("DICE_SIGNAL_AIRDROPS", True)
     )
+    # Screen the contract before a signal goes out. Only unsellability blocks;
+    # taxes, open mint authority and unlocked liquidity are attached as
+    # warnings, because they make a trade unwise rather than impossible.
+    risk_screening: bool = field(
+        default_factory=lambda: _env_bool("DICE_RISK_SCREENING", True)
+    )
 
 
 settings = Settings()

@@ -655,6 +655,15 @@ async def send_telegram_message(text: str) -> str | None:
     return _describe_telegram_error(status, payload, chat_id)
 
 
+def _risk_notes(chain: Chain, token_address: str, limit: int = 3) -> list[str]:
+    """Cached contract warnings for a token, or nothing when unscreened."""
+    try:
+        verdict = db.get_token_risk(chain=chain.value, token_address=token_address)
+    except Exception:  # pragma: no cover - notification must never fail
+        return []
+    return list((verdict or {}).get("warnings") or [])[:limit]
+
+
 async def send_signal_notification(
     *,
     watchlist_name: str,
@@ -695,6 +704,11 @@ async def send_signal_notification(
                     for share in signal.breakdown[:4]
                 )
             )
+        # Whatever the risk screen found, read from the cache the gate has
+        # just filled. A signal that arrives without its warnings is a signal
+        # acted on without them.
+        for warning in _risk_notes(chain, signal.token_address):
+            lines.append(f"  ! {warning}")
         lines.append(signal.token_address)
         lines.append(f"https://dexscreener.com/{chain.value}/{signal.token_address}")
     text = "\n".join(lines)

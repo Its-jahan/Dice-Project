@@ -361,6 +361,60 @@ evidence of an old pool.
 Give it a couple of weeks of signals before drawing conclusions. Three
 outcomes is an anecdote; thirty is a basis for moving the threshold.
 
+## Can it be sold again?
+
+Every other check asks whether a token is *interesting*. This one asks whether
+it is *survivable*. The worst thing DICE can produce is not a missed signal —
+it is a correct signal on a token whose contract refuses the sell. Ten wallets
+really did buy it; the contract simply keeps the money.
+
+Before a signal goes out, the contract is screened through GoPlus Security
+(no key needed): honeypot behaviour, buy and sell tax, mint authority,
+blacklists, transfer pauses, LP lock and holder concentration.
+
+**Only unsellability blocks.** It is the one verdict that makes the trade
+impossible rather than merely unwise. High tax, open mint authority and
+unlocked liquidity ride along as warnings — on the board, in the signal, and
+in the Telegram message — and the decision stays yours. A gate that silently
+swallowed signals on heuristics would be indistinguishable from a broken
+webhook. A blocked token still *appears* on the board, marked `honeypot`, for
+the same reason: you have a real interest in knowing your wallets walked into
+one.
+
+**An outage never blocks.** If the risk API does not answer, tokens pass
+marked unchecked, exactly as an unknown price leaves an outcome pending
+instead of recording a zero. Failing closed would take the whole system down
+with the API.
+
+This is deliberately not an LLM reading contract source. A model that is
+mostly right about a honeypot is worse than useless: the failure is silent and
+costs the whole position. `is_honeypot: 1` from a dedicated service is a fact;
+a model's opinion about Solidity is not.
+
+> The endpoint accepts a comma-separated address list and appears to batch, but
+> answers for the **first address only** — verified by asking for three and
+> receiving one. DICE therefore sends one request per token and caches the
+> verdicts for six hours (failures for ten minutes). Sending a batch would have
+> left the rest silently unscreened, which for a safety check is the worst
+> possible failure: it looks like a pass.
+
+## Watching the money leave
+
+Everything above watches money going *in*. **Live distribution** is the same
+evidence read the other way, and for a token you are already holding on a
+signal it is the more urgent half.
+
+A **sale** is a token leaving a watched wallet *while something else comes back
+in the same transaction* — the mirror of the buy test. A one-way departure is
+somebody funding another wallet or paying an invoice, and counting it as an
+exit would misread the position entirely. A transfer between two wallets in
+the watched set is neither: one position moving is not a buyer and not a
+seller.
+
+The accumulation board gained a **Sold** column from the same data: a token six
+wallets bought and three have since sold is being distributed, not
+accumulated, and the buy count alone cannot tell those apart.
+
 ## Which wallets are worth counting
 
 The pooled signal counts heads: ten wallets bought, therefore fire. That
@@ -425,6 +479,8 @@ requires.
 | `POST /api/watchlists/{id}/monitor` | Run the monitor now. Header: `X-Dune-Api-Key`. |
 | `GET /api/watchlists/{id}/runs` | Monitor run history. |
 | `GET /api/signals` | Active signals (`?include_dismissed=true` for all). |
+| `GET /api/live/exits` | What the watched wallets are selling. |
+| `GET /api/tokens/risk?chain=&address=` | Screen one contract (honeypot, taxes, owner powers, LP lock). |
 | `GET /api/wallets/leaderboard?chain=` | Wallet quality: score, hit rate, median return, lead time, cohort count. |
 | `GET /api/signals/performance` · `POST …/refresh` | Scoreboard: win rate and median return per horizon; the POST looks up any prices now due. |
 | `POST /api/signals/{id}/dismiss` · `/restore` | Mute / unmute a signal. |

@@ -137,6 +137,14 @@ const FIELD_HELP = {
     "for a week has already been found by everyone else. Leave it empty to " +
     "see everything. Tokens whose age DexScreener does not report are still " +
     "shown — missing data is not evidence of an old pool.",
+  riskScreening:
+    "Screen each token's contract before a signal goes out. Only one verdict " +
+    "blocks it: a honeypot, where the contract refuses to let you sell — the " +
+    "worst outcome the system can produce is a correct signal on a token " +
+    "that keeps your money. Everything else (sell tax, open mint authority, " +
+    "unlocked liquidity) rides along as a warning and the decision stays " +
+    "yours. If the risk API is down, tokens pass unchecked rather than being " +
+    "silently dropped.",
   signalAirdrops:
     "Count wallets that were handed a token, not just those that paid for " +
     "it. Safe to leave on because a token with no liquidity pool is dropped " +
@@ -1268,6 +1276,7 @@ async function loadPoolSettings() {
     $("poolPct").value = data.pool_pct;
     $("poolMinWallets").value = data.pool_min_wallets;
     $("signalAirdrops").checked = !!data.signal_airdrops;
+    $("riskScreening").checked = !!data.risk_screening;
     const pools = (data.pools || [])
       .map(
         (pool) =>
@@ -1291,6 +1300,7 @@ async function savePoolSettings() {
           pool_pct: Number($("poolPct").value),
           pool_min_wallets: Number($("poolMinWallets").value),
           signal_airdrops: $("signalAirdrops").checked,
+          risk_screening: $("riskScreening").checked,
         },
       });
       await Promise.all([loadPoolSettings(), loadLiveTokens()]);
@@ -1347,7 +1357,7 @@ function renderLiveTokens() {
   const head = table.tHead.insertRow();
   const columns = ["Token", "From watchlists", "Buyers", "Progress to signal", "Buys"];
   if (state.liveIncludesAirdrops) columns.push("Paid for");
-  columns.push("Liquidity", "Pool age", "Price", "Last buy", "");
+  columns.push("Liquidity", "Pool age", "Contract", "Sold", "Price", "Last buy", "");
   for (const title of columns) {
     head.appendChild(el("th", "small text-body-secondary", title));
   }
@@ -1442,6 +1452,25 @@ function renderLiveTokens() {
     const ageCell = tr.insertCell();
     ageCell.appendChild(ageBadge(row.pool_age_hours));
 
+    tr.insertCell().appendChild(riskBadge(row.risk));
+
+    // How many of the buyers have already left. A token six wallets bought
+    // and three have sold is being distributed, not accumulated.
+    const soldCell = tr.insertCell();
+    if (row.sellers) {
+      const badge = el(
+        "span",
+        "badge " + (row.sellers >= row.wallet_count / 2 ? "text-bg-danger" : "text-bg-warning"),
+        `${row.sellers} of ${row.wallet_count}`,
+      );
+      badge.title =
+        `${row.sellers} of the wallets that bought this have since sold it ` +
+        "within the same window.";
+      soldCell.appendChild(badge);
+    } else {
+      soldCell.appendChild(el("span", "small text-body-secondary", "—"));
+    }
+
     const priceCell = tr.insertCell();
     priceCell.textContent =
       row.price_usd === null || row.price_usd === undefined
@@ -1451,7 +1480,14 @@ function renderLiveTokens() {
     tr.insertCell().textContent = fmtTime(row.last_buy_at);
 
     const statusCell = tr.insertCell();
-    if (row.signal_status === "active") {
+    if (row.risk?.blocked) {
+      const badge = el("span", "badge text-bg-danger", "honeypot");
+      badge.title =
+        "Over the threshold or not, this cannot signal — the contract does " +
+        "not permit selling. It is shown rather than hidden so you can see " +
+        "your wallets walked into it.";
+      statusCell.appendChild(badge);
+    } else if (row.signal_status === "active") {
       statusCell.appendChild(el("span", "badge text-bg-success", "signalled"));
     } else if (row.signal_status === "dismissed") {
       statusCell.appendChild(el("span", "badge text-bg-secondary", "dismissed"));
@@ -1468,6 +1504,33 @@ function renderLiveTokens() {
       );
     }
   }
+}
+
+/** Contract risk as a badge: blocked, warned, clean, or not checked. */
+function riskBadge(risk) {
+  if (!risk || !risk.checked) {
+    const unknown = el("span", "badge text-bg-light border text-body-secondary", "?");
+    unknown.title = risk?.reason
+      ? `Not screened: ${risk.reason}. An unscreened token is not a safe one — it is an unknown one.`
+      : "Contract not screened.";
+    return unknown;
+  }
+  if (risk.blocked) {
+    const bad = el("span", "badge text-bg-danger", "blocked");
+    bad.title = (risk.blockers || []).join(" ") +
+      " This token cannot signal: the contract does not permit selling.";
+    return bad;
+  }
+  if (risk.warnings && risk.warnings.length) {
+    const warn = el("span", "badge text-bg-warning", `${risk.warnings.length} warning${risk.warnings.length > 1 ? "s" : ""}`);
+    warn.title = risk.warnings.join("\n");
+    return warn;
+  }
+  const ok = el("span", "badge text-bg-success", "clean");
+  ok.title =
+    "No honeypot, no notable tax, no open owner powers found. " +
+    "This is a contract check, not a verdict on the token.";
+  return ok;
 }
 
 /** Pool age as a badge — green while a launch is still fresh, grey once it is not. */
@@ -1778,6 +1841,68 @@ function renderWalletQuality(data) {
   }
 }
 
+/* ------------------------------------------------------- live distribution */
+
+async function loadExits() {
+  try {
+    const data = await api("/api/live/exits?limit=50");
+    renderExits(data.tokens || []);
+  } catch (error) {
+    setStatus("exitStatus", error.message, "error");
+  }
+}
+
+function renderExits(rows) {
+  const table = $("exitTable");
+  $("exitEmpty").classList.toggle("d-none", !!rows.length);
+  table.classList.toggle("d-none", !rows.length);
+  table.tHead.innerHTML = "";
+  table.tBodies[0].innerHTML = "";
+  if (!rows.length) return;
+
+  const head = table.tHead.insertRow();
+  for (const title of ["Token", "Sellers", "Sales", "First sale", "Last sale", "Price"]) {
+    head.appendChild(el("th", "small text-body-secondary", title));
+  }
+
+  for (const row of rows) {
+    const tr = table.tBodies[0].insertRow();
+
+    const tokenCell = tr.insertCell();
+    const link = el(
+      "a",
+      "link-primary fw-medium text-decoration-none",
+      row.token_symbol || shortAddress(row.token_address),
+    );
+    link.href = row.pair_url || dexscreenerUrl(row.chain, row.token_address);
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.title = row.token_address;
+    tokenCell.appendChild(link);
+    tokenCell.appendChild(el("span", "mono ms-2", shortAddress(row.token_address)));
+
+    const sellerCell = tr.insertCell();
+    const share = row.pool_size ? (row.wallet_count / row.pool_size) * 100 : 0;
+    const badge = el(
+      "span",
+      "badge " + (share >= 10 ? "text-bg-danger" : "text-bg-warning"),
+      `${row.wallet_count} of ${row.pool_size}`,
+    );
+    badge.title =
+      `${row.wallet_count} watched wallets sold this in the last ` +
+      `${row.window_hours}h — ${share.toFixed(1)}% of the pool.`;
+    sellerCell.appendChild(badge);
+
+    tr.insertCell().textContent = row.sell_count;
+    tr.insertCell().textContent = fmtTime(row.first_sell_at);
+    tr.insertCell().textContent = fmtTime(row.last_sell_at);
+    tr.insertCell().textContent =
+      row.price_usd === null || row.price_usd === undefined
+        ? "—"
+        : "$" + Number(row.price_usd).toPrecision(4);
+  }
+}
+
 async function runLiveSweep() {
   await withBusy($("liveSweep"), async () => {
     setStatus("liveStatus", "Re-checking stored buys against every threshold…", "");
@@ -1789,7 +1914,9 @@ async function runLiveSweep() {
           `${result.signals} signal(s) fired.`,
         result.signals ? "ok" : "",
       );
-      await Promise.all([loadLiveTokens(), loadSignals(), loadPerformance()]);
+      await Promise.all([
+        loadLiveTokens(), loadSignals(), loadPerformance(), loadExits(),
+      ]);
     } catch (error) {
       setStatus("liveStatus", error.message, "error");
     }
@@ -2418,6 +2545,7 @@ function init() {
   $("refreshLive").addEventListener("click", loadLiveTokens);
   $("perfRefresh").addEventListener("click", loadPerformance);
   $("wqRefresh").addEventListener("click", loadWalletQuality);
+  $("refreshExits").addEventListener("click", loadExits);
   $("wqChain").addEventListener("change", loadWalletQuality);
   $("perfCheck").addEventListener("click", checkPerformanceNow);
   $("liveMaxPoolAge").addEventListener("change", loadLiveTokens);
@@ -2447,6 +2575,7 @@ function init() {
     loadCohortOverlap();
     loadPerformance();
     loadWalletQuality();
+    loadExits();
     updateRealtimeAvailability();
   });
   loadNotificationSettings();

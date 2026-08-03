@@ -27,7 +27,17 @@ from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import alchemy, arkham, cohorts, db, monitor, performance, realtime, wallets
+from . import (
+    alchemy,
+    arkham,
+    cohorts,
+    db,
+    monitor,
+    performance,
+    realtime,
+    security,
+    wallets,
+)
 from .cache import cache
 from .config import settings
 from .dune import DuneClient, DuneError, ensure_query
@@ -1011,6 +1021,7 @@ async def get_pool_settings() -> dict[str, object]:
         "pool_pct": realtime.pool_pct(),
         "pool_min_wallets": realtime.pool_min_wallets(),
         "signal_airdrops": realtime.signal_airdrops(),
+        "risk_screening": realtime.risk_screening(),
         "window_hours": realtime.pool_window_hours(),
         "pools": [
             {
@@ -1047,6 +1058,10 @@ async def save_pool_settings(body: Annotated[dict, Body()]) -> dict[str, object]
                 status_code=422, detail="pool_min_wallets must be at least 2."
             )
         db.set_setting("pool_min_wallets", str(floor))
+    if "risk_screening" in body:
+        db.set_setting(
+            "risk_screening", "true" if body["risk_screening"] else "false"
+        )
     if "signal_airdrops" in body:
         db.set_setting(
             "signal_airdrops", "true" if body["signal_airdrops"] else "false"
@@ -1152,6 +1167,22 @@ async def live_tokens(
     }
 
 
+@app.get("/api/tokens/risk")
+async def token_risk(
+    chain: Annotated[Chain, Query()],
+    address: Annotated[str, Query(min_length=3)],
+    refresh: Annotated[bool, Query()] = False,
+) -> dict[str, object]:
+    """Screen one token's contract on demand.
+
+    Answers the question a signal raises but cannot answer by itself: ten
+    wallets bought it, but can it be sold again?
+    """
+    verdicts = await security.screen(chain, [address], refresh=refresh)
+    verdict = verdicts.get(address.lower()) or security.unchecked("no answer")
+    return {"chain": chain.value, "token_address": address.lower(), **verdict}
+
+
 @app.get("/api/wallets/leaderboard")
 def wallet_leaderboard(
     chain: Annotated[Chain, Query()] = Chain.ethereum,
@@ -1182,6 +1213,19 @@ async def refresh_signal_performance() -> dict[str, object]:
     """Fill in any horizons that have come due, now rather than on the sweep."""
     filled = await performance.fill_horizons(limit=200)
     return {"filled": filled, **performance.summarise()}
+
+
+@app.get("/api/live/exits")
+async def live_exits(
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> dict[str, object]:
+    """What the watched wallets are selling.
+
+    DICE has only ever watched money going in. This is the same evidence read
+    the other way, and for a token already held on a signal it is the more
+    urgent half.
+    """
+    return {"tokens": await realtime.distribution_board(limit=limit)}
 
 
 @app.post("/api/live/sweep")
