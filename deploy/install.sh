@@ -215,7 +215,15 @@ if [[ -f "$HTPASSWD" ]]; then
     # Driven by the file rather than by the flag, so a redeploy without
     # --password does not quietly unlock a site that was locked.
     echo "   password file present — enabling the auth gate"
-    sed -i 's|^    # auth_basic |    auth_basic |' /etc/nginx/snippets/dice-proxy.conf
+    # No trailing space in the pattern: the second line is
+    # `# auth_basic_user_file`, and requiring a space there left it commented
+    # while the first line was live — which nginx accepted and served without
+    # asking for anything. A gate that fails open is worse than no gate.
+    sed -i 's|^    # auth_basic|    auth_basic|' /etc/nginx/snippets/dice-proxy.conf
+    if [[ "$(grep -c '^    auth_basic' /etc/nginx/snippets/dice-proxy.conf)" != "2" ]]; then
+        echo "Could not enable the password gate — the snippet did not match." >&2
+        exit 1
+    fi
 fi
 sed -e "s|__SERVER_NAME__|$server_names|g" \
     -e "s|__SSL_CERT__|${ssl_cert:-}|g" \
@@ -252,6 +260,34 @@ if ! curl -fsS --max-time 10 http://127.0.0.1:8000/api/health >/dev/null; then
     echo "Health check failed. Logs:" >&2
     journalctl -u dice -n 40 --no-pager >&2
     exit 1
+fi
+
+# Prove the gate actually gates. Asserting the *negative* matters more here
+# than the positive: a misconfigured auth_basic serves the site to everyone
+# while every log line still looks healthy.
+if [[ -f "$HTPASSWD" ]]; then
+    log "Checking that the password gate holds"
+    scheme=http
+    [[ -n "${ssl_cert:-}" ]] && scheme=https
+    locked="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 \
+        --resolve "$SERVER_NAME:443:127.0.0.1" --resolve "$SERVER_NAME:80:127.0.0.1" \
+        "$scheme://$SERVER_NAME/api/watchlists" || echo 000)"
+    if [[ "$locked" != "401" ]]; then
+        echo "The site answered $locked without a password — expected 401." >&2
+        echo "Refusing to finish a deploy that leaves the API open." >&2
+        exit 1
+    fi
+    # ...and that the exemption survived, or signals stop with no clue why.
+    open="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 \
+        --resolve "$SERVER_NAME:443:127.0.0.1" --resolve "$SERVER_NAME:80:127.0.0.1" \
+        -X POST -H 'Content-Type: application/json' -d '{}' \
+        "$scheme://$SERVER_NAME/api/webhooks/alchemy" || echo 000)"
+    if [[ "$open" == "401" ]]; then
+        echo "The webhook endpoint is behind the password — Alchemy cannot" >&2
+        echo "authenticate, so no signal would ever arrive." >&2
+        exit 1
+    fi
+    echo "   locked (401 without a password), webhook still reachable ($open)"
 fi
 
 if [[ -n "$LE_NAME" ]] && ! $SELF_SIGNED; then
