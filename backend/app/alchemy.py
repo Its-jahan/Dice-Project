@@ -129,8 +129,13 @@ class AlchemyNotifyClient:
                 status_code=401,
             )
         if response.status_code >= 400:
+            # Carry the real status, not just print it in the message. A caller
+            # that needs to tell "this webhook is gone" (404) from "Alchemy is
+            # unhappy" cannot parse prose, and the default of 502 silently made
+            # every such check unreachable.
             raise AlchemyError(
-                f"Alchemy returned {response.status_code}: {response.text[:300]}"
+                f"Alchemy returned {response.status_code}: {response.text[:300]}",
+                status_code=response.status_code,
             )
         if not response.content:
             return {}

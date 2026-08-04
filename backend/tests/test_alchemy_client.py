@@ -272,3 +272,35 @@ def test_solana_asks_for_the_provider_that_actually_covers_it(api, monkeypatch):
     result = api.post("/api/settings/realtime/sync").json()["synced"][0]
 
     assert "Helius" in result["error"]
+
+
+def test_an_http_status_reaches_the_caller_not_just_the_message():
+    """The status has to be on the exception, not only inside its text.
+
+    A caller distinguishing "this webhook no longer exists" from "Alchemy is
+    unhappy" cannot parse prose. The error carried a default of 502 while its
+    message said 404, which made every such check silently unreachable — the
+    recovery path existed, was tested against a hand-built exception, and
+    could never fire against the real one.
+    """
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        return httpx.Response(404, json={"error": {"message": "Webhook not found"}})
+
+    with pytest.raises(AlchemyError) as caught:
+        _call(handler, lambda c: c.list_addresses("wh_gone"))
+
+    assert caught.value.status_code == 404
+    assert "Webhook not found" in str(caught.value)
+    assert seen["path"].endswith("/webhook-addresses")
+
+
+def test_other_statuses_are_carried_too():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, text="slow down")
+
+    with pytest.raises(AlchemyError) as caught:
+        _call(handler, lambda c: c.list_addresses("wh_1"))
+    assert caught.value.status_code == 429
