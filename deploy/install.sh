@@ -236,22 +236,25 @@ fi
 log "Configuring nginx for $server_names"
 install -m 644 "$APP_DIR/deploy/nginx-proxy.conf" /etc/nginx/snippets/dice-proxy.conf
 if [[ -f "$HTPASSWD" ]]; then
+    # Only /graph/ is gated now. The app carries its own sign-in, and putting
+    # Basic Auth back at server level would stack a second prompt in front of
+    # it — which is what this deploy step used to do, silently, on every run.
+    #
     # Driven by the file rather than by the flag, so a redeploy without
-    # --password does not quietly unlock a site that was locked.
-    echo "   password file present — enabling the auth gate"
+    # --password does not quietly unlock the code map.
+    echo "   password file present — locking /graph/"
     # No trailing space in the pattern: the second line is
     # `# auth_basic_user_file`, and requiring a space there left it commented
     # while the first line was live — which nginx accepted and served without
     # asking for anything. A gate that fails open is worse than no gate.
-    sed -i 's|^# auth_basic|auth_basic|' /etc/nginx/snippets/dice-proxy.conf
-    # Assert on what must be true rather than on a line count: the webhook
-    # block carries its own `auth_basic off`, so counting every auth_basic
-    # line says 3 and means nothing. What matters is that no commented one
-    # survived and the user file is actually named.
+    sed -i 's|^\( *\)# auth_basic|\1auth_basic|' /etc/nginx/snippets/dice-proxy.conf
+    # Assert on what must be true rather than on a line count: two other
+    # `auth_basic off` lines exist by design, so counting them means nothing.
+    # What matters is that no commented one survived and the file is named.
     if grep -q '# auth_basic' /etc/nginx/snippets/dice-proxy.conf \
-       || ! grep -q "^auth_basic_user_file $HTPASSWD;" \
+       || ! grep -q "^ *auth_basic_user_file $HTPASSWD;" \
               /etc/nginx/snippets/dice-proxy.conf; then
-        echo "Could not enable the password gate — the snippet did not match." >&2
+        echo "Could not lock /graph/ — the snippet did not match." >&2
         exit 1
     fi
 fi
@@ -292,39 +295,68 @@ if ! curl -fsS --max-time 10 http://127.0.0.1:8000/api/health >/dev/null; then
     exit 1
 fi
 
-# Prove the gate actually gates. Asserting the *negative* matters more here
-# than the positive: a misconfigured auth_basic serves the site to everyone
-# while every log line still looks healthy.
+# Prove the gates actually gate. Asserting the *negative* matters more here
+# than the positive: a gate that fails open serves the site to everyone while
+# every log line still looks healthy.
+#
+# There are two gates now and they are not interchangeable. The app guards
+# itself with a session; nginx guards /graph/, which the app never sees.
+log "Checking that the gates hold"
+scheme=http
+[[ -n "${ssl_cert:-}" ]] && scheme=https
+
+probe() {  # path -> status code, from outside nginx
+    curl -sk -o /dev/null -w '%{http_code}' --max-time 10 \
+        --resolve "$SERVER_NAME:443:127.0.0.1" \
+        --resolve "$SERVER_NAME:80:127.0.0.1" \
+        "$scheme://$SERVER_NAME$1" || echo 000
+}
+
 if [[ -f "$HTPASSWD" ]]; then
-    log "Checking that the password gate holds"
-    scheme=http
-    [[ -n "${ssl_cert:-}" ]] && scheme=https
-    # Every public path, not just the API. /graph/ is a full map of the
-    # codebase and it is served by its own location, which inherits nothing
-    # from `location /` — checking only the API missed it entirely.
-    for path in /api/watchlists / /graph/; do
-        locked="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 \
-            --resolve "$SERVER_NAME:443:127.0.0.1" \
-            --resolve "$SERVER_NAME:80:127.0.0.1" \
-            "$scheme://$SERVER_NAME$path" || echo 000)"
-        if [[ "$locked" != "401" ]]; then
-            echo "$path answered $locked without a password — expected 401." >&2
-            echo "Refusing to finish a deploy that leaves it open." >&2
-            exit 1
-        fi
-    done
-    # ...and that the exemption survived, or signals stop with no clue why.
-    open="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 \
-        --resolve "$SERVER_NAME:443:127.0.0.1" --resolve "$SERVER_NAME:80:127.0.0.1" \
-        -X POST -H 'Content-Type: application/json' -d '{}' \
-        "$scheme://$SERVER_NAME/api/webhooks/alchemy" || echo 000)"
-    if [[ "$open" == "401" ]]; then
-        echo "The webhook endpoint is behind the password — Alchemy cannot" >&2
-        echo "authenticate, so no signal would ever arrive." >&2
+    # /graph/ is a full map of the codebase, served by its own location which
+    # inherits nothing from `location /`. Basic Auth is the only thing in
+    # front of it — the app's session cannot reach a static alias.
+    graph="$(probe /graph/)"
+    if [[ "$graph" != "401" ]]; then
+        echo "/graph/ answered $graph without a password — expected 401." >&2
+        echo "Refusing to finish a deploy that publishes the codebase." >&2
         exit 1
     fi
-    echo "   locked: app, API and /graph/ all 401; webhook reachable ($open)"
+    echo "   /graph/ locked (401)"
 fi
+
+# Ask the app whether it has a password before demanding that it enforce one:
+# a fresh install has none by design, and failing the deploy over that would
+# make the first deploy impossible.
+if curl -fsS --max-time 10 http://127.0.0.1:8000/api/auth/status 2>/dev/null \
+     | grep -q '"password_set":true'; then
+    api="$(probe /api/watchlists)"
+    page="$(probe /)"
+    if [[ "$api" != "401" ]]; then
+        echo "/api/watchlists answered $api — expected 401 with a password set." >&2
+        exit 1
+    fi
+    if [[ "$page" == "200" ]]; then
+        echo "/ served the app without a session — the sign-in gate is not on." >&2
+        exit 1
+    fi
+    echo "   app gated (API $api, page $page)"
+else
+    echo "   app has no password set — gate deliberately transparent"
+fi
+
+# The exemption must survive both, or signals stop with no clue why.
+open="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 \
+    --resolve "$SERVER_NAME:443:127.0.0.1" --resolve "$SERVER_NAME:80:127.0.0.1" \
+    -X POST -H 'Content-Type: application/json' -d '{}' \
+    "$scheme://$SERVER_NAME/api/webhooks/alchemy" || echo 000)"
+if [[ "$open" == "401" || "$open" == "303" ]]; then
+    echo "The webhook endpoint is behind a gate (got $open) — Alchemy can" >&2
+    echo "present neither a password nor a cookie, so no signal would ever" >&2
+    echo "arrive, and nothing anywhere would report an error." >&2
+    exit 1
+fi
+echo "   webhook reachable ($open)"
 
 if [[ -n "$LE_NAME" ]] && ! $SELF_SIGNED; then
     echo "DICE is running at https://$LE_NAME"
