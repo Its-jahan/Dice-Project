@@ -17,20 +17,29 @@ import asyncio
 import json
 import logging
 import uuid
+from html import escape as html_escape
+from urllib.parse import quote
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict
 from pathlib import Path
 from typing import Annotated, AsyncIterator
 
 import httpx
-from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi import Body, FastAPI, Form, Header, HTTPException, Query, Request
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+)
 from fastapi.staticfiles import StaticFiles
 
 from . import (
     ai,
     alchemy,
     arkham,
+    auth,
     cohorts,
     db,
     helius,
@@ -2052,6 +2061,151 @@ async def restore_signal(signal_id: int) -> SignalOut:
     row = db.get_signal(signal_id)
     assert row is not None
     return monitor.signal_to_out(row)
+
+
+# --------------------------------------------------------------------- login
+#
+# Paths that must answer without a session. Everything else is gated.
+#
+# The webhooks are the load-bearing entry: Alchemy and Helius cannot present a
+# cookie, and they are already authenticated by an HMAC over the raw body,
+# which is a stronger check than a password. Gating them would silently stop
+# every signal — a failure this deployment has already had once.
+OPEN_PATHS = frozenset({
+    "/login", "/api/auth/logout",
+    "/api/webhooks/alchemy", "/api/webhooks/helius",
+    "/api/health", "/favicon.ico",
+})
+OPEN_PREFIXES = ("/static/",)   # the login page needs its own stylesheet
+
+
+def _safe_next(target: str | None) -> str:
+    """Only ever redirect back into this site."""
+    if not target or not target.startswith("/") or target.startswith("//"):
+        return "/"
+    return target
+
+
+def _login_page(request: Request, *, error: str = "", status: int = 200) -> Response:
+    """Render the sign-in page with any error already in the markup.
+
+    Server-rendered rather than fetched, so the page works with JavaScript
+    switched off. A login that needs JavaScript is a login that can lock you
+    out of your own server.
+    """
+    html = (FRONTEND_DIR / "login.html").read_text(encoding="utf-8")
+    block = (
+        '<div class="alert alert-danger py-2 px-3 small mt-3 mb-0" role="alert">'
+        f"{html_escape(error)}</div>"
+        if error else ""
+    )
+    return HTMLResponse(
+        html.replace("__ERROR__", block)
+            .replace("__NEXT__", html_escape(_safe_next(request.query_params.get("next")), quote=True))
+            .replace("__MAX_ATTEMPTS__", str(auth.MAX_ATTEMPTS))
+            .replace("__LOCKOUT__", str(auth.LOCKOUT_MINUTES)),
+        status_code=status,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+def _client_address(request: Request) -> str:
+    # nginx sets X-Forwarded-For; the first hop is the real client.
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+@app.middleware("http")
+async def require_sign_in(request: Request, call_next):
+    """The gate. Open paths pass; everything else needs a live session.
+
+    With no password set the gate is transparent, so an existing install does
+    not lock itself out on upgrade — it opts in by setting one.
+    """
+    path = request.url.path
+    if (
+        not auth.password_is_set()
+        or path in OPEN_PATHS
+        or path.startswith(OPEN_PREFIXES)
+        or auth.session_is_valid(request.cookies.get(auth.SESSION_COOKIE))
+    ):
+        return await call_next(request)
+
+    if path.startswith("/api/"):
+        # An API caller gets a status it can act on, not a page it cannot read.
+        return JSONResponse({"detail": "Sign in required."}, status_code=401)
+    return RedirectResponse(f"/login?next={quote(path, safe='/')}", status_code=303)
+
+
+@app.get("/login", include_in_schema=False)
+async def login_form(request: Request) -> Response:
+    if auth.session_is_valid(request.cookies.get(auth.SESSION_COOKIE)):
+        return RedirectResponse("/", status_code=303)
+    return _login_page(request)
+
+
+@app.post("/login", include_in_schema=False)
+async def login_submit(
+    request: Request,
+    password: Annotated[str, Form()] = "",
+    remember: Annotated[str, Form()] = "",
+    next: Annotated[str, Form()] = "/",
+) -> Response:
+    address = _client_address(request)
+    waiting = auth.lockout_remaining(address)
+    if waiting:
+        minutes = max(1, round(waiting / 60))
+        return _login_page(
+            request,
+            error=f"Too many attempts. Try again in {minutes} minute"
+                  f"{'s' if minutes != 1 else ''}.",
+            status=429,
+        )
+
+    if not auth.check_password(password):
+        auth.record_failure(address)
+        left = auth.MAX_ATTEMPTS - auth.count_recent_failures(address)
+        # Warn when the lockout is close. Someone mistyping their own password
+        # deserves it, and an attacker learns nothing they could not count.
+        hint = f" {left} attempt{'s' if left != 1 else ''} left." if 0 < left <= 3 else ""
+        return _login_page(request, error=f"Incorrect password.{hint}", status=401)
+
+    auth.clear_failures(address)
+    token, expires = auth.start_session(remember=bool(remember))
+    response = RedirectResponse(_safe_next(next), status_code=303)
+    response.set_cookie(
+        value=token,
+        **auth.cookie_kwargs(expires, secure=request.url.scheme == "https"),
+    )
+    return response
+
+
+@app.post("/api/auth/logout", include_in_schema=False)
+async def logout(request: Request) -> Response:
+    auth.end_session(request.cookies.get(auth.SESSION_COOKIE))
+    response = JSONResponse({"ok": True})
+    response.delete_cookie(auth.SESSION_COOKIE, path="/")
+    return response
+
+
+@app.get("/api/auth/status")
+def auth_status(request: Request) -> dict[str, object]:
+    return {
+        "password_set": auth.password_is_set(),
+        "signed_in": auth.session_is_valid(request.cookies.get(auth.SESSION_COOKIE)),
+    }
+
+
+@app.put("/api/auth/password")
+def change_password(body: Annotated[dict, Body()]) -> dict[str, object]:
+    """Set or replace the password. Every existing session is revoked."""
+    try:
+        auth.set_password(str(body.get("password") or ""))
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return {"password_set": True, "sessions_revoked": True}
 
 
 if FRONTEND_DIR.is_dir():

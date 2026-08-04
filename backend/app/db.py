@@ -154,6 +154,24 @@ CREATE INDEX IF NOT EXISTS idx_deliveries_recent
 
 -- Cached DexScreener answers. has_pair = 0 means the token has no liquidity
 -- pool anywhere, so it cannot have been bought and must not signal.
+CREATE TABLE IF NOT EXISTS sessions (
+    -- The token itself is never stored: a leaked database should not hand
+    -- anyone a live session, for the same reason it does not store the
+    -- password.
+    token_hash TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS login_failures (
+    -- Persisted rather than counted in memory, because "restart the process"
+    -- must not be a way to clear the lockout.
+    address    TEXT NOT NULL,
+    at         TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_login_failures ON login_failures (address, at);
+
 CREATE TABLE IF NOT EXISTS signal_briefs (
     signal_id     INTEGER PRIMARY KEY REFERENCES signals(id) ON DELETE CASCADE,
     chain         TEXT    NOT NULL,
@@ -1851,3 +1869,68 @@ def signals_without_briefs(limit: int = 5) -> list[dict[str, Any]]:
             (limit,),
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+# ------------------------------------------------------------------ sessions
+
+
+def create_session(token_hash: str, created_at: str, expires_at: str) -> None:
+    with connect() as conn:
+        # Opportunistically drop what has already expired, so the table stays
+        # small without needing a scheduled job.
+        conn.execute("DELETE FROM sessions WHERE expires_at < ?", (created_at,))
+        conn.execute(
+            "INSERT OR REPLACE INTO sessions (token_hash, created_at, expires_at)"
+            " VALUES (?, ?, ?)",
+            (token_hash, created_at, expires_at),
+        )
+
+
+def session_is_live(token_hash: str, now_iso: str) -> bool:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM sessions WHERE token_hash = ? AND expires_at > ?",
+            (token_hash, now_iso),
+        ).fetchone()
+    return row is not None
+
+
+def delete_session(token_hash: str) -> None:
+    with connect() as conn:
+        conn.execute("DELETE FROM sessions WHERE token_hash = ?", (token_hash,))
+
+
+def delete_all_sessions() -> None:
+    with connect() as conn:
+        conn.execute("DELETE FROM sessions")
+
+
+def record_login_failure(address: str, at_iso: str) -> None:
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO login_failures (address, at) VALUES (?, ?)",
+            (address, at_iso),
+        )
+
+
+def count_login_failures(address: str, since_iso: str) -> int:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM login_failures WHERE address = ? AND at >= ?",
+            (address, since_iso),
+        ).fetchone()
+    return int(row["n"])
+
+
+def last_login_failure(address: str) -> str | None:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT MAX(at) AS at FROM login_failures WHERE address = ?",
+            (address,),
+        ).fetchone()
+    return row["at"] if row and row["at"] else None
+
+
+def clear_login_failures(address: str) -> None:
+    with connect() as conn:
+        conn.execute("DELETE FROM login_failures WHERE address = ?", (address,))

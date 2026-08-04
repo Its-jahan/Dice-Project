@@ -373,6 +373,15 @@ async function api(path, { method = "GET", body } = {}) {
     headers,
     body: body === undefined ? undefined : JSON.stringify(body),
   });
+  // A session that expired mid-visit would otherwise surface as "Sign in
+  // required." pasted into whichever panel happened to be refreshing — the
+  // page still looks logged in and nothing tells you what to do about it.
+  if (response.status === 401) {
+    window.location.assign(
+      `/login?next=${encodeURIComponent(window.location.pathname)}`,
+    );
+    throw new Error("Signed out.");
+  }
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(describeError(payload, response.status));
   return payload;
@@ -517,6 +526,60 @@ async function clearKey() {
       setStatus("keyStatus", error.message, "error");
     }
   });
+}
+
+// ------------------------------------------------------------------- access
+
+async function refreshAccess() {
+  try {
+    const status = await api("/api/auth/status");
+    const pill = $("accessPill");
+    pill.textContent = status.password_set ? "Password set" : "No password";
+    pill.className = `badge rounded-pill ${
+      status.password_set ? "text-bg-success" : "text-bg-warning"
+    }`;
+    $("signOut").hidden = !status.signed_in;
+    $("saveAccess").textContent = status.password_set
+      ? "Replace password"
+      : "Set password";
+  } catch {
+    // Never let this panel break the page it sits on.
+  }
+}
+
+async function saveAccess() {
+  const password = $("accessPassword").value;
+  if (password.length < 8) {
+    setStatus("accessStatus", "At least 8 characters.", "error");
+    return;
+  }
+  // Worth one confirm: the mistake this prevents is being locked out of your
+  // own server by a typo you cannot see, and there is no reset link.
+  const sure = window.confirm(
+    "Set this as the password?\n\n" +
+    "Every browser is signed out, including this one, and there is no way " +
+    "to recover it except editing the database on the server.",
+  );
+  if (!sure) return;
+
+  await withBusy($("saveAccess"), async () => {
+    try {
+      await api("/api/auth/password", { method: "PUT", body: { password } });
+      $("accessPassword").value = "";
+      setStatus("accessStatus", "Password set. Signing you in again…", "ok");
+      window.setTimeout(() => window.location.assign("/login"), 1200);
+    } catch (error) {
+      setStatus("accessStatus", error.message, "error");
+    }
+  });
+}
+
+async function signOut() {
+  try {
+    await api("/api/auth/logout", { method: "POST" });
+  } finally {
+    window.location.assign("/login");
+  }
 }
 
 async function archiveQueries() {
@@ -2947,6 +3010,15 @@ function init() {
     $("toggleKey").textContent = hidden ? "Hide" : "Show";
   });
 
+  $("saveAccess").addEventListener("click", saveAccess);
+  $("signOut").addEventListener("click", signOut);
+  $("toggleAccess").addEventListener("click", () => {
+    const input = $("accessPassword");
+    const hidden = input.type === "password";
+    input.type = hidden ? "text" : "password";
+    $("toggleAccess").textContent = hidden ? "Hide" : "Show";
+  });
+
   $("queryForm").addEventListener("submit", runQuery);
   $("showSql").addEventListener("click", showSql);
   $("diagnoseBtn").addEventListener("click", diagnose);
@@ -3010,6 +3082,7 @@ function init() {
     loadExits();
     updateRealtimeAvailability();
   });
+  refreshAccess();
   loadNotificationSettings();
   loadArkhamSettings();
   loadRealtimeSettings();
