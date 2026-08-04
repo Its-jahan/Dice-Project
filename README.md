@@ -486,11 +486,27 @@ context window are shown for whatever is selected, so the choice is made with
 the cost visible rather than looked up afterwards. Empty means the default,
 Claude Opus 5.
 
+**Briefs and the review take separate models**, because the jobs are not
+alike and the economics agree with the quality. A brief is search-and-
+summarise, runs on every signal, and a small fast model does it well for a
+fraction of the cost. The review runs when a human asks and has to decide what
+a handful of numbers does *not* yet support.
+
+That split is not a guess. Run on identical data — two signals, neither
+matured — the two answers were:
+
+| | cheap model | strong model |
+|---|---|---|
+| confidence | `high` | `none` |
+| verdict | "no changes warranted" | explained that every win rate in the scoreboard was null |
+| recommendations | 0 | 1 — noticed a router contract had contaminated *both* signals, and labelled the claim as not outcome-based |
+
+So the review model defaults to the strong one even when briefs are set to a
+cheap one. Both are configurable.
+
 Models that cannot honour a fixed response schema are marked. That is not
 fatal — briefs are unaffected, and the review falls back to reading JSON out
-of the reply — but the review is the half that benefits from the stronger
-model anyway: it is deciding what a small table does *not* yet support, which
-is precisely where a weaker model manufactures confidence.
+of the reply.
 
 One cost worth knowing: the briefs use web search, which OpenRouter bills per
 result — five per signal.

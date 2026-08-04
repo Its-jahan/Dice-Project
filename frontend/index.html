@@ -587,10 +587,17 @@
                    spellcheck="false" placeholder="OpenRouter API key (sk-or-…)">
           </div>
           <div class="col-lg-3">
+            <label class="form-label small mb-1" for="aiModel">Briefs</label>
             <input id="aiModel" class="form-control" spellcheck="false"
                    list="aiModelList" autocomplete="off"
                    placeholder="anthropic/claude-opus-5">
             <datalist id="aiModelList"></datalist>
+          </div>
+          <div class="col-lg-3">
+            <label class="form-label small mb-1" for="aiReviewModel">Review</label>
+            <input id="aiReviewModel" class="form-control" spellcheck="false"
+                   list="aiModelList" autocomplete="off"
+                   placeholder="anthropic/claude-opus-5">
           </div>
           <div class="col-auto">
             <button type="button" id="aiSave" class="btn btn-primary">Save</button>

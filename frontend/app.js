@@ -173,13 +173,20 @@ const FIELD_HELP = {
     "model never decides to buy, never sets a threshold, and never replaces " +
     "the contract screen. Leave it empty and everything else works as before.",
   aiModel:
-    "Which model to use — type to search the provider's live catalogue, or " +
-    "paste any slug. Empty means the default shown — Claude Opus 5, the " +
-    "same model either way. Any OpenRouter slug works if you want to trade " +
-    "cost against judgement, but the review is the part that benefits from " +
-    "the stronger model: it is reading a table and deciding what the numbers " +
-    "do not yet support, which is exactly where a weaker model invents " +
-    "confidence.",
+    "The model that writes the briefs — the frequent, cheap call. Search and " +
+    "summarise, once per signal; a small fast model does this well and costs " +
+    "a fraction. Type to search the catalogue or paste any slug. Empty means " +
+    "the default shown.",
+  aiReviewModel:
+    "The model that reviews your results — rare, and the one that has to " +
+    "judge. Kept separate on purpose, and defaulted to the strong model even " +
+    "when briefs run on a cheap one. Measured on identical data here — two " +
+    "signals, neither matured — a cheap model answered \"confidence: high, " +
+    "no changes warranted\" while the strong one answered \"confidence: " +
+    "none\", explained that every win rate in the scoreboard was null, and " +
+    "separately noticed a router contract had contaminated both signals. " +
+    "Deciding what a handful of numbers does NOT support is exactly where a " +
+    "weaker model manufactures confidence.",
   aiEnrichment:
     "Research each new signal before the Telegram goes out. The brief sits in " +
     "the webhook path, so it is time-boxed: if the model is slow or down, the " +
@@ -1960,6 +1967,10 @@ async function loadAiSettings() {
     $("aiModel").placeholder = data.default_models?.[data.provider || "openrouter"] || "";
     $("aiModel").value = data.model && data.model !== $("aiModel").placeholder
       ? data.model : "";
+    $("aiReviewModel").placeholder = $("aiModel").placeholder;
+    $("aiReviewModel").value =
+      data.review_model && data.review_model !== $("aiReviewModel").placeholder
+        ? data.review_model : "";
     $("aiEnrichment").checked = !!data.enrichment;
     describeSelectedModel();
     const badge = $("aiBadge");
@@ -2052,6 +2063,7 @@ async function saveAiSettings() {
     const body = {
       enrichment: $("aiEnrichment").checked,
       model: $("aiModel").value.trim(),
+      review_model: $("aiReviewModel").value.trim(),
     };
     const key = $("aiKey").value.trim();
     if (key) {

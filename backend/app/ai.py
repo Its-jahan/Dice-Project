@@ -336,8 +336,30 @@ def api_key(for_provider: str) -> str | None:
 
 
 def model() -> str:
-    """The configured model, or the right default for the active provider."""
+    """The model that writes the briefs — the frequent, cheap call."""
     chosen = (db.get_setting("ai_model") or "").strip()
+    if chosen:
+        return chosen
+    return DEFAULT_MODELS.get(provider() or "openrouter", DEFAULT_MODELS["openrouter"])
+
+
+def review_model() -> str:
+    """The model that reviews the results — rare, and the one that must judge.
+
+    Defaults to the strong model even when the briefs run on a cheap one,
+    because the two jobs are not alike and the economics point the same way as
+    the quality does. A brief is search-and-summarise, runs on every signal,
+    and a small model does it well. The review decides what a handful of
+    numbers does *not* yet support, runs when a human asks, and is exactly
+    where a weaker model manufactures confidence.
+
+    That is not a guess: on identical data — two signals, neither matured —
+    one model answered "confidence: high, no changes warranted" while the
+    other answered "confidence: none", explained that every win rate in the
+    scoreboard was null, and separately noticed that a router contract had
+    contaminated both signals.
+    """
+    chosen = (db.get_setting("ai_review_model") or "").strip()
     if chosen:
         return chosen
     return DEFAULT_MODELS.get(provider() or "openrouter", DEFAULT_MODELS["openrouter"])
@@ -366,6 +388,7 @@ async def complete(
     schema: dict[str, Any] | None = None,
     web: bool = False,
     timeout: float = 90.0,
+    use_model: str | None = None,
 ) -> str:
     """One completion, from whichever provider is configured. Returns text."""
     active = provider()
@@ -375,24 +398,25 @@ async def complete(
     if not key:  # pragma: no cover - provider() already proved one exists
         raise AIUnavailable("No API key saved.")
 
+    chosen = use_model or model()
     if active == "openrouter":
         return await _openrouter(
             key=key, system=system, user=user, max_tokens=max_tokens,
-            effort=effort, schema=schema, web=web, timeout=timeout,
+            effort=effort, schema=schema, web=web, timeout=timeout, model=chosen,
         )
     return await _anthropic(
         key=key, system=system, user=user, max_tokens=max_tokens,
-        effort=effort, schema=schema, web=web, timeout=timeout,
+        effort=effort, schema=schema, web=web, timeout=timeout, model=chosen,
     )
 
 
 async def _openrouter(
     *, key: str, system: str, user: str, max_tokens: int, effort: str,
-    schema: dict[str, Any] | None, web: bool, timeout: float,
+    schema: dict[str, Any] | None, web: bool, timeout: float, model: str,
 ) -> str:
     """OpenAI-shaped request against the gateway."""
     payload: dict[str, Any] = {
-        "model": model(),
+        "model": model,
         "max_tokens": max_tokens,
         "reasoning": {"effort": effort},
         "messages": [
@@ -468,7 +492,7 @@ def _openrouter_error(response: httpx.Response) -> str:
 
 async def _anthropic(
     *, key: str, system: str, user: str, max_tokens: int, effort: str,
-    schema: dict[str, Any] | None, web: bool, timeout: float,
+    schema: dict[str, Any] | None, web: bool, timeout: float, model: str,
 ) -> str:
     """The official SDK, for a key that talks to Anthropic directly."""
     try:
@@ -480,7 +504,7 @@ async def _anthropic(
     if schema is not None:
         output_config["format"] = {"type": "json_schema", "schema": schema}
     request: dict[str, Any] = {
-        "model": model(),
+        "model": model,
         "max_tokens": max_tokens,
         "output_config": output_config,
         "system": system,
@@ -610,6 +634,7 @@ async def review(payload: dict[str, Any]) -> dict[str, Any]:
         # UI renders the result field by field.
         effort="high",
         schema=REVIEW_SCHEMA,
+        use_model=review_model(),
     )
     return parse_json(text)
 
@@ -646,7 +671,10 @@ async def check_key() -> dict[str, Any]:
         effort="low",
         timeout=45.0,
     )
-    return {"ok": True, "provider": provider(), "model": model(), "reply": text[:80]}
+    return {
+        "ok": True, "provider": provider(), "model": model(),
+        "review_model": review_model(), "reply": text[:80],
+    }
 
 
 __all__ = [
@@ -661,6 +689,7 @@ __all__ = [
     "complete",
     "enabled",
     "model",
+    "review_model",
     "parse_brief",
     "parse_json",
     "provider",

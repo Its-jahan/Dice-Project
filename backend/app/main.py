@@ -1363,6 +1363,7 @@ def get_ai_settings() -> dict[str, object]:
         "anthropic_hint": _key_hint(db.get_setting("anthropic_api_key")),
         "enrichment": ai.enabled(),
         "model": ai.model(),
+        "review_model": ai.review_model(),
         "default_models": ai.DEFAULT_MODELS,
         "themes": db.theme_counts(),
     }
@@ -1374,6 +1375,7 @@ def save_ai_settings(body: Annotated[dict, Body()]) -> dict[str, object]:
         ("openrouter_api_key", "openrouter_api_key"),
         ("anthropic_api_key", "anthropic_api_key"),
         ("model", "ai_model"),
+        ("review_model", "ai_review_model"),
     ):
         if field not in body:
             continue

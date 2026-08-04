@@ -562,7 +562,9 @@ async def test_the_key_can_be_proved_before_a_signal_needs_it(store, monkeypatch
     result = await ai.check_key()
     assert result == {
         "ok": True, "provider": "openrouter",
-        "model": "anthropic/claude-opus-5", "reply": "ok",
+        "model": "anthropic/claude-opus-5",
+        "review_model": "anthropic/claude-opus-5",
+        "reply": "ok",
     }
 
 
@@ -727,3 +729,46 @@ async def test_a_dismissed_signal_is_not_researched(client, monkeypatch):
 
     assert await realtime.backfill_briefs() == 0
     assert calls == 0
+
+
+# ------------------------------------------------- brief vs review model
+
+
+@pytest.mark.anyio
+async def test_the_review_uses_the_strong_model_even_on_a_cheap_brief_model(
+    store, monkeypatch
+):
+    """The two jobs are not alike, and the economics agree with the quality.
+
+    A brief is search-and-summarise, runs on every signal, and a small model
+    does it well. The review decides what a handful of numbers does *not* yet
+    support — measured on identical data, a cheap model answered "confidence:
+    high" where the strong one answered "confidence: none" and explained that
+    every win rate in the scoreboard was null.
+    """
+    db.set_setting("openrouter_api_key", "sk-or-test")
+    db.set_setting("ai_model", "cheap/model")
+
+    assert ai.model() == "cheap/model"
+    assert ai.review_model() == "anthropic/claude-opus-5"
+
+    sent = _openrouter_stub(monkeypatch, _reply(BRIEF))
+    await ai.brief_token(chain="ethereum", token_address=GEM, symbol="GEM", facts={})
+    assert sent["body"]["model"] == "cheap/model"
+
+    verdict = {"verdict": "v", "confidence": "none", "recommendations": [],
+               "watch_next": "w"}
+    sent = _openrouter_stub(monkeypatch, _reply(json.dumps(verdict)))
+    await ai.review({})
+    assert sent["body"]["model"] == "anthropic/claude-opus-5"
+
+
+@pytest.mark.anyio
+async def test_the_review_model_can_still_be_chosen(store, monkeypatch):
+    db.set_setting("openrouter_api_key", "sk-or-test")
+    db.set_setting("ai_review_model", "something/else")
+    verdict = {"verdict": "v", "confidence": "low", "recommendations": [],
+               "watch_next": "w"}
+    sent = _openrouter_stub(monkeypatch, _reply(json.dumps(verdict)))
+    await ai.review({})
+    assert sent["body"]["model"] == "something/else"
