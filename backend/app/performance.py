@@ -105,17 +105,58 @@ def _returns(rows: list[dict[str, Any]], column: str) -> list[float]:
     return out
 
 
+def _due_at(fired_at: str | None, age: timedelta) -> datetime | None:
+    """When a horizon becomes measurable for one signal."""
+    if not fired_at:
+        return None
+    try:
+        fired = datetime.fromisoformat(fired_at)
+    except ValueError:
+        return None
+    if fired.tzinfo is None:
+        fired = fired.replace(tzinfo=timezone.utc)
+    return fired + age
+
+
 def summarise(rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-    """Hit rate and median return per horizon, plus how early the signals were."""
+    """Hit rate and median return per horizon, plus how early the signals were.
+
+    Each horizon also reports how many signals are simply *too young* to have
+    an answer and when the next one is due. Without that a fresh install shows
+    three dashes and no way to tell "nothing has happened yet" from "this is
+    broken" — which is the wrong conclusion to leave available, because the
+    honest state of a new scoreboard is mostly empty for a day.
+    """
     rows = db.list_outcomes(limit=1000) if rows is None else rows
+    now = _utcnow()
 
     horizons = []
     for column, age in HORIZONS.items():
         returns = _returns(rows, column)
+        # Split the unanswered into "waiting for the clock" and "due, and the
+        # checker has not got to it" — only the second is ever a problem.
+        waiting, overdue, soonest = 0, 0, None
+        for row in rows:
+            if row.get(column) is not None:
+                continue
+            due = _due_at(row.get("fired_at"), age)
+            if due is None:
+                continue
+            if due > now:
+                waiting += 1
+                soonest = due if soonest is None else min(soonest, due)
+            else:
+                overdue += 1
         horizons.append(
             {
                 "horizon": column.replace("price_", ""),
                 "measured": len(returns),
+                "waiting": waiting,
+                "overdue": overdue,
+                "next_due_in_hours": (
+                    round((soonest - now).total_seconds() / 3600, 1)
+                    if soonest else None
+                ),
                 # The number that matters: how often it went up at all.
                 "win_rate": (
                     round(sum(1 for r in returns if r > 0) / len(returns) * 100, 1)
@@ -130,7 +171,13 @@ def summarise(rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     ages = [r["pool_age_hours"] for r in rows if r.get("pool_age_hours") is not None]
     return {
         "signals": len(rows),
-        "pending": sum(1 for r in rows if r.get("price_24h") is None),
+        # Scored at all, on any horizon — the number someone means by "is this
+        # working". The old "pending" counted signals with no 24h price, which
+        # read as "nothing measured" while a 1h column sat full beside it.
+        "scored": sum(
+            1 for r in rows
+            if any(r.get(c) is not None for c in HORIZONS)
+        ),
         "horizons": horizons,
         # How early the system actually is, rather than how early it feels.
         "median_pool_age_hours": round(statistics.median(ages), 1) if ages else None,

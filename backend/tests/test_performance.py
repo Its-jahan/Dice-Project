@@ -328,7 +328,7 @@ async def test_board_filters_on_pool_age_but_keeps_unknown_ages(client, monkeypa
 # --------------------------------------------------------------------- API
 
 
-def test_performance_endpoint_reports_pending_work(client, monkeypatch):
+def test_the_endpoint_says_what_is_scored_and_what_is_merely_early(client, monkeypatch):
     monkeypatch.setattr(dexscreener, "market_data", _market(price=0.02))
     _live_watchlist(client)
     for wallet in WALLETS[:5]:
@@ -337,5 +337,66 @@ def test_performance_endpoint_reports_pending_work(client, monkeypatch):
 
     body = client.get("/api/signals/performance").json()
     assert body["signals"] == 1
-    assert body["pending"] == 1          # the 24 h mark has not arrived
+    assert body["scored"] == 0           # nothing has come of age yet
+    by = {h["horizon"]: h for h in body["horizons"]}
+    # Empty because it is early, not because anything is wrong.
+    assert by["24h"]["waiting"] == 1 and by["24h"]["overdue"] == 0
     assert body["recent"][0]["entry_price"] == 0.02
+
+
+# ------------------------------------------- saying why a horizon is empty
+
+
+def test_a_horizon_says_whether_it_is_early_or_late():
+    """An empty scoreboard must not be indistinguishable from a broken one.
+
+    A bare dash gives a reader no way to tell "this has not elapsed yet" from
+    "this is not working", and a reader who cannot tell assumes broken — which
+    is the wrong conclusion, because the honest state of a new scoreboard is
+    mostly empty for a day.
+    """
+    now = datetime.now(timezone.utc)
+    rows = [
+        # Fired two hours ago: the 1h answer exists, 24h cannot yet.
+        {"fired_at": (now - timedelta(hours=2)).isoformat(),
+         "entry_price": 1.0, "price_1h": 1.5, "price_24h": None, "price_7d": None,
+         "pool_age_hours": 5.0},
+    ]
+    summary = performance.summarise(rows)
+    by = {h["horizon"]: h for h in summary["horizons"]}
+
+    assert by["1h"]["measured"] == 1
+    assert by["1h"]["waiting"] == 0 and by["1h"]["overdue"] == 0
+
+    assert by["24h"]["measured"] == 0
+    assert by["24h"]["waiting"] == 1          # too young, not broken
+    assert by["24h"]["overdue"] == 0
+    assert 21 < by["24h"]["next_due_in_hours"] <= 22
+
+    # "Scored" means measured on any horizon — the number someone means when
+    # they ask whether this is working at all.
+    assert summary["scored"] == 1
+
+
+def test_a_horizon_that_is_due_and_unanswered_is_reported_as_overdue():
+    """The one state that really is a problem, told apart from the rest."""
+    now = datetime.now(timezone.utc)
+    rows = [
+        {"fired_at": (now - timedelta(hours=30)).isoformat(),
+         "entry_price": 1.0, "price_1h": None, "price_24h": None, "price_7d": None,
+         "pool_age_hours": 5.0},
+    ]
+    by = {h["horizon"]: h for h in performance.summarise(rows)["horizons"]}
+
+    assert by["1h"]["overdue"] == 1 and by["1h"]["waiting"] == 0
+    assert by["24h"]["overdue"] == 1
+    assert by["7d"]["waiting"] == 1           # still in the future
+    assert performance.summarise(rows)["scored"] == 0
+
+
+def test_an_unmeasurable_signal_is_not_counted_as_waiting():
+    """A row with no fired_at cannot be due for anything."""
+    rows = [{"fired_at": None, "entry_price": 1.0, "price_1h": None,
+             "price_24h": None, "price_7d": None, "pool_age_hours": None}]
+    by = {h["horizon"]: h for h in performance.summarise(rows)["horizons"]}
+    assert all(h["waiting"] == 0 and h["overdue"] == 0 for h in by.values())

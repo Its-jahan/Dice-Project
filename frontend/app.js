@@ -1607,19 +1607,43 @@ function ageBadge(hours) {
   return badge;
 }
 
-/** A percentage return, coloured by direction. */
-function returnCell(entry, later) {
+/** A percentage return, coloured by direction — or why there isn't one yet. */
+function returnCell(entry, later, dueInHours) {
   if (!entry || later === null || later === undefined) {
-    return el("span", "small text-body-secondary", "—");
+    // A bare dash cannot distinguish "too early" from "broken", and a reader
+    // who cannot tell assumes broken.
+    if (dueInHours !== null && dueInHours !== undefined && dueInHours > 0) {
+      const wait = el("span", "small text-body-secondary", `in ${fmtWait(dueInHours)}`);
+      wait.title =
+        "Not measurable yet — this horizon has not elapsed since the signal " +
+        "fired. It fills in on its own.";
+      return wait;
+    }
+    const dash = el("span", "small text-body-secondary", "—");
+    dash.title = "Due, but no price recorded yet. Use “Check prices now”.";
+    return dash;
   }
   const pct = ((later - entry) / entry) * 100;
+  // Anything that rounds to zero is flat, not a loss. Showing "-0.0%" in red
+  // makes an unchanged price look like a losing trade.
+  const flat = Math.abs(pct) < 0.05;
   const node = el(
     "span",
-    "fw-medium " + (pct > 0 ? "text-success" : pct < 0 ? "text-danger" : ""),
-    `${pct > 0 ? "+" : ""}${pct.toFixed(1)}%`,
+    "fw-medium " +
+      (flat ? "text-body-secondary" : pct > 0 ? "text-success" : "text-danger"),
+    flat ? "0.0%" : `${pct > 0 ? "+" : ""}${pct.toFixed(1)}%`,
   );
-  node.title = `$${Number(entry).toPrecision(4)} → $${Number(later).toPrecision(4)}`;
+  node.title =
+    `$${Number(entry).toPrecision(4)} → $${Number(later).toPrecision(4)}` +
+    (flat ? " — unchanged to within a rounding place" : "");
   return node;
+}
+
+/** "3h" / "22h" / "6d" — how long until a horizon can be answered. */
+function fmtWait(hours) {
+  if (hours < 1) return `${Math.max(1, Math.round(hours * 60))}m`;
+  if (hours < 48) return `${Math.round(hours)}h`;
+  return `${Math.round(hours / 24)}d`;
 }
 
 async function loadPerformance() {
@@ -1663,7 +1687,7 @@ function renderPerformance() {
     const col = el("div", "col-6 col-lg-3");
     const box = el("div", "border rounded p-2 h-100");
     box.appendChild(el("div", "small text-body-secondary", `After ${horizon.horizon}`));
-    if (horizon.measured) {
+    if (horizon.measured) {  // eslint-disable-line
       const value = el(
         "div",
         "h5 mb-0 " +
@@ -1685,9 +1709,33 @@ function renderPerformance() {
       box.title =
         `Median return ${horizon.median_return}% across ${horizon.measured} ` +
         `signals. Best ${horizon.best}%, worst ${horizon.worst}%.`;
+    } else if (horizon.waiting) {
+      // Say when, not just "no". The honest state of a new scoreboard is
+      // empty for a day, and it should read that way rather than as a fault.
+      box.appendChild(
+        el("div", "h5 mb-0 text-body-secondary", `in ${fmtWait(horizon.next_due_in_hours)}`),
+      );
+      box.appendChild(
+        el(
+          "div",
+          "small text-body-secondary",
+          `${horizon.waiting} signal${horizon.waiting > 1 ? "s" : ""} too young`,
+        ),
+      );
+    } else if (horizon.overdue) {
+      // This is the only state that is actually a problem.
+      const value = el("div", "h5 mb-0 text-warning", "overdue");
+      box.appendChild(value);
+      box.appendChild(
+        el(
+          "div",
+          "small text-body-secondary",
+          `${horizon.overdue} due — press “Check prices now”`,
+        ),
+      );
     } else {
       box.appendChild(el("div", "h5 mb-0 text-body-secondary", "—"));
-      box.appendChild(el("div", "small text-body-secondary", "not measured yet"));
+      box.appendChild(el("div", "small text-body-secondary", "no signals yet"));
     }
     col.appendChild(box);
     cards.appendChild(col);
@@ -1706,7 +1754,12 @@ function renderPerformance() {
     ),
   );
   box.appendChild(
-    el("div", "small text-body-secondary", `${data.signals || 0} signals · ${data.pending || 0} pending`),
+    el(
+      "div",
+      "small text-body-secondary",
+      `${data.signals || 0} signal${data.signals === 1 ? "" : "s"} · ` +
+        `${data.scored || 0} scored`,
+    ),
   );
   box.title =
     "How old the liquidity pool was when the signals fired — the honest " +
@@ -1750,8 +1803,14 @@ function renderPerformance() {
       row.entry_price === null || row.entry_price === undefined
         ? "—"
         : "$" + Number(row.entry_price).toPrecision(4);
-    for (const column of ["price_1h", "price_24h", "price_7d"]) {
-      tr.insertCell().appendChild(returnCell(row.entry_price, row[column]));
+    const dueIn = {};
+    for (const h of data.horizons || []) dueIn[h.horizon] = h.next_due_in_hours;
+    for (const [column, key] of [
+      ["price_1h", "1h"], ["price_24h", "24h"], ["price_7d", "7d"],
+    ]) {
+      tr.insertCell().appendChild(
+        returnCell(row.entry_price, row[column], dueIn[key]),
+      );
     }
   }
 }

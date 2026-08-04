@@ -370,6 +370,15 @@ Only the *first* fire is recorded. A signal that keeps gaining buyers is the
 same opportunity, and re-stamping it would quietly re-baseline the entry to a
 price the signal itself may have helped move.
 
+An empty horizon says **why** it is empty. "in 22h · 2 signals too young" is
+a different statement from "overdue · press Check prices now", and both are
+different from a bare dash — which cannot distinguish "this has not elapsed
+yet" from "this is broken". A reader who cannot tell assumes broken, and the
+honest state of a new scoreboard is mostly empty for a day.
+
+For the same reason a return that rounds to zero is shown as flat and grey
+rather than as `-0.0%` in red: an unchanged price is not a losing trade.
+
 Two failure modes are recorded honestly rather than hidden. A token whose pool
 has vanished reads as **-100%**, because that is the truth: the position could
 not be exited. A price lookup that *fails* leaves the horizon **pending**, so
