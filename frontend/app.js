@@ -131,6 +131,16 @@ const FIELD_HELP = {
   poolMinWallets:
     "An absolute floor under the percentage, so a small pool cannot fire on " +
     "one or two wallets. The higher of the two applies.",
+  signalMaxPoolAge:
+    "Refuse to fire a signal on a token whose liquidity pool is older than " +
+    "this. This is the setting that makes 'early' mean something. On a pool " +
+    "of thousands of wallets, five-year-old blue chips like LINK and AAVE " +
+    "attract more simultaneous buyers than a real day-old launch does — " +
+    "simply because more people hold them. Without a limit there is no " +
+    "threshold that catches the discovery and rejects the background: set it " +
+    "high and nothing fires, set it low and your loudest alerts are the least " +
+    "interesting tokens on the chain. Tokens whose age is unknown are never " +
+    "blocked. Empty means no limit.",
   liveMaxPoolAge:
     "Hide tokens whose liquidity pool is older than this many hours. The " +
     "whole point of the system is to be early, and a pool that has existed " +
@@ -1307,6 +1317,7 @@ async function loadPoolSettings() {
     $("poolPct").value = data.pool_pct;
     $("poolMinWallets").value = data.pool_min_wallets;
     $("signalAirdrops").checked = !!data.signal_airdrops;
+    $("signalMaxPoolAge").value = data.max_pool_age_hours ?? "";
     $("riskScreening").checked = !!data.risk_screening;
     const pools = (data.pools || [])
       .map(
@@ -1331,6 +1342,8 @@ async function savePoolSettings() {
           pool_pct: Number($("poolPct").value),
           pool_min_wallets: Number($("poolMinWallets").value),
           signal_airdrops: $("signalAirdrops").checked,
+          // Empty means no limit, which the API stores by clearing the setting.
+          max_pool_age_hours: $("signalMaxPoolAge").value.trim() || null,
           risk_screening: $("riskScreening").checked,
         },
       });

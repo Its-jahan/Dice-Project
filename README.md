@@ -350,6 +350,25 @@ has vanished reads as **-100%**, because that is the truth: the position could
 not be exited. A price lookup that *fails* leaves the horizon **pending**, so
 an API outage is never recorded as a token going to zero.
 
+### The setting that makes "early" mean something
+
+`max_pool_age_hours` refuses to fire a signal on a token whose liquidity pool
+is older than the limit. It is not a nicety — without it there is no threshold
+that works at all.
+
+Measured on a live pool of 6,231 watched wallets: the tokens attracting the
+most simultaneous buyers were LINK, AAVE, SHIB and APE, with pools **45,000+
+hours old**. Five years. They lead not because anything is happening but
+because more wallets hold them. A genuine 35-hour-old launch sat at a similar
+count. So raising the threshold silences everything, and lowering it fills
+Telegram with blue chips — the count alone cannot express "early", and only
+the age can.
+
+Tokens whose age DexScreener does not report are never blocked: missing
+metadata is not evidence of an old pool, and silently dropping signals on
+absent data is the failure mode hardest to notice. Empty means no limit, so
+nothing changes for an install that does not set it.
+
 **Pool age** answers the question the whole system exists for — how early was
 this, really? Ten wallets buying a two-hour-old pool and ten buying a
 two-year-old one are different events, and only one of them is being early. The

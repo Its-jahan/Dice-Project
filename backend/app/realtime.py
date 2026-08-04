@@ -299,6 +299,41 @@ def pool_min_wallets() -> int:
         return settings.pool_min_wallets
 
 
+def max_pool_age_hours() -> float | None:
+    """Ignore tokens whose pool is older than this. None means no limit.
+
+    Being early is the entire premise, and the count alone cannot express it:
+    on a pool of thousands of wallets, five-year-old blue chips like LINK and
+    AAVE attract more simultaneous buyers than a genuine day-old launch does,
+    purely because more people hold them. Without an age limit there is no
+    threshold that admits the discovery and rejects the background — set it
+    high and nothing fires, set it low and the loudest signals are the least
+    interesting tokens on the chain.
+    """
+    stored = db.get_setting("max_pool_age_hours")
+    if stored is None:
+        return settings.max_pool_age_hours
+    try:
+        value = float(stored)
+    except ValueError:
+        return settings.max_pool_age_hours
+    return value if value > 0 else None
+
+
+def too_old(market: dict[str, Any] | None) -> bool:
+    """Whether a token's pool predates the age limit.
+
+    A token whose age cannot be established is never rejected: missing
+    metadata is not evidence of an old pool, and silently dropping signals on
+    absent data is the failure mode hardest to notice.
+    """
+    limit = max_pool_age_hours()
+    if limit is None:
+        return False
+    age = performance.pool_age_hours((market or {}).get("pair_created_at"))
+    return age is not None and age > limit
+
+
 def pool_threshold(pool: int) -> int:
     """How many distinct wallets, out of the whole pool, a token needs.
 
@@ -374,6 +409,9 @@ def evaluate_pool(
         only_buys=not signal_airdrops(),
     )
     if not rows or len(rows) < pool_threshold(len(wallets)):
+        return None
+    if too_old(market):
+        # Plenty of wallets, but not a discovery — see max_pool_age_hours().
         return None
 
     market = market or {}

@@ -1174,6 +1174,7 @@ async def get_pool_settings() -> dict[str, object]:
         "pool_min_wallets": realtime.pool_min_wallets(),
         "signal_airdrops": realtime.signal_airdrops(),
         "risk_screening": realtime.risk_screening(),
+        "max_pool_age_hours": realtime.max_pool_age_hours(),
         "window_hours": realtime.pool_window_hours(),
         "pools": [
             {
@@ -1210,6 +1211,23 @@ async def save_pool_settings(body: Annotated[dict, Body()]) -> dict[str, object]
                 status_code=422, detail="pool_min_wallets must be at least 2."
             )
         db.set_setting("pool_min_wallets", str(floor))
+    if "max_pool_age_hours" in body:
+        raw = body["max_pool_age_hours"]
+        if raw in (None, "", 0):
+            db.delete_setting("max_pool_age_hours")  # no limit
+        else:
+            try:
+                age = float(raw)
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=422,
+                    detail="max_pool_age_hours must be a number of hours.",
+                )
+            if age <= 0:
+                raise HTTPException(
+                    status_code=422, detail="max_pool_age_hours must be positive."
+                )
+            db.set_setting("max_pool_age_hours", str(age))
     if "risk_screening" in body:
         db.set_setting(
             "risk_screening", "true" if body["risk_screening"] else "false"

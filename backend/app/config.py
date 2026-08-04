@@ -24,6 +24,17 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float_or_none(name: str) -> float | None:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
 def _env_bool(name: str, default: bool) -> bool:
     raw = (os.getenv(name) or "").strip().lower()
     if not raw:
@@ -130,6 +141,11 @@ class Settings:
     # Screen the contract before a signal goes out. Only unsellability blocks;
     # taxes, open mint authority and unlocked liquidity are attached as
     # warnings, because they make a trade unwise rather than impossible.
+    # None means no limit. Set it and pooled signals ignore tokens whose
+    # liquidity pool is older — see realtime.max_pool_age_hours().
+    max_pool_age_hours: float | None = field(
+        default_factory=lambda: _env_float_or_none("DICE_MAX_POOL_AGE_HOURS")
+    )
     risk_screening: bool = field(
         default_factory=lambda: _env_bool("DICE_RISK_SCREENING", True)
     )

@@ -21,7 +21,7 @@ OTHER = "0x" + "7" * 40
 USDC = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
 
 
-def _fake_market(**_kwargs):
+def _fake_market(pair_created_at=None, **_kwargs):
     """Stub DexScreener: every token in a test is tradeable unless said otherwise."""
 
     async def market_data(chain, addresses, refresh=False):
@@ -35,7 +35,7 @@ def _fake_market(**_kwargs):
                 "symbol": None,
                 "name": None,
                 "pair_url": None,
-                "pair_created_at": None,
+                "pair_created_at": pair_created_at,
             }
             for address in addresses
         }
@@ -552,3 +552,64 @@ def test_sweep_ignores_tokens_below_threshold(client):
 
 def test_sweep_with_nothing_live_is_a_no_op(client):
     assert client.post("/api/live/sweep").json() == {"checked": 0, "signals": 0}
+
+
+# --------------------------------------------------------------- pool age
+
+
+def test_an_old_pool_cannot_signal_however_many_wallets_buy_it(client, monkeypatch):
+    """The count alone cannot express "early".
+
+    On a pool of thousands of wallets, a five-year-old blue chip attracts more
+    simultaneous buyers than a genuine day-old launch, purely because more
+    people hold it. Without the age gate the loudest signals are the least
+    interesting tokens on the chain.
+    """
+    monkeypatch.setattr(
+        dexscreener, "market_data", _fake_market(pair_created_at="2021-01-01T00:00:00+00:00")
+    )
+    _live_watchlist(client, min_wallets=5)
+    db.set_setting("max_pool_age_hours", "168")  # a week
+
+    for wallet in WALLETS[:8]:
+        _buy(client, wallet)
+
+    assert client.get("/api/signals").json() == []
+
+
+def test_a_fresh_pool_still_signals_under_the_same_limit(client, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    fresh = (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat()
+    monkeypatch.setattr(dexscreener, "market_data", _fake_market(pair_created_at=fresh))
+    _live_watchlist(client, min_wallets=5)
+    db.set_setting("max_pool_age_hours", "168")
+
+    for wallet in WALLETS[:8]:
+        _buy(client, wallet)
+
+    assert len(client.get("/api/signals").json()) == 1
+
+
+def test_an_unknown_pool_age_is_never_rejected(client, monkeypatch):
+    """Missing metadata is not evidence of an old pool."""
+    monkeypatch.setattr(dexscreener, "market_data", _fake_market(pair_created_at=None))
+    _live_watchlist(client, min_wallets=5)
+    db.set_setting("max_pool_age_hours", "168")
+
+    for wallet in WALLETS[:8]:
+        _buy(client, wallet)
+
+    assert len(client.get("/api/signals").json()) == 1
+
+
+def test_with_no_limit_set_nothing_is_filtered(client, monkeypatch):
+    monkeypatch.setattr(
+        dexscreener, "market_data", _fake_market(pair_created_at="2021-01-01T00:00:00+00:00")
+    )
+    _live_watchlist(client, min_wallets=5)
+
+    for wallet in WALLETS[:8]:
+        _buy(client, wallet)
+
+    assert len(client.get("/api/signals").json()) == 1

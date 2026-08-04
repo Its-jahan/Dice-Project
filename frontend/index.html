@@ -427,8 +427,15 @@
             </div>
           </div>
           <div class="col-md-2">
+            <label class="form-label small mb-1" for="signalMaxPoolAge">
+              Signal only if pool &lt; (h)
+            </label>
+            <input id="signalMaxPoolAge" type="number" min="1" step="1"
+                   placeholder="no limit" class="form-control form-control-sm">
+          </div>
+          <div class="col-md-2">
             <label class="form-label small mb-1" for="liveMaxPoolAge">
-              Max pool age (h)
+              Board filter: age (h)
             </label>
             <input id="liveMaxPoolAge" type="number" min="1" step="1"
                    placeholder="any" class="form-control form-control-sm">
