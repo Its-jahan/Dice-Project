@@ -953,7 +953,38 @@ async def sync_realtime_chain(chain: Chain) -> dict[str, object]:
                 existing = db.get_webhook(chain.value)
 
             webhook_id = existing["webhook_id"]
-            registered = set(await client.list_addresses(webhook_id))
+            try:
+                registered = set(await client.list_addresses(webhook_id))
+            except alchemy.AlchemyError as gone:
+                # The webhook was deleted or recreated on Alchemy's side, so
+                # our stored id points at nothing. Without this the sync fails
+                # with "Webhook not found" on every retry and live monitoring
+                # stays dead — silently, because the app still shows a webhook
+                # and a wallet count. Re-create instead, and note that the
+                # signing key changes with it.
+                if gone.status_code != 404:
+                    raise
+                log.warning(
+                    "webhook %s no longer exists at Alchemy; recreating",
+                    webhook_id,
+                )
+                db.delete_webhook(chain.value)
+                created = await client.create_address_webhook(
+                    network=network,
+                    webhook_url=_webhook_url(),
+                    addresses=sorted(wanted),
+                )
+                db.save_webhook(
+                    chain=chain.value,
+                    network=network,
+                    webhook_id=str(created["id"]),
+                    signing_key=str(created.get("signing_key") or ""),
+                    webhook_url=_webhook_url(),
+                    address_count=len(wanted),
+                )
+                existing = db.get_webhook(chain.value)
+                webhook_id = existing["webhook_id"]
+                registered = set(await client.list_addresses(webhook_id))
             to_add = sorted(wanted - registered)
             to_remove = sorted(registered - wanted)
             if to_add or to_remove:

@@ -8,7 +8,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from app import db, main
+from app import alchemy, db, main
 from app import dexscreener
 from app.cache import DiskCache
 from app.config import settings
@@ -314,3 +314,104 @@ def _mock_httpx(monkeypatch, handler):
         return real_client(transport=httpx.MockTransport(handler), **kwargs)
 
     monkeypatch.setattr(main.httpx, "AsyncClient", factory)
+
+
+# ------------------------------------------------ a webhook deleted upstream
+
+
+def test_sync_recreates_a_webhook_that_no_longer_exists(client, monkeypatch):
+    """Deleting the webhook in Alchemy's dashboard must not be terminal.
+
+    Without recovery the sync answers "Webhook not found" on every retry and
+    live monitoring stays dead — silently, because the app still shows a
+    webhook row and a wallet count.
+    """
+    db.set_setting("alchemy_auth_token", "alcht_token")
+    db.set_setting("public_base_url", "https://dice.example")
+    db.save_webhook(
+        chain="ethereum", network="ETH_MAINNET", webhook_id="wh_deleted",
+        signing_key="whsec-old", webhook_url="https://dice.example/api/webhooks/alchemy",
+        address_count=3,
+    )
+    db.create_watchlist(
+        name="cohort", chain="ethereum", wallets=[f"0x{i:040x}" for i in range(1, 4)],
+        source_token_address=None, notes="", min_wallets=2, min_wallets_pct=0.0,
+        buy_window_hours=48, monitor_interval_hours=24.0, min_buy_usd=0.0,
+        auto_monitor=False, ignore_tokens=[], realtime=True,
+    )
+
+    calls = []
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return None
+
+        async def list_addresses(self, webhook_id, **kwargs):
+            calls.append(("list", webhook_id))
+            if webhook_id == "wh_deleted":
+                raise alchemy.AlchemyError("Webhook not found", status_code=404)
+            return []
+
+        async def create_address_webhook(self, **kwargs):
+            calls.append(("create", kwargs["network"]))
+            return {"id": "wh_fresh", "signing_key": "whsec-new"}
+
+        async def update_addresses(self, webhook_id, add, remove):
+            calls.append(("update", webhook_id, len(add), len(remove)))
+
+    monkeypatch.setattr(alchemy, "AlchemyNotifyClient", lambda *a, **k: FakeClient())
+
+    body = client.post("/api/settings/realtime/sync").json()
+
+    assert body["synced"][0]["webhook_id"] == "wh_fresh"
+    assert [c[0] for c in calls] == ["list", "create", "list", "update"]
+    # The replacement carries its own signing key; keeping the old one would
+    # make every delivery fail signature verification.
+    stored = db.get_webhook("ethereum")
+    assert stored["webhook_id"] == "wh_fresh"
+    assert stored["signing_key"] == "whsec-new"
+
+
+def test_a_non_404_error_is_not_treated_as_a_missing_webhook(client, monkeypatch):
+    """A rate limit or outage must not cause a spurious webhook to be created."""
+    db.set_setting("alchemy_auth_token", "alcht_token")
+    db.set_setting("public_base_url", "https://dice.example")
+    db.save_webhook(
+        chain="ethereum", network="ETH_MAINNET", webhook_id="wh_live",
+        signing_key="whsec-old", webhook_url="https://dice.example/api/webhooks/alchemy",
+        address_count=3,
+    )
+    db.create_watchlist(
+        name="cohort", chain="ethereum", wallets=[f"0x{i:040x}" for i in range(1, 4)],
+        source_token_address=None, notes="", min_wallets=2, min_wallets_pct=0.0,
+        buy_window_hours=48, monitor_interval_hours=24.0, min_buy_usd=0.0,
+        auto_monitor=False, ignore_tokens=[], realtime=True,
+    )
+    created = False
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return None
+
+        async def list_addresses(self, webhook_id, **kwargs):
+            raise alchemy.AlchemyError("rate limited", status_code=429)
+
+        async def create_address_webhook(self, **kwargs):
+            nonlocal created
+            created = True
+            return {"id": "wh_should_not_happen", "signing_key": "x"}
+
+    monkeypatch.setattr(alchemy, "AlchemyNotifyClient", lambda *a, **k: FakeClient())
+
+    # The multi-chain sync reports a per-chain failure in the body rather
+    # than failing the whole request, so one bad chain cannot hide the others.
+    body = client.post("/api/settings/realtime/sync").json()
+    assert "rate limited" in body["synced"][0]["error"]
+    assert created is False
+    assert db.get_webhook("ethereum")["webhook_id"] == "wh_live"
