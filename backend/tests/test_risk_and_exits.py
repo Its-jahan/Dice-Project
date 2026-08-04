@@ -20,6 +20,12 @@ GEM = "0x" + "9" * 40
 WETH = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
 
 
+def _settle(client):
+    """A delivery only records; the sweep turns it into a signal."""
+    return client.post("/api/live/sweep").json()
+
+
+
 def _market():
     async def market_data(chain, addresses, refresh=False):
         return {
@@ -197,6 +203,7 @@ async def test_a_honeypot_never_becomes_a_signal(client, monkeypatch):
     _live_watchlist(client)
     for wallet in WALLETS[:6]:
         _buy(client, wallet)
+    _settle(client)
 
     # Six of ten wallets bought — over the 50% threshold — and it still must
     # not fire, because the contract will not let anyone sell.
@@ -226,6 +233,7 @@ async def test_warnings_travel_with_the_signal_instead_of_blocking_it(client, mo
     _live_watchlist(client)
     for wallet in WALLETS[:6]:
         _buy(client, wallet)
+    _settle(client)
 
     signals = client.get("/api/signals").json()
     assert len(signals) == 1
@@ -248,6 +256,7 @@ async def test_screening_can_be_switched_off(client, monkeypatch):
     _live_watchlist(client)
     for wallet in WALLETS[:6]:
         _buy(client, wallet)
+    _settle(client)
 
     assert len(client.get("/api/signals").json()) == 1
     assert called is False

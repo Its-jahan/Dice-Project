@@ -1206,6 +1206,7 @@ async def get_pool_settings() -> dict[str, object]:
         "signal_airdrops": realtime.signal_airdrops(),
         "risk_screening": realtime.risk_screening(),
         "max_pool_age_hours": realtime.max_pool_age_hours(),
+        "sweep_seconds": realtime.sweep_seconds(),
         "window_hours": realtime.pool_window_hours(),
         "pools": [
             {
@@ -1259,6 +1260,20 @@ async def save_pool_settings(body: Annotated[dict, Body()]) -> dict[str, object]
                     status_code=422, detail="max_pool_age_hours must be positive."
                 )
             db.set_setting("max_pool_age_hours", str(age))
+    if "sweep_seconds" in body:
+        try:
+            seconds = int(body["sweep_seconds"])
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=422, detail="sweep_seconds must be a whole number."
+            )
+        if seconds < 15:
+            raise HTTPException(
+                status_code=422,
+                detail="sweep_seconds must be at least 15 — every pass spends "
+                "market and risk lookups, which is the budget that runs out.",
+            )
+        db.set_setting("live_sweep_seconds", str(seconds))
     if "risk_screening" in body:
         db.set_setting(
             "risk_screening", "true" if body["risk_screening"] else "false"
@@ -1674,6 +1689,11 @@ async def simulate_signal(body: Annotated[dict, Body()]) -> dict[str, object]:
     }
 
     summary = await realtime.ingest(payload, chain=chain)
+    # A delivery only records now, so the probe has to run the evaluation too
+    # — otherwise it would stop proving the thing it exists to prove: that
+    # everything downstream of Alchemy works, signal and notification included.
+    swept = await realtime.sweep()
+    summary = {**summary, "signals": int(swept["signals"])}
     db.record_delivery(
         chain=chain.value,
         status="simulated",

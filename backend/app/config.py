@@ -114,8 +114,12 @@ class Settings:
     )
     # How often the live sweep re-checks stored events against each live
     # watchlist's threshold. Reads only local SQLite, so this is cheap.
+    # How often stored events are turned into signals. Deliveries only record
+    # what they saw; this decides what it means, so it is also the ceiling on
+    # how late a signal can be — a minute, against pools that are hours old
+    # when they fire.
     live_sweep_seconds: int = field(
-        default_factory=lambda: _env_int("DICE_LIVE_SWEEP_SECONDS", 300)
+        default_factory=lambda: _env_int("DICE_LIVE_SWEEP_SECONDS", 60)
     )
     # A token needs at least this much pooled liquidity before it can signal.
     # 0 still requires a pool to exist — which is what excludes spam that was

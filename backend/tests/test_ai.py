@@ -89,6 +89,15 @@ def _live_watchlist():
     return created
 
 
+def _settle(client):
+    """Turn stored events into signals.
+
+    A delivery only records what it saw; the sweep is what evaluates it.
+    Tests that used to assert straight after a buy now say so explicitly.
+    """
+    return client.post("/api/live/sweep").json()
+
+
 def _buy(client, wallet):
     tx = f"0xb{wallet[-6:]}"
     payload = {
@@ -153,6 +162,7 @@ async def test_without_a_key_nothing_is_attempted(client, monkeypatch):
     _live_watchlist()
     for wallet in WALLETS[:6]:
         _buy(client, wallet)
+    _settle(client)
 
     assert len(client.get("/api/signals").json()) == 1
     assert called is False  # no key, so no request and no spend
@@ -171,6 +181,7 @@ async def test_a_slow_model_does_not_delay_the_signal(client, monkeypatch):
     _live_watchlist()
     for wallet in WALLETS[:6]:
         _buy(client, wallet)
+    _settle(client)
 
     signals = client.get("/api/signals").json()
     assert len(signals) == 1
@@ -189,6 +200,7 @@ async def test_a_refusal_or_outage_is_not_an_error(client, monkeypatch):
     _live_watchlist()
     for wallet in WALLETS[:6]:
         _buy(client, wallet)
+    _settle(client)
 
     assert len(client.get("/api/signals").json()) == 1
 
@@ -206,6 +218,7 @@ async def test_an_unexpected_exception_still_lets_the_signal_through(
     _live_watchlist()
     for wallet in WALLETS[:6]:
         _buy(client, wallet)
+    _settle(client)
 
     assert len(client.get("/api/signals").json()) == 1
 
@@ -233,6 +246,7 @@ async def test_the_webhook_never_waits_for_research(client, monkeypatch):
     _live_watchlist()
     for wallet in WALLETS[:6]:
         _buy(client, wallet)
+    _settle(client)
 
     assert len(client.get("/api/signals").json()) == 1
     assert called is False  # the alert went out without waiting on a model
@@ -251,6 +265,7 @@ async def test_a_brief_is_stored_and_reaches_the_signal(client, monkeypatch):
     _live_watchlist()
     for wallet in WALLETS[:6]:
         _buy(client, wallet)
+    _settle(client)
 
     # The research pass is what writes briefs, on the sweep's schedule.
     assert await realtime.backfill_briefs() == 1
@@ -282,6 +297,7 @@ async def test_a_strengthened_signal_is_not_re_briefed(client, monkeypatch):
         _buy(client, wallet)
     for wallet in WALLETS[6:9]:
         _buy(client, wallet)  # strengthens the same signal
+    _settle(client)
 
     await realtime.backfill_briefs()
     await realtime.backfill_briefs()  # nothing left to research
@@ -292,6 +308,7 @@ def test_a_signal_without_a_brief_says_so(client):
     _live_watchlist()
     for wallet in WALLETS[:6]:
         _buy(client, wallet)
+    _settle(client)
     signal_id = client.get("/api/signals").json()[0]["id"]
     assert client.get(f"/api/signals/{signal_id}/brief").status_code == 404
 
@@ -303,6 +320,7 @@ def test_themes_are_grouped_with_their_measured_returns(client):
     _live_watchlist()
     for wallet in WALLETS[:6]:
         _buy(client, wallet)
+    _settle(client)
     signal_id = client.get("/api/signals").json()[0]["id"]
 
     db.save_brief(
@@ -694,6 +712,7 @@ async def test_research_delivers_a_follow_up_rather_than_holding_the_alert(
     # a second alert, which would muddle the count this test is making.
     for wallet in WALLETS[:5]:
         _buy(client, wallet)
+    _settle(client)
 
     assert len(sent) == 1                    # the alert, with no model in the way
     assert "Research" not in sent[0]
@@ -723,6 +742,7 @@ async def test_a_dismissed_signal_is_not_researched(client, monkeypatch):
     _live_watchlist()
     for wallet in WALLETS[:6]:
         _buy(client, wallet)
+    _settle(client)
 
     signal_id = client.get("/api/signals").json()[0]["id"]
     client.post(f"/api/signals/{signal_id}/dismiss")

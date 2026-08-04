@@ -241,6 +241,31 @@ needed. It refreshes every 20 seconds.
 The window is each watchlist's own **buy window**, so if you want "10 wallets
 across 3 days" rather than 48 hours, set that list's buy window to 72.
 
+### Deliveries record; the sweep decides
+
+A webhook delivery stores what it saw and returns. It prices nothing and
+screens nothing. Every judgement — is this tradeable, is the contract safe,
+has it crossed the threshold — happens on the sweep, once a minute.
+
+That ordering is the whole point. The old path looked every token in every
+delivery up on DexScreener and screened it on GoPlus *before* asking the free
+question of whether any wallet count was near the threshold. Measured on a
+live install: **15 deliveries a minute touching 1,184 distinct tokens every
+five minutes**, almost all of them touched by two wallets and incapable of
+signalling. GoPlus screens one address per request and is rate limited, so the
+budget went on tokens that could never matter, and ran out.
+
+The sweep asks the questions in the right order — it counts wallets per token
+in SQLite, which is free, and looks up only the handful already over the line.
+
+**The cost is up to one minute of latency**, and two smaller things worth
+knowing: a signal's recorded entry price is the price at evaluation rather
+than at the instant the threshold was crossed, and `/api/live/sweep` is what
+turns stored events into signals. Against pools whose median age at signal is
+34 hours, a minute is not the constraint — spending the entire API budget
+before lunchtime is. `sweep_seconds` is configurable, with a floor of 15,
+because every pass that finds a candidate spends the budget that runs out.
+
 **Nothing gets missed.** Deliveries only re-check the tokens they touch, which
 leaves a gap: a token can become qualified for a reason no new buy will
 announce — the threshold was lowered, or wallets were added to the list after

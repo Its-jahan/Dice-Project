@@ -22,6 +22,12 @@ USDC = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"   # on the built-in stoplist
 OUTSIDER = "0x" + "e" * 40
 
 
+def _settle(client):
+    """A delivery only records; the sweep turns it into a signal."""
+    return client.post("/api/live/sweep").json()
+
+
+
 def _activity(to_address, token=GEM, tx="0xabc", **overrides):
     item = {
         "fromAddress": OUTSIDER,
@@ -256,7 +262,7 @@ def test_payment_in_a_different_transaction_does_not_launder_an_airdrop():
 # ------------------------------------------------------------ end to end
 
 
-def test_third_buyer_fires_a_signal_immediately(client):
+def test_the_third_buyer_crosses_the_line_and_the_sweep_fires_it(client):
     _live_watchlist(client)
 
     # Two buyers: below the threshold of 3, so nothing yet.
@@ -266,12 +272,19 @@ def test_third_buyer_fires_a_signal_immediately(client):
         )
         assert response.status_code == 200
         assert response.json()["signals"] == 0
+    _settle(client)
     assert client.get("/api/signals").json() == []
 
-    # The third buyer crosses it — the signal exists the moment the event lands.
+    # The third buyer crosses it. The delivery only records — it answers
+    # without pricing or screening anything, which is what keeps the API
+    # budget from going on tokens two wallets touched.
     response = _deliver(client, _payload(*_buy_activity(WALLETS[2], tx="0x2c")))
+    assert response.status_code == 200
+    assert response.json()["signals"] == 0
 
-    assert response.json()["signals"] == 1
+    # The sweep is what turns the stored events into the signal.
+    assert _settle(client)["signals"] == 1
+    _settle(client)
     signals = client.get("/api/signals").json()
     assert len(signals) == 1
     signal = signals[0]
@@ -297,6 +310,7 @@ def test_redelivery_does_not_double_count_a_buyer(client):
 
     assert first["stored"] == 3
     assert second["stored"] == 0
+    _settle(client)
     assert client.get("/api/signals").json()[0]["wallet_count"] == 3
 
 
@@ -309,6 +323,7 @@ def test_stoplisted_token_never_fires(client):
             _payload(_activity(WALLETS[index], token=USDC, tx=f"0xu{index}")),
         )
 
+    _settle(client)
     assert client.get("/api/signals").json() == []
 
 
@@ -316,6 +331,7 @@ def test_events_only_count_inside_the_buy_window(client):
     watchlist_id = _live_watchlist(client)
     for index in range(3):
         _deliver(client, _payload(*_buy_activity(WALLETS[index], tx=f"0x{index}")))
+    _settle(client)
     assert len(client.get("/api/signals").json()) == 1
 
     # Shrink the window so the stored events fall outside it; a re-evaluation

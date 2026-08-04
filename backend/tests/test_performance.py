@@ -20,6 +20,12 @@ WALLETS = [f"0x{i:040x}" for i in range(1, 11)]
 GEM = "0x" + "9" * 40
 
 
+def _settle(client):
+    """A delivery only records; the sweep turns it into a signal."""
+    return client.post("/api/live/sweep").json()
+
+
+
 def _market(price=0.01, *, created_at=None, liquidity=50_000.0):
     async def market_data(chain, addresses, refresh=False):
         return {
@@ -136,6 +142,7 @@ def test_firing_a_signal_stamps_the_entry_market(client, monkeypatch):
     for wallet in WALLETS[:5]:
         _buy(client, wallet)
 
+    _settle(client)
     assert client.get("/api/signals").json()  # sanity: it fired
 
     outcomes = db.list_outcomes()
@@ -159,10 +166,12 @@ def test_entry_price_is_not_rebaselined_by_later_buyers(client, monkeypatch):
     _live_watchlist(client)
     for wallet in WALLETS[:5]:
         _buy(client, wallet)
+    _settle(client)                       # fires here, at 0.02
 
     monkeypatch.setattr(dexscreener, "market_data", _market(price=0.09))
     for wallet in WALLETS[5:8]:
         _buy(client, wallet)
+    _settle(client)                       # strengthens; must not re-stamp
 
     outcomes = db.list_outcomes()
     assert len(outcomes) == 1
@@ -178,6 +187,7 @@ async def test_horizons_fill_only_once_they_come_due(client, monkeypatch):
     _live_watchlist(client)
     for wallet in WALLETS[:5]:
         _buy(client, wallet)
+    _settle(client)
     signal_id = db.list_outcomes()[0]["signal_id"]
 
     # Nothing is measurable a moment after firing.
@@ -191,6 +201,7 @@ async def test_horizons_fill_only_once_they_come_due(client, monkeypatch):
             (_age(2), signal_id),
         )
     assert await performance.fill_horizons() == {"price_1h": 1}
+    _settle(client)
     assert db.list_outcomes()[0]["price_1h"] == 0.05
     # The 24 h horizon is still in the future and must stay empty.
     assert db.list_outcomes()[0]["price_24h"] is None
@@ -203,6 +214,7 @@ async def test_a_dead_pool_is_recorded_as_a_total_loss(client, monkeypatch):
     _live_watchlist(client)
     for wallet in WALLETS[:5]:
         _buy(client, wallet)
+    _settle(client)
     signal_id = db.list_outcomes()[0]["signal_id"]
     with db.connect() as conn:
         conn.execute(
@@ -219,6 +231,7 @@ async def test_a_dead_pool_is_recorded_as_a_total_loss(client, monkeypatch):
     monkeypatch.setattr(dexscreener, "market_data", rugged)
     await performance.fill_horizons()
 
+    _settle(client)
     assert db.list_outcomes()[0]["price_1h"] == 0.0
     summary = performance.summarise()
     hour = next(h for h in summary["horizons"] if h["horizon"] == "1h")
@@ -233,6 +246,7 @@ async def test_a_failed_lookup_leaves_the_horizon_pending(client, monkeypatch):
     _live_watchlist(client)
     for wallet in WALLETS[:5]:
         _buy(client, wallet)
+    _settle(client)
     signal_id = db.list_outcomes()[0]["signal_id"]
     with db.connect() as conn:
         conn.execute(
@@ -245,6 +259,7 @@ async def test_a_failed_lookup_leaves_the_horizon_pending(client, monkeypatch):
 
     monkeypatch.setattr(dexscreener, "market_data", broken)
     assert await performance.fill_horizons() == {}
+    _settle(client)
     assert db.list_outcomes()[0]["price_1h"] is None
 
 
@@ -318,6 +333,7 @@ def test_performance_endpoint_reports_pending_work(client, monkeypatch):
     _live_watchlist(client)
     for wallet in WALLETS[:5]:
         _buy(client, wallet)
+    _settle(client)
 
     body = client.get("/api/signals/performance").json()
     assert body["signals"] == 1

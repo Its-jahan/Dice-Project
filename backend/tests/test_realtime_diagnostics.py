@@ -19,6 +19,12 @@ WEBHOOK_ID = "wh_diag"
 WALLETS = [f"0x{i:040x}" for i in range(1, 6)]
 
 
+def _settle(client):
+    """A delivery only records; the sweep turns it into a signal."""
+    return client.post("/api/live/sweep").json()
+
+
+
 def _fake_market(**_kwargs):
     """Stub DexScreener: every token in a test is tradeable unless said otherwise."""
 
@@ -229,6 +235,7 @@ def test_simulate_fires_a_real_signal_through_the_live_path(client):
     assert result["signals"] == 1
     assert result["token_address"] == main.SIMULATED_TOKEN
 
+    _settle(client)
     signals = client.get("/api/signals").json()
     assert len(signals) == 1
     assert signals[0]["token_address"] == main.SIMULATED_TOKEN

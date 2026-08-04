@@ -352,6 +352,20 @@ def pool_threshold(pool: int) -> int:
     return max(required, pool_min_wallets(), 2)
 
 
+def sweep_seconds() -> int:
+    """Seconds between evaluation passes, floored so it cannot spin.
+
+    Lower is not better: every pass that finds a candidate spends DexScreener
+    and GoPlus calls, and those are the budget that runs out.
+    """
+    stored = db.get_setting("live_sweep_seconds")
+    try:
+        value = int(stored) if stored is not None else settings.live_sweep_seconds
+    except ValueError:
+        value = settings.live_sweep_seconds
+    return max(value, 15)
+
+
 def pool_window_hours() -> int:
     """Buy window for pooled signals: the widest any live list asks for.
 
@@ -720,33 +734,32 @@ async def ingest_solana(payload: Any) -> dict[str, Any]:
 async def store_and_evaluate(
     events: list[dict[str, Any]], *, chain: Chain
 ) -> dict[str, Any]:
-    """Everything a delivery does once its events have been decoded."""
+    """Record a delivery's events. Deciding what they mean happens elsewhere.
+
+    This used to look every token in the delivery up on DexScreener and
+    GoPlus before checking whether any of them was anywhere near the
+    threshold — the expensive question asked before the free one. Measured on
+    the live install that was 15 deliveries a minute touching **1,184 distinct
+    tokens every five minutes**, nearly all of which could never signal.
+    GoPlus screens one address per request and is rate limited, so the budget
+    went on tokens that two wallets had touched.
+
+    The sweep already asks the questions in the right order: it counts wallets
+    per token in SQLite, which is free, and only looks up the handful that
+    already cross the line. So a delivery now just stores what it saw and
+    returns, and the sweep decides — on its own schedule, at most a minute
+    later. On pools that are hours old when they signal, a minute is nothing
+    next to spending the entire API budget before lunchtime.
+
+    Returning fast has a second benefit: Alchemy retries a slow delivery, so
+    the old path made more work for itself the busier it got.
+    """
     if not events:
         return {"events": 0, "stored": 0, "signals": 0}
 
     stored = db.record_events(events)
-
-    # Only the (wallet, token) pairs this delivery actually touched need
-    # re-checking — everything else's count is unchanged.
-    pairs = {(event["wallet_address"], event["token_address"]) for event in events}
-
-    # One batched market lookup for the whole delivery, before any evaluation:
-    # a token with no pool cannot have been bought and must not signal.
-    markets = await tradeable(chain, {token for _, token in pairs})
-
-    # One check per token against the pooled threshold — signals belong to the
-    # whole pool, not to whichever watchlist happened to contain the buyer.
-    fired: list[tuple[SignalOut, bool]] = []
-    for token in {token for _, token in pairs}:
-        if token not in markets:
-            continue
-        outcome = check_pool_token(chain, token, market=markets[token])
-        if outcome:
-            fired.append(outcome)
-
-    await announce(fired, chain=chain, markets=markets)
     db.prune_events(_iso(_utcnow() - timedelta(days=EVENT_RETENTION_DAYS)))
-    return {"events": len(events), "stored": stored, "signals": len(fired)}
+    return {"events": len(events), "stored": stored, "signals": 0}
 
 
 # ----------------------------------------------------------------- the sweep
@@ -803,10 +816,11 @@ async def sweep() -> dict[str, Any]:
 
 async def sweep_loop() -> None:
     """Run :func:`sweep` on an interval for the lifetime of the process."""
-    log.info("live sweep running every %ss", settings.live_sweep_seconds)
+    log.info("live sweep running every %ss", sweep_seconds())
     while True:
         try:
-            await asyncio.sleep(settings.live_sweep_seconds)
+            # Read each time round so a change takes effect without a restart.
+            await asyncio.sleep(sweep_seconds())
             result = await sweep()
             try:
                 filled = await performance.fill_horizons()

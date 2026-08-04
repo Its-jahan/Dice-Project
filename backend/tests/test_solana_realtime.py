@@ -31,6 +31,12 @@ OUTSIDER = "3nJ6mCLkNVSQVjB1RJZQnPCrfXvGXWNHo7HbTHYCu9Vy"
 SEEN = "2026-08-04T12:00:00+00:00"
 
 
+def _settle(client):
+    """A delivery only records; the sweep turns it into a signal."""
+    return client.post("/api/live/sweep").json()
+
+
+
 def _tx(signature, *, token=(), native=()):
     return {
         "signature": signature,
@@ -291,6 +297,7 @@ def test_an_authenticated_delivery_becomes_events_and_a_signal(client):
     assert response.json()["events"] == 3
     # Three of three wallets bought the same mint: a signal on Solana, fired
     # by exactly the same pooled threshold every EVM chain uses.
+    _settle(client)
     signals = client.get("/api/signals").json()
     assert len(signals) == 1
     assert signals[0]["chain"] == "solana"
