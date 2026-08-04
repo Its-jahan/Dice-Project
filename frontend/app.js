@@ -2221,9 +2221,26 @@ async function loadSignals() {
     state.signals = await api(`/api/signals?include_dismissed=${include}`);
     renderSignals();
     setStatus("signalsStatus", "", "");
+    loadBriefs(state.signals);
   } catch (error) {
     setStatus("signalsStatus", error.message, "error");
   }
+}
+
+/** Fetch whatever research already exists, so a refresh does not lose it. */
+async function loadBriefs(signals) {
+  state.briefs = state.briefs || {};
+  let found = false;
+  for (const signal of signals) {
+    if (state.briefs[signal.id]) continue;
+    try {
+      state.briefs[signal.id] = await api(`/api/signals/${signal.id}/brief`);
+      found = true;
+    } catch {
+      /* no brief yet — the sweep will get to it */
+    }
+  }
+  if (found) renderSignals();
 }
 
 function renderSignals() {
@@ -2372,6 +2389,31 @@ function renderSignalRow(tbody, signal) {
       setStatus("signalsStatus", error.message, "error");
     }
   });
+  // Research runs on its own during the sweep; this is for a signal that
+  // fired before a key was saved, or one you want answered now rather than
+  // on the next pass.
+  const researchBtn = el("button", "btn btn-sm btn-outline-secondary me-1", "Research");
+  researchBtn.type = "button";
+  researchBtn.title =
+    "Search the web for what this token actually is and attach the finding. " +
+    "Takes about a minute.";
+  researchBtn.addEventListener("click", async (event) => {
+    event.stopPropagation();
+    await withBusy(researchBtn, async () => {
+      setStatus("signalsStatus", "Researching — this takes about a minute…", "");
+      try {
+        const brief = await api(`/api/signals/${signal.id}/brief`, { method: "POST" });
+        state.expandedSignals.add(signal.id);
+        state.briefs = state.briefs || {};
+        state.briefs[signal.id] = brief;
+        renderSignals();
+        setStatus("signalsStatus", "Research attached.", "ok");
+      } catch (error) {
+        setStatus("signalsStatus", error.message, "error");
+      }
+    });
+  });
+  actions.appendChild(researchBtn);
   actions.appendChild(toggleBtn);
 
   tr.addEventListener("click", () => {
@@ -2393,6 +2435,24 @@ function renderSignalDetails(tbody, signal) {
   tr.className = "table-active";
   const cell = tr.insertCell();
   cell.colSpan = 7;
+
+  // The research, when there is any — the answer to "what is this", which the
+  // wallet list below cannot give.
+  const brief = (state.briefs || {})[signal.id];
+  if (brief) {
+    const box = el("div", "border rounded p-2 mb-2 bg-body");
+    const head = el("div", "small fw-medium mb-1");
+    head.textContent = "Research";
+    if (brief.theme) {
+      head.appendChild(el("span", "badge text-bg-light border ms-2", brief.theme));
+    }
+    box.appendChild(head);
+    for (const key of ["what", "read", "risk"]) {
+      const text = brief[key] ?? brief[`${key}_note`];
+      if (text) box.appendChild(el("div", "small", text));
+    }
+    cell.appendChild(box);
+  }
 
   cell.appendChild(
     el(

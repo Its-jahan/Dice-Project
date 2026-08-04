@@ -506,9 +506,17 @@ Two things arithmetic genuinely cannot do:
 
 **Triage.** A signal says "GEM, 19 of 180 wallets". Finding out what GEM
 actually *is* costs five minutes, which on a six-hour-old pool is most of the
-edge. When a signal fires, Claude searches the web and writes four lines —
-theme, what it is, what the combination suggests, and the single biggest risk
-— which ride along in the Telegram message. If search finds nothing about a
+edge. The research answers that in four lines — theme, what it is, what the
+combination suggests, and the biggest risk.
+
+It arrives as a **second Telegram message**, deliberately. Measured against a
+real model on a real token, one brief takes **55 seconds** — it runs a web
+search and reads pages. The alert fires inside the Alchemy webhook, which is
+retried if it answers slowly, so holding the alert for the research would mean
+arriving a minute late to a pool that is hours old *and* risking a duplicate
+delivery. The alert is the time-critical half; the research is not. A
+background pass on the sweep picks up any signal without a brief, researches
+it, and sends the finding after. If search finds nothing about a
 token days after launch, it says so: that absence is itself the finding, and
 inventing a plausible project is the one failure that would make this worse
 than useless.

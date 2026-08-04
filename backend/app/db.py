@@ -1819,3 +1819,23 @@ def theme_counts() -> list[dict[str, Any]]:
         }
         for row in rows
     ]
+
+
+def signals_without_briefs(limit: int = 5) -> list[dict[str, Any]]:
+    """Active signals nothing has researched yet, newest first.
+
+    Dismissed signals are skipped: the operator has already judged them, and
+    paying a model to describe something they closed is spending for nothing.
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT s.* FROM signals s
+            LEFT JOIN signal_briefs b ON b.signal_id = s.id
+            WHERE b.signal_id IS NULL AND s.status = 'active'
+            ORDER BY s.first_seen_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]

@@ -1953,6 +1953,36 @@ def signal_brief(signal_id: int) -> dict[str, object]:
     return brief
 
 
+@app.post("/api/signals/{signal_id}/brief")
+async def research_signal(signal_id: int) -> dict[str, object]:
+    """Research one signal now.
+
+    The sweep does this on its own, but a signal that fired before a key was
+    saved would otherwise wait for the next one — and a brief is most useful
+    while the position is still open.
+    """
+    row = db.get_signal(signal_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Signal {signal_id} not found.")
+    if not ai.enabled():
+        raise HTTPException(
+            status_code=503,
+            detail="No model key saved, or research is switched off.",
+        )
+    chain = Chain(row["chain"])
+    markets = await realtime.tradeable(chain, [row["token_address"]])
+    brief = await realtime.enrich(
+        monitor.signal_to_out(row),
+        chain=chain,
+        market=markets.get(row["token_address"]),
+    )
+    if brief is None:
+        raise HTTPException(
+            status_code=503, detail="The model could not be reached in time."
+        )
+    return brief
+
+
 @app.post("/api/signals/{signal_id}/dismiss")
 async def dismiss_signal(signal_id: int) -> SignalOut:
     if not db.set_signal_status(signal_id, "dismissed"):

@@ -655,6 +655,37 @@ async def send_telegram_message(text: str) -> str | None:
     return _describe_telegram_error(status, payload, chat_id)
 
 
+async def send_brief_notification(
+    signal: SignalOut, *, chain: Chain, brief: dict[str, Any]
+) -> None:
+    """Deliver the research as a follow-up to an alert already sent.
+
+    Two messages rather than one is a deliberate trade. Searching the web and
+    reading pages takes minutes; holding the alert for it would mean arriving
+    minutes late to a pool that is hours old. So the alert is the time-critical
+    half and this is the answer to "what actually is it", which is worth
+    reading whenever it lands.
+    """
+    token, chat_id = db.telegram_credentials()
+    if not token or not chat_id:
+        return
+
+    label = signal.token_symbol or _short_address(signal.token_address)
+    theme = f" [{brief['theme']}]" if brief.get("theme") else ""
+    lines = [f"Research — {label}{theme}"]
+    for key in ("what", "read", "risk"):
+        if brief.get(key):
+            lines.append(f"  {brief[key]}")
+    lines.append(signal.token_address)
+    lines.append(f"https://dexscreener.com/{chain.value}/{signal.token_address}")
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            await _post_message(client, token, chat_id, "\n".join(lines))
+    except Exception:  # pragma: no cover - a note must never break the sweep
+        log.exception("sending the brief notification failed")
+
+
 def _brief_notes(signal_id: int) -> list[str]:
     """The researched brief for a signal, when one was written in time."""
     try:

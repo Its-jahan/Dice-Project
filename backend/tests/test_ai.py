@@ -15,7 +15,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from app import ai, db, dexscreener, main
+from app import ai, db, dexscreener, main, monitor, realtime
 from app.cache import DiskCache
 from app.config import settings
 from app.jobs import JobStore
@@ -214,6 +214,31 @@ async def test_an_unexpected_exception_still_lets_the_signal_through(
 
 
 @pytest.mark.anyio
+async def test_the_webhook_never_waits_for_research(client, monkeypatch):
+    """Measured at 55s against a real model, on a path Alchemy retries.
+
+    Research must therefore happen after the alert, never inside the delivery
+    that produced it — otherwise every brief silently times out while the
+    feature looks switched on.
+    """
+    db.set_setting("anthropic_api_key", "sk-ant-test")
+    called = False
+
+    async def brief_token(**kwargs):
+        nonlocal called
+        called = True
+        return ai.parse_brief(BRIEF)
+
+    monkeypatch.setattr(ai, "brief_token", brief_token)
+    _live_watchlist()
+    for wallet in WALLETS[:6]:
+        _buy(client, wallet)
+
+    assert len(client.get("/api/signals").json()) == 1
+    assert called is False  # the alert went out without waiting on a model
+
+
+@pytest.mark.anyio
 async def test_a_brief_is_stored_and_reaches_the_signal(client, monkeypatch):
     db.set_setting("anthropic_api_key", "sk-ant-test")
     seen = {}
@@ -227,16 +252,17 @@ async def test_a_brief_is_stored_and_reaches_the_signal(client, monkeypatch):
     for wallet in WALLETS[:6]:
         _buy(client, wallet)
 
+    # The research pass is what writes briefs, on the sweep's schedule.
+    assert await realtime.backfill_briefs() == 1
+
     signal_id = client.get("/api/signals").json()[0]["id"]
     stored = client.get(f"/api/signals/{signal_id}/brief").json()
     assert stored["theme"] == "gaming"
     assert "browser game" in stored["what"]
 
-    # The model is only ever given facts DICE already established, and it is
-    # asked at the moment the threshold is crossed — the fifth wallet, not
-    # whatever the count has grown to by the time anyone reads the signal.
+    # The model is only ever given facts DICE already established.
     assert seen["token_address"] == GEM
-    assert "5 of 10 tracked" in seen["facts"]["Wallets that bought it"]
+    assert "of 10 tracked" in seen["facts"]["Wallets that bought it"]
 
 
 @pytest.mark.anyio
@@ -257,6 +283,8 @@ async def test_a_strengthened_signal_is_not_re_briefed(client, monkeypatch):
     for wallet in WALLETS[6:9]:
         _buy(client, wallet)  # strengthens the same signal
 
+    await realtime.backfill_briefs()
+    await realtime.backfill_briefs()  # nothing left to research
     assert calls == 1
 
 
@@ -639,3 +667,63 @@ async def test_a_chosen_model_is_used_for_the_request(store, monkeypatch):
 
     assert sent["body"]["model"] == "google/gemini-3-pro"
     assert ai.model() == "google/gemini-3-pro"
+
+
+@pytest.mark.anyio
+async def test_research_delivers_a_follow_up_rather_than_holding_the_alert(
+    client, monkeypatch
+):
+    """Two messages, deliberately: the alert is urgent, the research is not."""
+    db.set_setting("anthropic_api_key", "sk-ant-test")
+    db.set_setting("telegram_bot_token", "bot-token")
+    db.set_setting("telegram_chat_id", "-100123")
+    sent = []
+
+    async def fake_post(client, token, chat_id, text):
+        sent.append(text)
+        return True, 200, {"ok": True}
+
+    monkeypatch.setattr(ai, "brief_token",
+                        lambda **k: _immediately(ai.parse_brief(BRIEF)))
+    monkeypatch.setattr(monitor, "_post_message", fake_post)
+
+    _live_watchlist()
+    # Exactly the threshold: a sixth buy would strengthen the signal and send
+    # a second alert, which would muddle the count this test is making.
+    for wallet in WALLETS[:5]:
+        _buy(client, wallet)
+
+    assert len(sent) == 1                    # the alert, with no model in the way
+    assert "Research" not in sent[0]
+
+    await realtime.backfill_briefs()
+    assert len(sent) == 2                    # the finding, once it exists
+    assert sent[1].startswith("Research —")
+    assert "browser game" in sent[1]
+
+
+async def _immediately(value):
+    return value
+
+
+@pytest.mark.anyio
+async def test_a_dismissed_signal_is_not_researched(client, monkeypatch):
+    """The operator already judged it; paying to describe it buys nothing."""
+    db.set_setting("anthropic_api_key", "sk-ant-test")
+    calls = 0
+
+    async def brief_token(**kwargs):
+        nonlocal calls
+        calls += 1
+        return ai.parse_brief(BRIEF)
+
+    monkeypatch.setattr(ai, "brief_token", brief_token)
+    _live_watchlist()
+    for wallet in WALLETS[:6]:
+        _buy(client, wallet)
+
+    signal_id = client.get("/api/signals").json()[0]["id"]
+    client.post(f"/api/signals/{signal_id}/dismiss")
+
+    assert await realtime.backfill_briefs() == 0
+    assert calls == 0

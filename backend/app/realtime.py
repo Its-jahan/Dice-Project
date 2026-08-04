@@ -35,7 +35,12 @@ from typing import Any, Iterable
 from . import ai, db, dexscreener, helius, performance, security
 from .config import settings
 from .models import Chain, SignalOut
-from .monitor import effective_min_wallets, send_signal_notification, signal_to_out
+from .monitor import (
+    effective_min_wallets,
+    send_brief_notification,
+    send_signal_notification,
+    signal_to_out,
+)
 from .sql import ignored_tokens_for
 
 log = logging.getLogger(__name__)
@@ -590,15 +595,11 @@ async def announce(
     chain: Chain,
     markets: dict[str, dict[str, Any]] | None = None,
 ) -> None:
+    # Research deliberately does not happen here. A brief with web search
+    # takes minutes, and this runs inside the webhook request that Alchemy
+    # retries if it answers slowly — so the alert goes out now and the
+    # research follows it (see backfill_briefs).
     for signal, is_new in fired:
-        if is_new:
-            # Only new signals are briefed, and only before the notification
-            # goes out: the brief is most of the value of the message, and a
-            # second Telegram arriving later would be noise. Time-boxed, so a
-            # slow or missing model costs the signal nothing.
-            await enrich(signal, chain=chain, market=(markets or {}).get(
-                signal.token_address
-            ))
         await send_signal_notification(
             watchlist_name=signal.watchlist_name or f"#{signal.watchlist_id}",
             chain=chain,
@@ -609,8 +610,8 @@ async def announce(
 
 async def enrich(
     signal: SignalOut, *, chain: Chain, market: dict[str, Any] | None
-) -> None:
-    """Research what a freshly-signalled token actually is, best-effort.
+) -> dict[str, Any] | None:
+    """Research what a signalled token actually is, best-effort.
 
     Everything handed to the model is a fact DICE already established. Its
     job is the part DICE cannot answer — whether there is a real project
@@ -618,7 +619,7 @@ async def enrich(
     """
     market = market or {}
     risk = market.get("risk") or {}
-    brief = await ai.brief_with_timeout(
+    brief = await ai.brief_token_safely(
         chain=chain.value,
         token_address=signal.token_address,
         symbol=signal.token_symbol,
@@ -639,7 +640,7 @@ async def enrich(
         },
     )
     if brief is None:
-        return
+        return None
     try:
         db.save_brief(
             signal_id=signal.id,
@@ -650,6 +651,37 @@ async def enrich(
         )
     except Exception:  # pragma: no cover - a brief must never break a signal
         log.exception("storing the brief failed")
+        return None
+    return brief
+
+
+async def backfill_briefs(limit: int = 5) -> int:
+    """Research any signal that does not have a brief yet, then say so.
+
+    This is the half of enrichment that cannot live in the webhook: a brief
+    takes minutes, so it happens here, on the sweep's own schedule, and the
+    finding is delivered as a follow-up to an alert that already went out.
+    The alert is the time-critical half; the research is not.
+    """
+    if not ai.enabled():
+        return 0
+    pending = db.signals_without_briefs(limit=limit)
+    written = 0
+    for row in pending:
+        chain = Chain(row["chain"])
+        try:
+            markets = await tradeable(chain, [row["token_address"]])
+        except Exception:  # pragma: no cover - defensive
+            markets = {}
+        signal = signal_to_out(row)
+        brief = await enrich(
+            signal, chain=chain, market=markets.get(row["token_address"])
+        )
+        if brief is None:
+            continue
+        written += 1
+        await send_brief_notification(signal, chain=chain, brief=brief)
+    return written
 
 
 async def ingest(payload: dict[str, Any], *, chain: Chain) -> dict[str, Any]:
@@ -782,6 +814,15 @@ async def sweep_loop() -> None:
                     log.info("outcome horizons filled: %s", filled)
             except Exception:  # pragma: no cover - never break the sweep
                 log.exception("filling outcome horizons failed")
+            try:
+                # The slow half of enrichment lives here rather than in the
+                # webhook, where minutes of web search would time the delivery
+                # out. A small batch per sweep keeps the spend legible.
+                written = await backfill_briefs()
+                if written:
+                    log.info("researched %s newly signalled token(s)", written)
+            except Exception:  # pragma: no cover - never break the sweep
+                log.exception("researching signals failed")
             if result["signals"]:
                 log.info(
                     "live sweep fired %s signal(s) from %s token(s)",

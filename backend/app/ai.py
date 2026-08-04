@@ -82,10 +82,11 @@ DEFAULT_MODELS = {
 ENRICH_MAX_TOKENS = 8_000
 REVIEW_MAX_TOKENS = 16_000
 
-#: Enrichment sits in the webhook request path, and Alchemy retries a delivery
-#: that answers too slowly. Past this, the signal goes out unenriched — a late
-#: brief is worth less than a duplicate delivery.
-ENRICH_TIMEOUT_SECONDS = 12.0
+#: A brief runs web search and reads several pages, which measured at well
+#: over a minute on a real token. It deliberately does NOT run in the webhook
+#: request path — Alchemy retries a slow delivery — so this is only a ceiling
+#: on a hung request, not a latency budget anyone is waiting on.
+ENRICH_TIMEOUT_SECONDS = 300.0
 
 #: Web results per brief. OpenRouter bills search per result, so this is the
 #: one knob that turns "research every signal" into a line on a bill; five is
@@ -613,8 +614,12 @@ async def review(payload: dict[str, Any]) -> dict[str, Any]:
     return parse_json(text)
 
 
-async def brief_with_timeout(**kwargs: Any) -> dict[str, Any] | None:
-    """:func:`brief_token`, but never worth delaying a signal for."""
+async def brief_token_safely(**kwargs: Any) -> dict[str, Any] | None:
+    """:func:`brief_token`, but incapable of breaking its caller.
+
+    Every failure — no key, timeout, refusal, an exception nobody predicted —
+    returns None. A signal without a brief is still a signal.
+    """
     if not enabled():
         return None
     try:
@@ -651,7 +656,7 @@ __all__ = [
     "ENRICH_TIMEOUT_SECONDS",
     "api_key",
     "brief_token",
-    "brief_with_timeout",
+    "brief_token_safely",
     "check_key",
     "complete",
     "enabled",
