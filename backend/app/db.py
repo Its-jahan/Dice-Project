@@ -1005,7 +1005,15 @@ def webhook_by_id(webhook_id: str) -> dict[str, Any] | None:
 
 
 def realtime_wallets(chain: str) -> set[str]:
-    """Union of the wallets of every realtime-enabled watchlist on a chain."""
+    """Union of the wallets of every realtime-enabled watchlist on a chain.
+
+    Infrastructure addresses are excluded here as well as at the point they
+    would enter a cohort, because cohorts built before that filter existed
+    still contain them — and this is what everything counts against: the pool
+    size, the threshold, and the buyers behind a signal.
+    """
+    from .infra import is_never_watched
+
     with connect() as conn:
         rows = conn.execute(
             """
@@ -1016,7 +1024,11 @@ def realtime_wallets(chain: str) -> set[str]:
             """,
             (chain,),
         ).fetchall()
-        return {row["wallet_address"] for row in rows}
+        return {
+            row["wallet_address"]
+            for row in rows
+            if not is_never_watched(row["wallet_address"])
+        }
 
 
 def realtime_watchlists_for_wallet(chain: str, wallet: str) -> list[dict[str, Any]]:

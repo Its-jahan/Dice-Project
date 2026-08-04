@@ -314,7 +314,14 @@ class WatchlistCreate(WatchlistSettings):
 
     @model_validator(mode="after")
     def _validate_wallets(self) -> "WatchlistCreate":
-        normalized = normalize_addresses(self.chain, self.wallets)
+        from .infra import drop as _drop_infrastructure
+
+        # Routers, settlement contracts and exchange hot wallets are not
+        # traders; letting one in inflates the pool and contributes to
+        # signals it had no opinion about.
+        normalized = _drop_infrastructure(
+            normalize_addresses(self.chain, self.wallets)
+        )
         if not normalized:
             raise ValueError("wallets contained no valid addresses")
         object.__setattr__(self, "wallets", normalized)

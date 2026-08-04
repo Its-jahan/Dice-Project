@@ -555,6 +555,29 @@ declines, the signal fires on time *without* a brief rather than late with
 one. Only the first fire of a signal is briefed — a signal that gains buyers
 is the same opportunity, already answered.
 
+### Addresses that are never a trader
+
+Routers, settlement contracts and exchange hot wallets are excluded twice:
+when wallets enter a cohort, and again when wallets are counted towards a
+signal. The second is what repairs cohorts built before the filter existed,
+without rewriting stored data.
+
+Neither of the existing defences catches them. The holder query's
+contract filter only applies to cohorts built with it switched on; the
+`sprayer` flag needs weeks of history before it notices. And an exchange hot
+wallet is not a contract and buys nothing — it *receives* — so it lands in an
+early-buyer cohort simply because tokens flow through it.
+
+The cost of missing one is not cosmetic, because everything downstream is a
+count. On this install a single router had bought 744 distinct tokens, and a
+review of the first two signals found a router had contributed to **both**.
+One such address inflates the pool, raises the threshold every real wallet
+must clear, and creates overlap between cohorts that merely appear to share a
+member.
+
+The list is deliberately conservative: a wrong entry silently removes a real
+trader, which is much harder to notice than a router that slipped through.
+
 ## Which wallets are worth counting
 
 The pooled signal counts heads: ten wallets bought, therefore fire. That
