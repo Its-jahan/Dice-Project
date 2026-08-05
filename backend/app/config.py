@@ -153,6 +153,23 @@ class Settings:
     risk_screening: bool = field(
         default_factory=lambda: _env_bool("DICE_RISK_SCREENING", True)
     )
+    # Exit warnings: when this share of a signal's *own buyers* have sold since
+    # it fired, say so. A third is deliberately not a majority — by the time
+    # most of a cohort has gone the move is over, and the point of the warning
+    # is to arrive while leaving is still a decision.
+    exit_pct: float = field(
+        default_factory=lambda: float(os.getenv("DICE_EXIT_PCT", "33"))
+    )
+    # A third of three buyers is one wallet, and one wallet closing a position
+    # is a Tuesday. Same reasoning as pool_min_wallets.
+    exit_min_wallets: int = field(
+        default_factory=lambda: _env_int("DICE_EXIT_MIN_WALLETS", 3)
+    )
+    # After this long a signal is not a position any more, and warning about
+    # it would be archaeology rather than an alert.
+    exit_window_days: int = field(
+        default_factory=lambda: _env_int("DICE_EXIT_WINDOW_DAYS", 14)
+    )
     # An LLM brief attached to each new signal: what the token actually is,
     # researched with web search. Off unless a key is saved — it costs money
     # per signal and the system works without it.

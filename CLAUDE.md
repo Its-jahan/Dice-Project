@@ -114,6 +114,27 @@ This is what makes every threshold falsifiable rather than a guess.
   `db.realtime_wallets`, the second of which repairs cohorts built before the
   filter existed.
 
+## The exit half (`exits.py`)
+
+Everything else decides when to *enter*. This is the only thing that says a
+position has stopped being one: when enough of the wallets **named on a
+signal** have sold since it fired, Telegram says so.
+
+- It counts the signal's own buyers, not the pool. "Is the thesis I acted on
+  intact" is a different question from "is anyone selling anything".
+- `since_iso` is the signal's own `first_seen_at`. A sale from *before* it
+  fired is a wallet that rebought, not one leaving.
+- Two bars: a percentage (the cohort is going, not one member rotating) and a
+  floor (a third of three buyers is one wallet).
+- One alert per signal, enforced by the existence of a `signal_exits` row.
+  Claim before sending — the reverse order re-sends forever if a send fails.
+
+**`signals.buyers` is a list of TokenBuyer objects, not addresses.** Reading it
+as addresses fails silently: every wallet becomes the string form of a dict,
+matches nothing, and the count is zero forever while the code looks fine.
+Measured on live data: the naive parse found 0 sellers where the correct one
+found 5.
+
 ## The AI layer's boundaries (`ai.py`)
 
 The model **never** decides to buy, computes a threshold, or replaces the
@@ -178,6 +199,10 @@ Two things that have caused wrong-but-passing tests here:
 - **Test the path, not the handler.** A test that hand-builds an exception with
   `status_code=404` passed against a client that never set the status, so the
   recovery it covered could never fire in production. Drive the real code path.
+- **Build fixtures through the real model.** The exit tests passed while the
+  feature could not work: the fixture wrote `buyers` as bare addresses and the
+  code read bare addresses, so both agreed and both were wrong about the
+  schema. `tests/test_exits.py::_signal` now serialises a real `TokenBuyer`.
 - **A delivery no longer fires a signal.** Tests must `POST /api/live/sweep`
   between buying and asserting — the shared `_settle(client)` helper does this.
 

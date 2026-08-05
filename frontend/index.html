@@ -573,6 +573,66 @@
       </div>
     </section>
 
+    <!-- ================================================== exits -->
+    <section class="card shadow-sm" aria-labelledby="exitAlertsHeading">
+      <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
+        <h2 id="exitAlertsHeading" class="h6 mb-0">Exit warnings</h2>
+        <button type="button" id="checkExits" class="btn btn-outline-secondary btn-sm">
+          Check now
+        </button>
+      </div>
+      <div class="card-body">
+        <p class="small text-body-secondary">
+          Everything above says when to get in. This is the only thing that says
+          a position has stopped being one: when enough of the wallets
+          <em>named on a signal</em> have sold since it fired, Telegram tells you.
+          It counts only those buyers, not the whole pool — so it answers
+          “is the thesis I acted on still intact”, not “is anyone selling anything”.
+        </p>
+        <div class="row g-2 align-items-end">
+          <div class="col-auto">
+            <label class="form-label small mb-1" for="exitPct">Warn at</label>
+            <div class="input-group input-group-sm">
+              <input id="exitPct" type="number" class="form-control" min="1" max="100" step="1" style="width:5rem">
+              <span class="input-group-text">% of buyers sold</span>
+            </div>
+          </div>
+          <div class="col-auto">
+            <label class="form-label small mb-1" for="exitMinWallets">…but never fewer than</label>
+            <div class="input-group input-group-sm">
+              <input id="exitMinWallets" type="number" class="form-control" min="1" step="1" style="width:4.5rem">
+              <span class="input-group-text">wallets</span>
+            </div>
+          </div>
+          <div class="col-auto">
+            <label class="form-label small mb-1" for="exitWindowDays">Stop watching after</label>
+            <div class="input-group input-group-sm">
+              <input id="exitWindowDays" type="number" class="form-control" min="1" step="1" style="width:4.5rem">
+              <span class="input-group-text">days</span>
+            </div>
+          </div>
+          <div class="col-auto">
+            <button type="button" id="saveExitSettings" class="btn btn-primary btn-sm">Save</button>
+          </div>
+        </div>
+        <p class="form-text mt-1 mb-3">
+          Both bars have to be met. The percentage says the cohort is leaving
+          rather than one member rotating; the floor says there are enough of
+          them for a percentage to mean anything — a third of three buyers is
+          one wallet.
+        </p>
+        <p id="exitAlertsEmpty" class="small text-body-secondary mb-0">
+          Nothing has been warned about yet.
+        </p>
+        <div class="table-responsive">
+          <table id="exitAlertsTable" class="table table-sm align-middle d-none mb-0">
+            <thead></thead><tbody></tbody>
+          </table>
+        </div>
+        <div id="exitAlertsStatus" class="small mt-2" role="status" aria-live="polite"></div>
+      </div>
+    </section>
+
     <!-- ================================================== scoreboard -->
     <section class="card shadow-sm" aria-labelledby="perfHeading">
       <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">

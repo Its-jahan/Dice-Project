@@ -42,6 +42,7 @@ from . import (
     auth,
     cohorts,
     db,
+    exits,
     helius,
     monitor,
     performance,
@@ -1568,6 +1569,60 @@ async def live_exits(
 async def run_live_sweep() -> dict[str, object]:
     """Re-check stored events against every live threshold, now."""
     return await realtime.sweep()
+
+
+@app.get("/api/signals/exits")
+def signal_exits(
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> dict[str, object]:
+    """Signals whose own buyers have since sold out of them.
+
+    Distinct from /api/live/exits, which reports selling across every watched
+    wallet. This is narrower and harder-hitting: it only counts the wallets
+    named on a signal, so it answers "is the thesis I acted on still intact"
+    rather than "is anyone selling anything".
+    """
+    return {
+        "exits": db.list_exits(limit=limit),
+        "threshold_pct": exits.exit_pct(),
+        "min_wallets": exits.exit_min_wallets(),
+        "window_days": exits.exit_window_days(),
+    }
+
+
+@app.post("/api/signals/exits/check")
+async def run_exit_check() -> dict[str, object]:
+    """Run the exit check now instead of waiting for the next sweep."""
+    return await exits.check()
+
+
+@app.put("/api/settings/exits")
+def save_exit_settings(body: Annotated[dict, Body()]) -> dict[str, object]:
+    """Tune the exit warning. Stored in SQLite, so no redeploy is needed."""
+    if "exit_pct" in body:
+        pct = float(body["exit_pct"])
+        if not 0 < pct <= 100:
+            raise HTTPException(status_code=422, detail="exit_pct must be 0-100.")
+        db.set_setting("exit_pct", str(pct))
+    if "exit_min_wallets" in body:
+        floor = int(body["exit_min_wallets"])
+        if floor < 1:
+            raise HTTPException(
+                status_code=422, detail="exit_min_wallets must be at least 1."
+            )
+        db.set_setting("exit_min_wallets", str(floor))
+    if "exit_window_days" in body:
+        days = int(body["exit_window_days"])
+        if days < 1:
+            raise HTTPException(
+                status_code=422, detail="exit_window_days must be at least 1."
+            )
+        db.set_setting("exit_window_days", str(days))
+    return {
+        "exit_pct": exits.exit_pct(),
+        "exit_min_wallets": exits.exit_min_wallets(),
+        "exit_window_days": exits.exit_window_days(),
+    }
 
 
 @app.get("/api/settings/realtime/deliveries")

@@ -32,7 +32,7 @@ import math
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
-from . import ai, db, dexscreener, helius, performance, security
+from . import ai, db, dexscreener, exits, helius, performance, security
 from .config import settings
 from .models import Chain, SignalOut
 from .monitor import (
@@ -837,6 +837,15 @@ async def sweep_loop() -> None:
                     log.info("researched %s newly signalled token(s)", written)
             except Exception:  # pragma: no cover - never break the sweep
                 log.exception("researching signals failed")
+            try:
+                # The other half of the trade. Entries are found above; this
+                # is the only thing in the system that says a position has
+                # stopped being one.
+                left = await exits.check()
+                if left["alerted"]:
+                    log.info("warned about %s signal(s) being sold", left["alerted"])
+            except Exception:  # pragma: no cover - never break the sweep
+                log.exception("checking exits failed")
             if result["signals"]:
                 log.info(
                     "live sweep fired %s signal(s) from %s token(s)",
@@ -970,7 +979,7 @@ async def accumulation_board(
     # Who has already left. A token twelve wallets bought and five have since
     # sold is a different proposition from one nobody has exited, and the buy
     # count alone cannot tell them apart.
-    exits: dict[tuple[str, str], int] = {}
+    sellers_by_token: dict[tuple[str, str], int] = {}
     for chain_value, tokens in by_chain.items():
         counts = db.exit_counts(
             chain=chain_value,
@@ -979,13 +988,15 @@ async def accumulation_board(
             since_iso=since,
         )
         for address, sellers in counts.items():
-            exits[(chain_value, address)] = sellers
+            sellers_by_token[(chain_value, address)] = sellers
 
     annotated: list[dict[str, Any]] = []
     for row in rows:
         market = markets.get((row["chain"], row["token_address"])) or {}
         row["risk"] = risks.get((row["chain"], row["token_address"]))
-        row["sellers"] = exits.get((row["chain"], row["token_address"]), 0)
+        row["sellers"] = sellers_by_token.get(
+            (row["chain"], row["token_address"]), 0
+        )
         row["has_pair"] = bool(market.get("has_pair"))
         row["price_usd"] = market.get("price_usd")
         row["liquidity_usd"] = market.get("liquidity_usd")

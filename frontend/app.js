@@ -2361,6 +2361,87 @@ async function loadSignals() {
   }
 }
 
+// -------------------------------------------------------------- exit warnings
+
+async function loadExitAlerts() {
+  try {
+    const body = await api("/api/signals/exits");
+    $("exitPct").value = body.threshold_pct;
+    $("exitMinWallets").value = body.min_wallets;
+    $("exitWindowDays").value = body.window_days;
+    renderExitAlerts(body.exits || []);
+  } catch (error) {
+    setStatus("exitAlertsStatus", error.message, "error");
+  }
+}
+
+function renderExitAlerts(rows) {
+  const table = $("exitAlertsTable");
+  $("exitAlertsEmpty").classList.toggle("d-none", !!rows.length);
+  table.classList.toggle("d-none", !rows.length);
+  table.tHead.innerHTML = "";
+  table.tBodies[0].innerHTML = "";
+  if (!rows.length) return;
+
+  const head = table.tHead.insertRow();
+  for (const title of ["Warned", "Token", "Sold", "Share", "Signal fired"]) {
+    head.appendChild(el("th", "small text-body-secondary", title));
+  }
+
+  for (const row of rows) {
+    const tr = table.tBodies[0].insertRow();
+    tr.appendChild(el("td", "small text-body-secondary", fmtTime(row.alerted_at)));
+
+    const token = el("td", "small");
+    const link = el("a", "", row.token_symbol || shortAddress(row.token_address));
+    link.href = `https://dexscreener.com/${row.chain}/${row.token_address}`;
+    link.target = "_blank";
+    link.rel = "noopener";
+    token.appendChild(link);
+    tr.appendChild(token);
+
+    tr.appendChild(el("td", "small", `${row.sellers} of ${row.buyers}`));
+    // Red throughout: every row here is a warning by construction — it only
+    // exists because the threshold was crossed.
+    tr.appendChild(el("td", "small text-danger fw-semibold", `${row.pct}%`));
+    tr.appendChild(el("td", "small text-body-secondary", fmtTime(row.first_seen_at)));
+  }
+}
+
+async function saveExitSettings() {
+  await withBusy($("saveExitSettings"), async () => {
+    try {
+      await api("/api/settings/exits", {
+        method: "PUT",
+        body: {
+          exit_pct: Number($("exitPct").value),
+          exit_min_wallets: Number($("exitMinWallets").value),
+          exit_window_days: Number($("exitWindowDays").value),
+        },
+      });
+      setStatus("exitAlertsStatus", "Saved.", "ok");
+    } catch (error) {
+      setStatus("exitAlertsStatus", error.message, "error");
+    }
+  });
+}
+
+async function checkExitsNow() {
+  await withBusy($("checkExits"), async () => {
+    try {
+      const result = await api("/api/signals/exits/check", { method: "POST" });
+      setStatus(
+        "exitAlertsStatus",
+        `Checked ${result.checked} signal(s), warned about ${result.alerted}.`,
+        "ok",
+      );
+      await loadExitAlerts();
+    } catch (error) {
+      setStatus("exitAlertsStatus", error.message, "error");
+    }
+  });
+}
+
 /** Fetch whatever research already exists, so a refresh does not lose it. */
 async function loadBriefs(signals) {
   state.briefs = state.briefs || {};
@@ -3010,6 +3091,9 @@ function init() {
     $("toggleKey").textContent = hidden ? "Hide" : "Show";
   });
 
+  $("saveExitSettings").addEventListener("click", saveExitSettings);
+  $("checkExits").addEventListener("click", checkExitsNow);
+
   $("saveAccess").addEventListener("click", saveAccess);
   $("signOut").addEventListener("click", signOut);
   $("toggleAccess").addEventListener("click", () => {
@@ -3078,6 +3162,7 @@ function init() {
     loadPoolSettings();
     loadCohortOverlap();
     loadPerformance();
+    loadExitAlerts();
     loadWalletQuality();
     loadExits();
     updateRealtimeAvailability();

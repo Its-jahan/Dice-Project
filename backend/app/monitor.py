@@ -686,6 +686,42 @@ async def send_brief_notification(
         log.exception("sending the brief notification failed")
 
 
+async def send_exit_notification(
+    *,
+    chain: Chain,
+    token_address: str,
+    token_symbol: str | None,
+    measured: dict[str, Any],
+) -> None:
+    """Tell the operator the cohort that got them in is getting out.
+
+    Deliberately plain, and deliberately not advice. It reports how many of
+    the wallets named on the signal have sold since it fired and leaves the
+    decision where it belongs — the same wallets have been wrong before, and
+    a message that said "sell" would be pretending otherwise.
+    """
+    token, chat_id = db.telegram_credentials()
+    if not token or not chat_id:
+        return
+
+    label = token_symbol or _short_address(token_address)
+    lines = [
+        f"Exit — {label}",
+        f"  {measured['sellers']} of the {measured['buyers']} wallets that "
+        f"bought it have sold ({measured['pct']}%)",
+    ]
+    if measured.get("last_sell_at"):
+        lines.append(f"  most recent sale {measured['last_sell_at']}")
+    lines.append(token_address)
+    lines.append(f"https://dexscreener.com/{chain.value}/{token_address}")
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            await _post_message(client, token, chat_id, "\n".join(lines))
+    except Exception:  # pragma: no cover - a warning must never break the sweep
+        log.exception("sending the exit notification failed")
+
+
 def _brief_notes(signal_id: int) -> list[str]:
     """The researched brief for a signal, when one was written in time."""
     try:

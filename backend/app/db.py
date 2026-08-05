@@ -185,6 +185,17 @@ CREATE TABLE IF NOT EXISTS signal_briefs (
     created_at    TEXT    NOT NULL
 );
 
+-- One row per signal whose buyers have been seen leaving. Existence is the
+-- "already told them" flag: an exit is news once, and a bot that repeats it
+-- every minute teaches you to ignore the alert that matters.
+CREATE TABLE IF NOT EXISTS signal_exits (
+    signal_id  INTEGER PRIMARY KEY REFERENCES signals(id) ON DELETE CASCADE,
+    sellers    INTEGER NOT NULL,
+    buyers     INTEGER NOT NULL,
+    pct        REAL    NOT NULL,
+    alerted_at TEXT    NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS token_risk (
     chain           TEXT    NOT NULL,
     token_address   TEXT    NOT NULL,
@@ -1849,6 +1860,68 @@ def theme_counts() -> list[dict[str, Any]]:
         }
         for row in rows
     ]
+
+
+def signals_to_watch_for_exits(since_iso: str, limit: int = 100) -> list[dict[str, Any]]:
+    """Live signals recent enough to still be a position, not yet alerted on.
+
+    Dismissed signals are skipped for the same reason briefs skip them: the
+    operator has already judged the trade, so telling them it went bad is
+    noise. And a signal older than the window is not a position any more —
+    warning about it would be archaeology, not an alert.
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT s.* FROM signals s
+            LEFT JOIN signal_exits e ON e.signal_id = s.id
+            WHERE e.signal_id IS NULL
+              AND s.status = 'active'
+              AND s.first_seen_at >= ?
+            ORDER BY s.first_seen_at DESC
+            LIMIT ?
+            """,
+            (since_iso, limit),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def record_exit(
+    *, signal_id: int, sellers: int, buyers: int, pct: float, alerted_at: str
+) -> bool:
+    """Mark a signal as warned about. False when it already was.
+
+    INSERT OR IGNORE and the return value together are what make the caller
+    safe to run every minute: two overlapping sweeps cannot both decide they
+    are the one to send the message.
+    """
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO signal_exits
+                (signal_id, sellers, buyers, pct, alerted_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (signal_id, sellers, buyers, pct, alerted_at),
+        )
+    return cursor.rowcount > 0
+
+
+def list_exits(limit: int = 50) -> list[dict[str, Any]]:
+    """Signals whose buyers were seen leaving, newest first."""
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT e.*, s.chain, s.token_address, s.token_symbol,
+                   s.first_seen_at
+            FROM signal_exits e
+            JOIN signals s ON s.id = e.signal_id
+            ORDER BY e.alerted_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def signals_without_briefs(limit: int = 5) -> list[dict[str, Any]]:
