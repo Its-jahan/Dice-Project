@@ -153,6 +153,24 @@ class Settings:
     risk_screening: bool = field(
         default_factory=lambda: _env_bool("DICE_RISK_SCREENING", True)
     )
+    # The delivery watchdog. Measured on the live stream, deliveries arrive
+    # about every twelve seconds and the largest observed gap was fourteen; a
+    # quiet hour is roughly one a minute. Twenty minutes is therefore between
+    # twenty and a hundred missed deliveries — nothing normal looks like that.
+    watchdog_enabled: bool = field(
+        default_factory=lambda: _env_bool("DICE_WATCHDOG_ENABLED", True)
+    )
+    watchdog_silence_minutes: int = field(
+        default_factory=lambda: _env_int("DICE_WATCHDOG_SILENCE_MINUTES", 20)
+    )
+    # Re-sync first, shout later: a notification should always mean automatic
+    # recovery was already tried and did not work.
+    watchdog_alert_minutes: int = field(
+        default_factory=lambda: _env_int("DICE_WATCHDOG_ALERT_MINUTES", 45)
+    )
+    watchdog_resync_cooldown_minutes: int = field(
+        default_factory=lambda: _env_int("DICE_WATCHDOG_RESYNC_COOLDOWN_MINUTES", 10)
+    )
     # Exit warnings: when this share of a signal's *own buyers* have sold since
     # it fired, say so. A third is deliberately not a majority — by the time
     # most of a cohort has gone the move is over, and the point of the warning

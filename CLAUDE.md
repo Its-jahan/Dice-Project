@@ -114,6 +114,30 @@ This is what makes every threshold falsifiable rather than a guess.
   `db.realtime_wallets`, the second of which repairs cohorts built before the
   filter existed.
 
+## The delivery watchdog (`watchdog.py`)
+
+The pipeline's only failure mode that nothing could see. On 2026-08-08 Alchemy
+stopped delivering for 12½ hours: webhook still registered, `is_active: true`,
+service never restarted, nothing errored. Six hours on 08-04 as well — 17 hours
+blind in a week, dashboard green throughout. **Silence is indistinguishable
+from "no watched wallet bought anything."**
+
+The older self-healing does not cover this; it recreates a webhook Alchemy has
+*deleted*, which announces itself with a 404. This has no error to catch.
+
+- Healthy stream measured at one delivery per **~12 s** (Ethereum block time),
+  largest observed gap 14 s, ~1/min on a quiet night. Hence a 20-minute
+  default: 20–100 missed deliveries, which nothing normal resembles.
+- **Re-sync first, shout later.** A re-sync is what actually fixed it, so it
+  runs at 20 min silently; Telegram only at 45 min, so a message always means
+  automatic recovery was already tried.
+- Re-syncs back off (doubling, capped 60 min) — a day-long provider outage
+  must not be 144 attempts. A *failed* re-sync still counts as an attempt.
+- **`silent_for_minutes` is the true gap, never floored at process start.**
+  Flooring it kept deploys quiet but made a 12-hour outage report as 20
+  minutes; understating the failure is the habit this module exists to break.
+  The floor applies only when no delivery has *ever* arrived.
+
 ## The exit half (`exits.py`)
 
 Everything else decides when to *enter*. This is the only thing that says a

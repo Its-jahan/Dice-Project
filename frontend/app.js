@@ -2361,6 +2361,120 @@ async function loadSignals() {
   }
 }
 
+// --------------------------------------------------------------- feed health
+
+async function loadHealth() {
+  try {
+    const h = await api("/api/realtime/health");
+    $("watchdogSilence").value = h.silence_threshold_minutes;
+    $("watchdogAlert").value = h.alert_threshold_minutes;
+    $("watchdogEnabled").checked = !!h.enabled;
+    $("healthSilence").textContent = h.silence_threshold_minutes;
+    $("healthLast").textContent = fmtTime(h.last_delivery_at);
+    $("healthSilentFor").textContent = `${h.silent_for_minutes} min`;
+
+    const outages = h.recent_outages || [];
+    const open = outages.filter((o) => !o.resolved_at).length;
+    $("healthOutageCount").textContent = open
+      ? `${outages.length} (one open now)`
+      : String(outages.length);
+
+    // Three states, not two. "Not watching" is neither healthy nor broken —
+    // an install with nothing live has nothing to receive, and colouring that
+    // red would teach you to ignore the colour.
+    let label = "Feed idle";
+    let tone = "text-bg-secondary";
+    if (h.watching && h.healthy) {
+      label = "Feed live";
+      tone = "text-bg-success";
+    } else if (h.watching && !h.healthy) {
+      label = `Feed silent ${h.silent_for_minutes}m`;
+      tone = "text-bg-danger";
+    } else if (!h.enabled) {
+      label = "Watchdog off";
+      tone = "text-bg-warning";
+    }
+    for (const id of ["healthPill", "healthState"]) {
+      const node = $(id);
+      node.textContent = label;
+      node.className = node.className.replace(/text-bg-\w+/, tone);
+    }
+
+    renderOutages(outages);
+  } catch (error) {
+    setStatus("healthStatus", error.message, "error");
+  }
+}
+
+function renderOutages(rows) {
+  const table = $("outagesTable");
+  table.classList.toggle("d-none", !rows.length);
+  table.tHead.innerHTML = "";
+  table.tBodies[0].innerHTML = "";
+  if (!rows.length) return;
+
+  const head = table.tHead.insertRow();
+  for (const title of ["Went quiet", "Came back", "Blind for", "Re-syncs", "Told you"]) {
+    head.appendChild(el("th", "small text-body-secondary", title));
+  }
+  for (const row of rows) {
+    const tr = table.tBodies[0].insertRow();
+    const from = row.last_delivery_at || row.detected_at;
+    tr.appendChild(el("td", "small", fmtTime(from)));
+    tr.appendChild(el("td", "small", row.resolved_at ? fmtTime(row.resolved_at) : "still down"));
+
+    let blind = "—";
+    if (from) {
+      const end = row.resolved_at ? new Date(row.resolved_at) : new Date();
+      const hours = (end - new Date(from)) / 3600000;
+      blind = hours >= 1 ? `${hours.toFixed(1)} h` : `${Math.round(hours * 60)} min`;
+    }
+    tr.appendChild(el("td", `small ${row.resolved_at ? "" : "text-danger fw-semibold"}`, blind));
+    tr.appendChild(el("td", "small", String(row.resyncs ?? 0)));
+    tr.appendChild(el("td", "small text-body-secondary", row.alerted_at ? "yes" : "self-healed"));
+  }
+}
+
+async function saveWatchdog() {
+  await withBusy($("saveWatchdog"), async () => {
+    try {
+      await api("/api/settings/watchdog", {
+        method: "PUT",
+        body: {
+          enabled: $("watchdogEnabled").checked,
+          silence_minutes: Number($("watchdogSilence").value),
+          alert_minutes: Number($("watchdogAlert").value),
+        },
+      });
+      setStatus("healthStatus", "Saved.", "ok");
+      await loadHealth();
+    } catch (error) {
+      setStatus("healthStatus", error.message, "error");
+    }
+  });
+}
+
+async function checkHealthNow() {
+  await withBusy($("checkHealth"), async () => {
+    try {
+      const r = await api("/api/realtime/health/check", { method: "POST" });
+      const did = (r.acted || []).join(", ");
+      setStatus(
+        "healthStatus",
+        r.checked === false
+          ? `Not watching: ${r.reason}.`
+          : r.healthy
+            ? "Deliveries are arriving."
+            : `Silent for ${r.silent_for_minutes} min${did ? ` — ${did}` : ""}.`,
+        r.checked === false ? "" : r.healthy ? "ok" : "error",
+      );
+      await loadHealth();
+    } catch (error) {
+      setStatus("healthStatus", error.message, "error");
+    }
+  });
+}
+
 // -------------------------------------------------------------- exit warnings
 
 async function loadExitAlerts() {
@@ -3091,6 +3205,9 @@ function init() {
     $("toggleKey").textContent = hidden ? "Hide" : "Show";
   });
 
+  $("saveWatchdog").addEventListener("click", saveWatchdog);
+  $("checkHealth").addEventListener("click", checkHealthNow);
+
   $("saveExitSettings").addEventListener("click", saveExitSettings);
   $("checkExits").addEventListener("click", checkExitsNow);
 
@@ -3168,6 +3285,10 @@ function init() {
     updateRealtimeAvailability();
   });
   refreshAccess();
+  loadHealth();
+  // The pulse is the one number worth refreshing on its own — a page left
+  // open should not keep claiming the feed is live an hour after it died.
+  window.setInterval(loadHealth, 60000);
   loadNotificationSettings();
   loadArkhamSettings();
   loadRealtimeSettings();

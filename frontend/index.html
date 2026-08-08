@@ -32,6 +32,11 @@
         </span>
       </span>
       <div class="d-flex align-items-center gap-2">
+        <!-- The pipeline's own pulse. Everything else on this page is derived
+             from deliveries, so when they stop every panel reports a calm and
+             entirely fictional "nothing is happening". -->
+        <a href="#healthHeading" id="healthPill"
+           class="badge rounded-pill text-bg-secondary text-decoration-none">Feed …</a>
         <span id="keyPill" class="badge rounded-pill text-bg-secondary">No API key</span>
         <!-- Hidden until there is a session to end, so an unprotected install
              is not offered a sign-out that does nothing. -->
@@ -570,6 +575,82 @@
           </table>
         </div>
         <div id="signalsStatus" class="small mt-2" role="status" aria-live="polite"></div>
+      </div>
+    </section>
+
+    <!-- ================================================== feed health -->
+    <section class="card shadow-sm" aria-labelledby="healthHeading">
+      <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
+        <h2 id="healthHeading" class="h6 mb-0">Feed health</h2>
+        <div class="d-flex align-items-center gap-2">
+          <span id="healthState" class="badge rounded-pill text-bg-secondary">…</span>
+          <button type="button" id="checkHealth" class="btn btn-outline-secondary btn-sm">
+            Check now
+          </button>
+        </div>
+      </div>
+      <div class="card-body">
+        <p class="small text-body-secondary">
+          On 8 August the feed stopped for <strong>12½ hours</strong> — the webhook
+          was still registered and active, nothing errored, and no page showed a
+          problem, because silence looks exactly like “no watched wallet bought
+          anything”. It had already happened for 6 hours four days earlier: 17
+          hours blind in a week. This watches the pulse itself. If nothing arrives
+          for <span id="healthSilence">…</span> minutes it re-syncs the address
+          list on its own — the thing that actually fixed it — and only messages
+          you if that didn’t work.
+        </p>
+        <div class="row g-3">
+          <div class="col-sm-4">
+            <div class="border rounded p-3 h-100">
+              <div class="text-body-secondary small">Last delivery</div>
+              <div id="healthLast" class="fs-6">—</div>
+            </div>
+          </div>
+          <div class="col-sm-4">
+            <div class="border rounded p-3 h-100">
+              <div class="text-body-secondary small">Silent for</div>
+              <div id="healthSilentFor" class="fs-6">—</div>
+            </div>
+          </div>
+          <div class="col-sm-4">
+            <div class="border rounded p-3 h-100">
+              <div class="text-body-secondary small">Outages recorded</div>
+              <div id="healthOutageCount" class="fs-6">—</div>
+            </div>
+          </div>
+        </div>
+        <div class="row g-2 align-items-end mt-1">
+          <div class="col-auto">
+            <label class="form-label small mb-1" for="watchdogSilence">Re-sync after</label>
+            <div class="input-group input-group-sm">
+              <input id="watchdogSilence" type="number" class="form-control" min="1" step="1" style="width:4.5rem">
+              <span class="input-group-text">min silent</span>
+            </div>
+          </div>
+          <div class="col-auto">
+            <label class="form-label small mb-1" for="watchdogAlert">Alert after</label>
+            <div class="input-group input-group-sm">
+              <input id="watchdogAlert" type="number" class="form-control" min="1" step="1" style="width:4.5rem">
+              <span class="input-group-text">min silent</span>
+            </div>
+          </div>
+          <div class="col-auto">
+            <div class="form-check form-switch mb-1">
+              <input class="form-check-input" type="checkbox" id="watchdogEnabled">
+              <label class="form-check-label small" for="watchdogEnabled">Enabled</label>
+            </div>
+          </div>
+          <div class="col-auto">
+            <button type="button" id="saveWatchdog" class="btn btn-primary btn-sm">Save</button>
+          </div>
+        </div>
+        <div id="healthStatus" class="small mt-2" role="status" aria-live="polite"></div>
+        <div class="table-responsive mt-2">
+          <table id="outagesTable" class="table table-sm align-middle d-none mb-0">
+            <thead></thead><tbody></tbody>
+          </table>
+        </div>
       </div>
     </section>
 

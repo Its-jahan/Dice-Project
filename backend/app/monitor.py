@@ -686,6 +686,25 @@ async def send_brief_notification(
         log.exception("sending the brief notification failed")
 
 
+async def send_watchdog_notification(text: str) -> None:
+    """Tell the operator the pipeline itself is broken.
+
+    Separate from the signal path on purpose: every other message here is
+    about a token, and this one is about DICE. It is also the only message
+    whose *absence* is the bug it reports, so it swallows nothing quietly —
+    a failure to send is logged rather than passed over.
+    """
+    token, chat_id = db.telegram_credentials()
+    if not token or not chat_id:
+        log.warning("watchdog has news but no Telegram is configured: %s", text)
+        return
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            await _post_message(client, token, chat_id, text)
+    except Exception:
+        log.exception("sending the watchdog notification failed")
+
+
 async def send_exit_notification(
     *,
     chain: Chain,

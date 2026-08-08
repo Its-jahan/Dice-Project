@@ -49,6 +49,7 @@ from . import (
     realtime,
     security,
     wallets,
+    watchdog,
 )
 from .cache import cache
 from .config import settings
@@ -1569,6 +1570,51 @@ async def live_exits(
 async def run_live_sweep() -> dict[str, object]:
     """Re-check stored events against every live threshold, now."""
     return await realtime.sweep()
+
+
+@app.get("/api/realtime/health")
+def realtime_health() -> dict[str, object]:
+    """Is the pipeline actually receiving anything?
+
+    The one question the UI could not previously answer. Everything else on
+    the dashboard is derived from deliveries, so when they stop, every panel
+    reports a calm and entirely fictional "nothing is happening".
+    """
+    return watchdog.status()
+
+
+@app.post("/api/realtime/health/check")
+async def run_watchdog_check() -> dict[str, object]:
+    """Run the watchdog now, including any re-sync it decides on."""
+    return await watchdog.check()
+
+
+@app.put("/api/settings/watchdog")
+def save_watchdog_settings(body: Annotated[dict, Body()]) -> dict[str, object]:
+    if "enabled" in body:
+        db.set_setting("watchdog_enabled", "1" if body["enabled"] else "0")
+    for key, name in (
+        ("silence_minutes", "watchdog_silence_minutes"),
+        ("alert_minutes", "watchdog_alert_minutes"),
+        ("resync_cooldown_minutes", "watchdog_resync_cooldown_minutes"),
+    ):
+        if key in body:
+            value = int(body[key])
+            if value < 1:
+                raise HTTPException(status_code=422, detail=f"{key} must be at least 1.")
+            db.set_setting(name, str(value))
+    if watchdog.alert_minutes() < watchdog.silence_minutes():
+        raise HTTPException(
+            status_code=422,
+            detail="alert_minutes must be at least silence_minutes — the point of "
+                   "the gap is that a re-sync gets a chance before anyone is told.",
+        )
+    return {
+        "enabled": watchdog.enabled(),
+        "silence_minutes": watchdog.silence_minutes(),
+        "alert_minutes": watchdog.alert_minutes(),
+        "resync_cooldown_minutes": watchdog.resync_cooldown_minutes(),
+    }
 
 
 @app.get("/api/signals/exits")

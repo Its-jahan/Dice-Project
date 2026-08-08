@@ -185,6 +185,20 @@ CREATE TABLE IF NOT EXISTS signal_briefs (
     created_at    TEXT    NOT NULL
 );
 
+-- One row per stretch where deliveries stopped arriving. Kept as history
+-- rather than a flag, because "is it working right now" is a much weaker
+-- question than "how often has it not been", and the second one is the only
+-- way to know whether a fix held.
+CREATE TABLE IF NOT EXISTS webhook_outages (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    last_delivery_at TEXT,
+    detected_at      TEXT    NOT NULL,
+    resolved_at      TEXT,
+    resyncs          INTEGER NOT NULL DEFAULT 0,
+    last_resync_at   TEXT,
+    alerted_at       TEXT
+);
+
 -- One row per signal whose buyers have been seen leaving. Existence is the
 -- "already told them" flag: an exit is news once, and a bot that repeats it
 -- every minute teaches you to ignore the alert that matters.
@@ -1860,6 +1874,86 @@ def theme_counts() -> list[dict[str, Any]]:
         }
         for row in rows
     ]
+
+
+# ------------------------------------------------------- the delivery watchdog
+
+
+def last_delivery_at() -> str | None:
+    """When a webhook delivery last arrived, from any provider.
+
+    The delivery log is pruned to a window, but the *newest* row survives
+    pruning by definition, so this stays correct however small the table gets.
+    """
+    with connect() as conn:
+        row = conn.execute("SELECT MAX(received_at) AS at FROM webhook_deliveries").fetchone()
+    return row["at"] if row else None
+
+
+def open_outage() -> dict[str, Any] | None:
+    """The outage currently in progress, if any."""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM webhook_outages WHERE resolved_at IS NULL "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def start_outage(*, detected_at: str, last_delivery_at: str | None) -> dict[str, Any]:
+    """Open an outage, or return the one already open.
+
+    Never opens a second: two overlapping sweeps would otherwise each start
+    one, and the history would read as twice as many failures as happened.
+    """
+    existing = open_outage()
+    if existing:
+        return existing
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO webhook_outages (last_delivery_at, detected_at) VALUES (?, ?)",
+            (last_delivery_at, detected_at),
+        )
+    return open_outage() or {}
+
+
+def record_outage_resync(outage_id: int, at: str) -> None:
+    with connect() as conn:
+        conn.execute(
+            "UPDATE webhook_outages SET resyncs = resyncs + 1, last_resync_at = ? "
+            "WHERE id = ?",
+            (at, outage_id),
+        )
+
+
+def mark_outage_alerted(outage_id: int, at: str) -> bool:
+    """Claim the right to send one alert. False when it was already sent."""
+    with connect() as conn:
+        cursor = conn.execute(
+            "UPDATE webhook_outages SET alerted_at = ? "
+            "WHERE id = ? AND alerted_at IS NULL",
+            (at, outage_id),
+        )
+    return cursor.rowcount > 0
+
+
+def resolve_outage(outage_id: int, at: str) -> bool:
+    """Close an outage. False when it was already closed."""
+    with connect() as conn:
+        cursor = conn.execute(
+            "UPDATE webhook_outages SET resolved_at = ? "
+            "WHERE id = ? AND resolved_at IS NULL",
+            (at, outage_id),
+        )
+    return cursor.rowcount > 0
+
+
+def list_outages(limit: int = 50) -> list[dict[str, Any]]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM webhook_outages ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def signals_to_watch_for_exits(since_iso: str, limit: int = 100) -> list[dict[str, Any]]:

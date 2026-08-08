@@ -32,7 +32,7 @@ import math
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
-from . import ai, db, dexscreener, exits, helius, performance, security
+from . import ai, db, dexscreener, exits, helius, performance, security, watchdog
 from .config import settings
 from .models import Chain, SignalOut
 from .monitor import (
@@ -837,6 +837,14 @@ async def sweep_loop() -> None:
                     log.info("researched %s newly signalled token(s)", written)
             except Exception:  # pragma: no cover - never break the sweep
                 log.exception("researching signals failed")
+            try:
+                # Before anything else: is the pipeline even receiving? Every
+                # number below is derived from deliveries, so when they stop
+                # the whole sweep reports a calm, entirely fictional "nothing
+                # is happening".
+                await watchdog.check()
+            except Exception:  # pragma: no cover - never break the sweep
+                log.exception("watchdog check failed")
             try:
                 # The other half of the trade. Entries are found above; this
                 # is the only thing in the system that says a position has
