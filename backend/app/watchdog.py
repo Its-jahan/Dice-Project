@@ -227,7 +227,11 @@ async def check() -> dict[str, Any]:
             log.exception("watchdog re-sync failed")
 
     if silent_for >= alert_minutes() * 60 and db.mark_outage_alerted(outage["id"], _iso(now)):
-        await _notify_down(silent_for, outage, last)
+        # Re-read: the row was fetched before the re-sync above incremented
+        # its counter, and the stale copy makes the message say "re-synced 0
+        # times" immediately after re-syncing — understating what was already
+        # tried, which is the one thing this module must never do.
+        await _notify_down(silent_for, db.open_outage() or outage, last)
         acted.append("alerted")
 
     return {

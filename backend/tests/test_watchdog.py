@@ -131,6 +131,11 @@ async def test_a_long_silence_is_escalated(pipeline, monkeypatch):
     # The message must say recovery was already attempted, or it reads as
     # something the operator has to go and do by hand.
     assert "re-synced" in messages[0]
+    # ...and it must say how many times, correctly. Composing this from the
+    # row as it was read *before* the re-sync made it claim "0 time(s)" in the
+    # same breath as having just re-synced.
+    assert "0 time(s)" not in messages[0]
+    assert "1 time(s)" in messages[0]
 
 
 @pytest.mark.anyio
